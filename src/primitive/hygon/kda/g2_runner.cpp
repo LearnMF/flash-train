@@ -1,0 +1,287 @@
+// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+// SPDX-License-Identifier: MIT
+
+#include <cstdint>
+#include <cstring>
+
+#include <hip/hip_runtime.h>
+
+#include "flash_train/error.hpp"
+#include "flash_train/primitive/hygon/kda/g2_runner.hpp"
+
+// Launchers defined in g2_kernels.hip (and the g2/ headers it includes).
+extern "C" {
+int g2_kda_tables(const int* cu, int N, int T, int NT, int* ctok, int* clen, int* seg, hipStream_t s);
+int g2_kda_to_gn(const float* g, const int* ctok, const int* clen, int H, int NT, float* gn, hipStream_t s);
+int g2_head_l2n2(const void* q, const void* k, void* qn, void* kn, void* q_rstd, void* k_rstd, long rows,
+                 hipStream_t s);
+int g2_head_gate(const void* g_raw, const void* A_log, const void* dt_bias, void* g_out, double lower_bound,
+                 double scale, int gate, int NT, int H, const int* ctok, const int* clen, hipStream_t s);
+int g2_l2n_apply(const void* q, const void* k, const void* q_rstd, const void* k_rstd, void* qn, void* kn,
+                 long total_tokens, hipStream_t s);
+int g2_fwd_intra2_split(const void* qn, const void* kn, const void* v, const void* g, const void* beta, void* Wn,
+                        void* Kn, void* Un, void* QgA, void* AqkA, void* Aqk, void* Akk, void* R, double scale, int B,
+                        int T, int H, const int* ctok, const int* clen, hipStream_t s);
+int g2_fwd_h_v8o(const void* Wn, const void* Kn, const void* Un, const void* Gn, const void* QgA, const void* AqkA,
+                 void* O, void* Ob, void* Vn, void* HbN, void* ANv, float scale, int B, int T, int H, const int* seg,
+                 int nseg, const int* ctok, const int* clen, hipStream_t s);
+int g2_wu(const void* k, const void* v, const void* q, const void* beta, const void* A, const void* g, void* Wn,
+          void* Wb, void* Un, void* KgA, void* Kn, void* Qn, void* kgB, void* vB, int B, int T, int H, const int* ctok,
+          const int* clen, hipStream_t s);
+int g2_dav(const void* do_, const void* Vn, const void* A, void* dA, void* dVn, void* dOT, void* aNdo, double scale,
+           int B, int T, int H, const int* ctok, const int* clen, hipStream_t s);
+int g2_dhu_v8b(const void* KgA, const void* Qg, const void* Wb, const void* dOT, const void* dv, const void* Gn,
+               void* dv2, void* HbN, void* ANv2, float scale, int B, int T, int H, const int* seg, int nseg,
+               hipStream_t s);
+int g2_wy_s4_split(const void* q_kgb, const void* k, const void* v_vb, const void* v_new, const void* g,
+                   const void* beta, const void* A, const void* h, const void* do_, const void* dh, const void* dv,
+                   const void* dAqk, void* dq, void* dk, void* dv2, void* dg, void* db, void* dA, void* dwT,
+                   void* db_part, float scale, int T, int H, int NT, const void* q_row, const void* v_row,
+                   const int* ctok, const int* clen, hipStream_t s);
+int g2_bwd_tail(const void* dq, const void* dk, const void* dg, const void* db, const void* qn, const void* kn,
+                const void* q_rstd, const void* k_rstd, const void* g_raw, const void* A_log, const void* dt_bias,
+                const void* beta_raw, void* dqo, void* dko, void* dg_raw, void* dA_log, void* ddt_bias, void* db_out,
+                void* dA_part, void* ddt_part, double lower_bound, double beta_scale, int use_l2, int use_beta, int B,
+                int T, int H, const int* ctok, const int* clen, int NTv, int gate_none, int beta_f32, hipStream_t s);
+}
+
+namespace ftrain {
+namespace kda_g2 {
+namespace {
+
+// The log2-domain scale of the chunk-local gate cumsum (the FLA literal; fp32 1/ln 2).
+constexpr double kRcpLn2       = 1.4426950216;
+constexpr std::uint64_t kAlign = 256;
+
+// Bump allocator over the caller's workspace; with a null base it only measures.
+class Arena {
+  public:
+    explicit Arena(void* base) noexcept : base_(static_cast<char*>(base)) {}
+
+    void* take(std::uint64_t bytes) noexcept {
+        offset_  = (offset_ + kAlign - 1) / kAlign * kAlign;
+        void* p  = base_ == nullptr ? nullptr : base_ + offset_;
+        offset_ += bytes;
+        return p;
+    }
+    std::uint64_t used() const noexcept { return (offset_ + kAlign - 1) / kAlign * kAlign; }
+
+  private:
+    char* base_;
+    std::uint64_t offset_ = 0;
+};
+
+void check(int rc, const char* what) {
+    if (rc != 0) { throw Exception(FTRAIN_STATUS_INTERNAL_ERROR, "KDA G2 launch %s failed: %d", what, rc); }
+}
+
+// Per-chunk-head native block sizes (elements) and row-tensor sizes (elements).
+struct Sizes {
+    std::uint64_t T, H, N, NT, CH;
+    explicit Sizes(const Shape& s) noexcept
+        : T(static_cast<std::uint64_t>(s.tokens)), H(static_cast<std::uint64_t>(s.heads)),
+          N(static_cast<std::uint64_t>(s.has_cu_seqlens ? s.seqs : 1)), NT(static_cast<std::uint64_t>(s.chunks())),
+          CH(NT * static_cast<std::uint64_t>(s.heads)) {}
+    std::uint64_t rows128() const noexcept { return T * H * 128; }  // [T, H, 128]
+};
+
+struct Tables {
+    int* ctok = nullptr;
+    int* clen = nullptr;
+    int* seg  = nullptr;
+};
+
+Tables takeTables(Arena& arena, const Shape& shape, const Sizes& z) {
+    Tables t;
+    if (shape.isDense()) { return t; }
+    t.ctok = static_cast<int*>(arena.take(z.NT * 4));
+    t.clen = static_cast<int*>(arena.take(z.NT * 4));
+    t.seg  = static_cast<int*>(arena.take((z.N + 1) * 4));
+    return t;
+}
+
+struct ForwardLayout {
+    Tables tab;
+    void *qn, *kn, *g, *Wn, *Kn, *Un, *QgA, *AqkA, *R, *Gn, *Vn;
+};
+
+ForwardLayout layoutForward(const Shape& shape, void* base, std::uint64_t* used) {
+    const Sizes z(shape);
+    Arena a(base);
+    ForwardLayout L{};
+    L.tab  = takeTables(a, shape, z);
+    L.qn   = shape.l2norm_qk ? a.take(z.rows128() * 2) : nullptr;
+    L.kn   = shape.l2norm_qk ? a.take(z.rows128() * 2) : nullptr;
+    L.g    = a.take(z.rows128() * 4);
+    L.Wn   = a.take(z.CH * 8192 * 2);
+    L.Kn   = a.take(z.CH * 8192 * 2);
+    L.Un   = a.take(z.CH * 8192 * 2);
+    L.QgA  = a.take(z.CH * 8192 * 2);
+    L.AqkA = a.take(z.CH * 4096 * 2);
+    L.R    = a.take(z.CH * 5120 * 4);
+    L.Gn   = a.take(z.CH * 128 * 4);
+    L.Vn   = a.take(z.CH * 8192 * 2);
+    if (used != nullptr) { *used = a.used(); }
+    return L;
+}
+
+// Backward lifetimes (the hip_kda order) let three regions be reused:
+//   B1 = Wn | Kn | Un (live through the bN recompute)   -> later bN(dh) | aN(dv2)
+//   B2 = KgA | Qn | Wb | Vn | dVn | dOT (through dhu)  -> later fp32 dq | dk | dg (wy -> tail)
+// Both reuses fit exactly: 3 x 8192 = 16384 + 8192 elements per chunk-head, and
+// 6 x 8192 bf16 per chunk-head = 3 x 64 rows x 128 fp32 >= 3 x T x H x 128 fp32 bytes.
+struct BackwardLayout {
+    Tables tab;
+    void *qn, *kn, *g, *dA, *Gn;
+    void *kgB, *vB, *ANv, *HbN, *aNdo;
+    void *Wn, *Kn, *Un, *HbNdh, *ANv2;     // B1
+    void *KgA, *Qn, *Wb, *Vn, *dVn, *dOT;  // B2
+    void *dq, *dk, *dg;                    // B2 reuse (fp32 rows)
+    void *dAout, *dwT, *dbPart, *dAPart, *ddtPart;
+};
+
+BackwardLayout layoutBackward(const Shape& shape, void* base, std::uint64_t* used) {
+    const Sizes z(shape);
+    Arena a(base);
+    BackwardLayout L{};
+    L.tab                   = takeTables(a, shape, z);
+    L.qn                    = shape.l2norm_qk ? a.take(z.rows128() * 2) : nullptr;
+    L.kn                    = shape.l2norm_qk ? a.take(z.rows128() * 2) : nullptr;
+    L.g                     = a.take(z.rows128() * 4);
+    L.dA                    = a.take(z.T * z.H * 64 * 4);
+    L.Gn                    = a.take(z.CH * 128 * 4);
+    L.kgB                   = a.take(z.CH * 8192 * 2);
+    L.vB                    = a.take(z.CH * 8192 * 2);
+    L.ANv                   = a.take(z.CH * 8192 * 2);
+    L.HbN                   = a.take(z.CH * 16384 * 2);
+    L.aNdo                  = a.take(z.CH * 8192 * 2);
+    char* b1                = static_cast<char*>(a.take(z.CH * 3 * 8192 * 2));
+    char* b2                = static_cast<char*>(a.take(z.CH * 6 * 8192 * 2));
+    const std::uint64_t blk = z.CH * 8192 * 2;  // one 8192-element bf16 native, bytes
+    if (b1 != nullptr) {
+        L.Wn    = b1;
+        L.Kn    = b1 + blk;
+        L.Un    = b1 + 2 * blk;
+        L.HbNdh = b1;
+        L.ANv2  = b1 + 2 * blk;
+    }
+    if (b2 != nullptr) {
+        L.KgA                    = b2;
+        L.Qn                     = b2 + blk;
+        L.Wb                     = b2 + 2 * blk;
+        L.Vn                     = b2 + 3 * blk;
+        L.dVn                    = b2 + 4 * blk;
+        L.dOT                    = b2 + 5 * blk;
+        const std::uint64_t rows = z.rows128() * 4;  // fp32 [T, H, 128] bytes, <= 2 blk
+        L.dq                     = b2;
+        L.dk                     = b2 + rows;
+        L.dg                     = b2 + 2 * rows;
+    }
+    L.dAout   = a.take(z.NT * 64 * z.H * 64 * 4);
+    L.dwT     = a.take(z.CH * 128 * 64 * 2);
+    L.dbPart  = a.take(z.CH * 256 * 4);
+    L.dAPart  = a.take(z.CH * 4);
+    L.ddtPart = a.take(z.CH * 128 * 4);
+    if (used != nullptr) { *used = a.used(); }
+    return L;
+}
+
+}  // namespace
+
+std::uint64_t forwardWorkspaceBytes(const Shape& shape) noexcept {
+    std::uint64_t used = 0;
+    layoutForward(shape, nullptr, &used);
+    return used;
+}
+
+std::uint64_t backwardWorkspaceBytes(const Shape& shape) noexcept {
+    std::uint64_t used = 0;
+    layoutBackward(shape, nullptr, &used);
+    return used;
+}
+
+void forward(const Shape& shape, const ForwardArgs& p, void* workspace, FTrainStream stream) {
+    const Sizes z(shape);
+    if (z.T == 0 || z.H == 0) { return; }
+    const ForwardLayout L = layoutForward(shape, workspace, nullptr);
+    const int T = static_cast<int>(z.T), H = static_cast<int>(z.H), NT = static_cast<int>(z.NT);
+    const int nseg = shape.isDense() ? 1 : static_cast<int>(z.N);
+    if (!shape.isDense()) {
+        check(g2_kda_tables(p.cu_seqlens, static_cast<int>(z.N), T, NT, L.tab.ctok, L.tab.clen, L.tab.seg, stream),
+              "tables");
+    }
+    const void* qn = p.q;
+    const void* kn = p.k;
+    if (shape.l2norm_qk) {
+        check(g2_head_l2n2(p.q, p.k, L.qn, L.kn, p.q_rstd, p.k_rstd, static_cast<long>(z.T * z.H), stream), "l2norm");
+        qn = L.qn;
+        kn = L.kn;
+    }
+    check(g2_head_gate(p.g, shape.gate_in_kernel ? p.a_log : nullptr, shape.gate_in_kernel ? p.dt_bias : nullptr, L.g,
+                       p.lower_bound, kRcpLn2, shape.gate_in_kernel ? 1 : 0, NT, H, L.tab.ctok, L.tab.clen, stream),
+          "gate");
+    check(g2_fwd_intra2_split(qn, kn, p.v, L.g, p.beta, L.Wn, L.Kn, L.Un, L.QgA, L.AqkA, p.aqk, p.akk, L.R, p.scale, 1,
+                              NT * 64, H, L.tab.ctok, L.tab.clen, stream),
+          "fwd_intra2");
+    check(
+        g2_kda_to_gn(static_cast<const float*>(L.g), L.tab.ctok, L.tab.clen, H, NT, static_cast<float*>(L.Gn), stream),
+        "to_gn");
+    check(g2_fwd_h_v8o(L.Wn, L.Kn, L.Un, L.Gn, L.QgA, L.AqkA, nullptr, p.o, L.Vn, nullptr, nullptr, p.scale, 1, NT * 64,
+                       H, L.tab.seg, nseg, L.tab.ctok, L.tab.clen, stream),
+          "fwd_h_o");
+}
+
+void backward(const Shape& shape, const BackwardArgs& p, void* workspace, FTrainStream stream) {
+    const Sizes z(shape);
+    if (z.T == 0 || z.H == 0) { return; }
+    const BackwardLayout L = layoutBackward(shape, workspace, nullptr);
+    const int T = static_cast<int>(z.T), H = static_cast<int>(z.H), NT = static_cast<int>(z.NT);
+    const int nseg  = shape.isDense() ? 1 : static_cast<int>(z.N);
+    const int *ctok = L.tab.ctok, *clen = L.tab.clen;
+    if (!shape.isDense()) {
+        check(g2_kda_tables(p.cu_seqlens, static_cast<int>(z.N), T, NT, L.tab.ctok, L.tab.clen, L.tab.seg, stream),
+              "tables");
+    }
+    const void* qn = p.q;
+    const void* kn = p.k;
+    if (shape.l2norm_qk) {  // V1: bf16(x * rstd) from the saved rstd == the forward's qn/kn bit for bit
+        check(g2_l2n_apply(p.q, p.k, p.q_rstd, p.k_rstd, L.qn, L.kn, static_cast<long>(z.T * z.H), stream),
+              "l2n_apply");
+        qn = L.qn;
+        kn = L.kn;
+    }
+    check(g2_head_gate(p.g, shape.gate_in_kernel ? p.a_log : nullptr, shape.gate_in_kernel ? p.dt_bias : nullptr, L.g,
+                       p.lower_bound, kRcpLn2, shape.gate_in_kernel ? 1 : 0, NT, H, ctok, clen, stream),
+          "gate");
+    check(g2_wu(kn, p.v, qn, p.beta, p.akk, L.g, L.Wn, L.Wb, L.Un, L.KgA, L.Kn, L.Qn, L.kgB, L.vB, 1, NT * 64, H, ctok,
+                clen, stream),
+          "wu");
+    check(g2_kda_to_gn(static_cast<const float*>(L.g), ctok, clen, H, NT, static_cast<float*>(L.Gn), stream), "to_gn");
+    check(g2_fwd_h_v8o(L.Wn, L.Kn, L.Un, L.Gn, nullptr, nullptr, nullptr, nullptr, L.Vn, L.HbN, L.ANv, 1.f, 1, NT * 64,
+                       H, L.tab.seg, nseg, nullptr, nullptr, stream),
+          "fwd_h_bn");
+    check(g2_dav(p.d_o, L.Vn, p.aqk, L.dA, L.dVn, L.dOT, L.aNdo, p.scale, 1, NT * 64, H, ctok, clen, stream), "dav");
+    check(g2_dhu_v8b(L.KgA, L.Qn, L.Wb, L.dOT, L.dVn, L.Gn, nullptr, L.HbNdh, L.ANv2, p.scale, 1, NT * 64, H, L.tab.seg,
+                     nseg, stream),
+          "dhu");
+    check(g2_wy_s4_split(L.kgB, kn, L.vB, L.ANv, L.g, p.beta, p.akk, L.HbN, L.aNdo, L.HbNdh, L.ANv2, L.dA, L.dq, L.dk,
+                         p.dv, L.dg, p.dbeta, L.dAout, L.dwT, L.dbPart, p.scale, NT * 64, H, NT, qn, p.v, ctok, clen,
+                         stream),
+          "wy");
+    // dbeta: the post-activation beta's gradient is wy's fp32 db, written in place (use_beta = 0).
+    check(g2_bwd_tail(L.dq, L.dk, L.dg, p.dbeta, qn, kn, p.q_rstd, p.k_rstd, p.g,
+                      shape.gate_in_kernel ? p.a_log : nullptr, shape.gate_in_kernel ? p.dt_bias : nullptr, p.beta,
+                      p.dq, p.dk, p.dg, shape.gate_in_kernel ? p.da_log : nullptr,
+                      shape.gate_in_kernel ? p.ddt_bias : nullptr, nullptr, L.dAPart, L.ddtPart, p.lower_bound, 1.0,
+                      shape.l2norm_qk ? 1 : 0, 0, 1, T, H, ctok, clen, NT, shape.gate_in_kernel ? 0 : 1, 1, stream),
+          "bwd_tail");
+}
+
+bool deviceSupported(FTrainDeviceId device) noexcept {
+    hipDeviceProp_t prop;
+    if (hipGetDeviceProperties(&prop, device) != hipSuccess) { return false; }
+    return std::strncmp(prop.gcnArchName, "gfx936", 6) == 0;
+}
+
+}  // namespace kda_g2
+}  // namespace ftrain

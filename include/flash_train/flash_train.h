@@ -47,6 +47,50 @@ FTRAIN_API FTrainStatus ftrainGemm(FTrainStorageView a, FTrainStorageView b, FTr
                                    FTrainStorageView alpha, FTrainStorageView beta, FTrainNumericType compute_type,
                                    void* workspace, uint64_t workspace_bytes, FTrainStream stream);
 
+/**
+ * @brief The Tensor ports of one KDA forward call (see ftrainPatternAddKdaForward).
+ *
+ * Packed THD layout: q, k, v, o [T, H, 128] bf16; g [T, H, 128] (bf16 raw gate with
+ * gate_in_kernel, else fp32 per-token log decay); beta [T, H] fp32 post-activation; a_log [H]
+ * and dt_bias [H, 128] fp32 (gate_in_kernel only); cu_seqlens [N + 1] int32; the saved
+ * tensors q_rstd, k_rstd [T, H] fp32 (l2norm_qk only) and aqk, akk [T, H, 64] bf16 are
+ * outputs the backward consumes. Unused ports take null memory.
+ */
+typedef struct {
+    FTrainStorageView q, k, v, g, beta, a_log, dt_bias, cu_seqlens;
+    FTrainStorageView o, q_rstd, k_rstd, aqk, akk;
+} FTrainKdaForwardTensors;
+
+/** @brief The Tensor ports of one KDA backward call (see ftrainPatternAddKdaBackward). */
+typedef struct {
+    FTrainStorageView d_o, q, k, v, g, beta, a_log, dt_bias, cu_seqlens, q_rstd, k_rstd, aqk, akk;
+    FTrainStorageView dq, dk, dv, dg, dbeta, da_log, ddt_bias;
+} FTrainKdaBackwardTensors;
+
+/**
+ * @brief Returns the workspace bytes the recommended KDA forward Primitive needs.
+ *
+ * @return FTRAIN_STATUS_INVALID_ARGUMENT for inconsistent ports or attributes,
+ * FTRAIN_STATUS_UNSUPPORTED when no implementation applies, otherwise success.
+ */
+FTRAIN_API FTrainStatus ftrainKdaForwardGetWorkspaceBytes(const FTrainKdaForwardTensors* tensors,
+                                                          FTrainKdaAttributes attributes, uint64_t* workspace_bytes);
+
+/**
+ * @brief Executes one KDA forward with the recommended Primitive (asynchronous on stream; the
+ * memory and workspace must stay valid until the enqueued work completes).
+ */
+FTRAIN_API FTrainStatus ftrainKdaForward(const FTrainKdaForwardTensors* tensors, FTrainKdaAttributes attributes,
+                                         void* workspace, uint64_t workspace_bytes, FTrainStream stream);
+
+/** @brief Returns the workspace bytes the recommended KDA backward Primitive needs. */
+FTRAIN_API FTrainStatus ftrainKdaBackwardGetWorkspaceBytes(const FTrainKdaBackwardTensors* tensors,
+                                                           FTrainKdaAttributes attributes, uint64_t* workspace_bytes);
+
+/** @brief Executes one KDA backward with the recommended Primitive (asynchronous on stream). */
+FTRAIN_API FTrainStatus ftrainKdaBackward(const FTrainKdaBackwardTensors* tensors, FTrainKdaAttributes attributes,
+                                          void* workspace, uint64_t workspace_bytes, FTrainStream stream);
+
 #ifdef __cplusplus
 }
 #endif

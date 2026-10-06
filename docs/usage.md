@@ -41,6 +41,34 @@ d = flash_train.torch.gemm(a, b)                           # c=None 时 β·c �
 - `alpha`/`beta` 是 Python 标量，按 FP32 传入内核。
 - 热循环请改用分阶段 API 复用 Plan（见第 3 节）；本接口每次调用有微秒级的参数组装开销。
 
+### 计算 KDA（Kimi Delta Attention）
+
+```python
+import torch, flash_train.torch as ft
+
+T, H = 8192, 12                                         # 打包后的总 token 数、head 数
+q = torch.randn(T, H, 128, device="cuda", dtype=torch.bfloat16)
+k = torch.randn_like(q); v = torch.randn_like(q)
+g = torch.randn_like(q)                                 # Kimi K3：原始 gate
+beta = torch.rand(T, H, device="cuda")                  # 已过 sigmoid 的 beta
+A_log = torch.zeros(H, device="cuda"); dt_bias = torch.zeros(H * 128, device="cuda")
+cu = torch.tensor([0, 3000, 8192], dtype=torch.int32, device="cuda")   # 两条序列
+
+o = ft.kimi_delta_attention(q, k, v, g, beta, A_log=A_log, dt_bias=dt_bias, cu_seqlens=cu)
+o.sum().backward()                                      # 支持 autograd：q/k/v/g/beta/A_log/dt_bias 的梯度
+```
+
+要点：
+
+- 布局为打包 THD：`q/k/v/o` 是 `[T, H, 128]` 的 BF16；`cu_seqlens`（int32 `[N+1]`）把 T 行切成互不相关的序列，每条序列从零状态开始，长度任意（不必是 64 的倍数，可以为 0）。省略时视为一条序列。
+- 两种 gate 契约：
+  - 传 `A_log`/`dt_bias` 时，g 是原始 gate，算子内部计算 `lower_bound·sigmoid(exp(A_log)·(g+dt_bias))`，用于 Kimi K3，`lower_bound` 取 [-5, 0)；
+  - 不传时，g 是 FP32 的逐 token log 衰减（cuDNN-frontend PR #556 契约），要求 ≥ -5；`check_decay=True`（默认）会检查这一点。
+- `use_qk_l2norm_in_kernel=True`（默认）表示在算子内部对 q/k 做 l2 归一化，eps 为 1e-6。
+- 当前实现为 gfx936 手写内核（`G2KdaForward`/`G2KdaBackward`），只支持 K = V = 128，其他配置抛 `RuntimeError`（`FTRAIN_STATUS_UNSUPPORTED`）。确定性：只用固定顺序归约，不用原子操作。
+- 精度：与 FP64 参考（`ft.kda_reference`）相比，相对 RMS 误差约 0.3–0.7%，判据为 o < 2e-2、dq/dk/dv < 4e-2、门控侧梯度 < 6e-2（与 PR #556 一致）。
+- 暂不支持初始状态、最终状态和 checkpoint。
+
 ---
 
 ## 2. 便利 C API（flash_train.h）
