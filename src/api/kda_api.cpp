@@ -23,8 +23,8 @@ struct KdaEntry {
     FTrainStatus status{FTRAIN_STATUS_SUCCESS};
 };
 
-using ForwardEntry  = KdaEntry<13, FTrainKdaForwardOpId>;
-using BackwardEntry = KdaEntry<20, FTrainKdaBackwardOpId>;
+using ForwardEntry  = KdaEntry<14, FTrainKdaForwardOpId>;
+using BackwardEntry = KdaEntry<21, FTrainKdaBackwardOpId>;
 
 template<typename Entry, typename AddOp>
 Entry buildEntry(AddOp&& add_op) {
@@ -45,7 +45,7 @@ const ForwardEntry& forwardEntry() {
     static const ForwardEntry entry = buildEntry<ForwardEntry>([](FTrainPattern pattern, ForwardEntry& e) {
         const auto& p = e.ports;
         return ftrainPatternAddKdaForward(pattern, &e.op, p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9],
-                                          p[10], p[11], p[12]);
+                                          p[10], p[11], p[12], p[13]);
     });
     return entry;
 }
@@ -54,7 +54,7 @@ const BackwardEntry& backwardEntry() {
     static const BackwardEntry entry = buildEntry<BackwardEntry>([](FTrainPattern pattern, BackwardEntry& e) {
         const auto& p = e.ports;
         return ftrainPatternAddKdaBackward(pattern, &e.op, p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9],
-                                           p[10], p[11], p[12], p[13], p[14], p[15], p[16], p[17], p[18], p[19]);
+                                           p[10], p[11], p[12], p[13], p[14], p[15], p[16], p[17], p[18], p[19], p[20]);
     });
     return entry;
 }

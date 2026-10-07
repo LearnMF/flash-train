@@ -23,10 +23,18 @@ struct KdaShape {
     std::int64_t seqs;
 };
 
+// Elements of the optional state port (ftrainKdaStateElements of flash_train.h).
+inline std::int64_t kdaStateElements(const KdaShape& s, bool has_cu) noexcept {
+    const std::int64_t chunks =
+        (!has_cu && s.tokens % 64 == 0) ? s.tokens / 64 : (s.tokens + 63) / 64 + (has_cu ? s.seqs : 1);
+    return s.heads * chunks * 32768;
+}
+
 // One KDA call's ports in packed THD layout, structurally validated by the constructors:
 // every port is rank-consistent with
 //   q, k [T, H, K]   v [T, H, V]   g [T, H, K]   beta [T, H]   a_log [H]   dt_bias [H, K] or [H*K]
 //   cu_seqlens [N + 1]   q_rstd, k_rstd [T, H]   aqk, akk [T, H, 64]   o / d_o [T, H, V]
+//   state [kdaStateElements(T, H, N, cu)] (optional, opaque recurrent state)
 // and lives in device memory. Optional ports carry null memory when unused (their dims are
 // then ignored): a_log/dt_bias (and their gradients) without gate_in_kernel, cu_seqlens for one
 // sequence, q_rstd/k_rstd without l2norm_qk. Value support (types, dims the kernels handle,
@@ -64,6 +72,7 @@ class KdaForwardProblem final : public KdaPortSet {
         kKRstd,
         kAqk,
         kAkk,
+        kState,
         kCount
     };
 
@@ -105,6 +114,7 @@ class KdaBackwardProblem final : public KdaPortSet {
         kDBeta,
         kDALog,
         kDDtBias,
+        kState,
         kCount
     };
 

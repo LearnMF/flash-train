@@ -19,6 +19,7 @@ Gate contracts:
 """
 
 import math
+import os
 
 import torch
 
@@ -37,22 +38,41 @@ def _thd(x, name):
     return x.contiguous()
 
 
+def _keep_state(ctx):
+    """Should the forward hand its recurrent state to the backward (skipping the backward's
+    recompute of it; bit-identical either way)?
+
+    FLASH_TRAIN_KDA_KEEP_STATE=auto (default): only when this forward runs inside a backward pass
+    with no saved-tensor hooks active -- a reentrant activation-checkpoint recompute (Megatron's
+    CheckpointFunction, torch.utils.checkpoint(use_reentrant=True)) -- so the state lives just
+    for this layer's backward. A plain training forward, non-reentrant checkpoint (its backward
+    uses the original forward's ctx) or activation offloading keep the minimal saved set.
+    1: whenever a backward follows; 0: never."""
+    mode = os.environ.get("FLASH_TRAIN_KDA_KEEP_STATE", "auto").strip()
+    if mode == "0" or not any(ctx.needs_input_grad):
+        return False
+    if mode == "1":
+        return True
+    return (torch._C._current_graph_task_id() != -1
+            and torch._C._autograd._top_saved_tensors_default_hooks(False) is None)
+
+
 class _KdaFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, g, beta, a_log, dt_bias, cu_seqlens, scale, lower_bound, l2norm):
         gate = a_log is not None
-        o, q_rstd, k_rstd, aqk, akk = _kda_forward(q, k, v, g, beta, a_log, dt_bias, cu_seqlens, scale,
-                                                   lower_bound, gate, l2norm)
-        ctx.save_for_backward(q, k, v, g, beta, a_log, dt_bias, cu_seqlens, q_rstd, k_rstd, aqk, akk)
+        o, q_rstd, k_rstd, aqk, akk, state = _kda_forward(q, k, v, g, beta, a_log, dt_bias, cu_seqlens, scale,
+                                                          lower_bound, gate, l2norm, _keep_state(ctx))
+        ctx.save_for_backward(q, k, v, g, beta, a_log, dt_bias, cu_seqlens, q_rstd, k_rstd, aqk, akk, state)
         ctx.scale, ctx.lower_bound, ctx.gate, ctx.l2norm = scale, lower_bound, gate, l2norm
         return o
 
     @staticmethod
     def backward(ctx, d_o):
-        q, k, v, g, beta, a_log, dt_bias, cu_seqlens, q_rstd, k_rstd, aqk, akk = ctx.saved_tensors
+        q, k, v, g, beta, a_log, dt_bias, cu_seqlens, q_rstd, k_rstd, aqk, akk, state = ctx.saved_tensors
         dq, dk, dv, dg, dbeta, da_log, ddt_bias = _kda_backward(
-            d_o.contiguous(), q, k, v, g, beta, a_log, dt_bias, cu_seqlens, q_rstd, k_rstd, aqk, akk, ctx.scale,
-            ctx.lower_bound, ctx.gate, ctx.l2norm)
+            d_o.contiguous(), q, k, v, g, beta, a_log, dt_bias, cu_seqlens, q_rstd, k_rstd, aqk, akk, state,
+            ctx.scale, ctx.lower_bound, ctx.gate, ctx.l2norm)
         if not ctx.gate:
             da_log = ddt_bias = None
         return dq, dk, dv, dg, dbeta, da_log, ddt_bias, None, None, None, None

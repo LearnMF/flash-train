@@ -194,8 +194,10 @@ __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p) {
             // (generally unaligned) offset, so scalar stride-1 stores
             const int ibn = (j & 3) + 4 * (vq & 15) + 64 * ((j >> 2) & 3)
                             + 256 * (j >> 4) + 1024 * (vq >> 4);
-            #pragma unroll
-            for (int dv = 0; dv < 4; ++dv) p.Kn[nblk + ibn + 4 * dv] = gkv[dv];
+            if (p.Kn != nullptr) {                          // null: keep-state backward
+                #pragma unroll
+                for (int dv = 0; dv < 4; ++dv) p.Kn[nblk + ibn + 4 * dv] = gkv[dv];
+            }
         }
         if (p.stop == 1) return;
         mmac_phase(p.Wn, p.Wb, nullptr, 2);

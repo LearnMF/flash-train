@@ -22,6 +22,10 @@ int g2_l2n_apply(const void* q, const void* k, const void* q_rstd, const void* k
 int g2_fwd_intra2_split(const void* qn, const void* kn, const void* v, const void* g, const void* beta, void* Wn,
                         void* Kn, void* Un, void* QgA, void* AqkA, void* Aqk, void* Akk, void* R, double scale, int B,
                         int T, int H, const int* ctok, const int* clen, hipStream_t s);
+int g2_fwd_prep(const void* q, const void* k, const void* v, const void* g_raw, const void* A_log, const void* dt_bias,
+                const void* beta, void* Wn, void* Kn, void* Un, void* QgA, void* AqkA, void* Aqk, void* Akk,
+                void* q_rstd, void* k_rstd, void* Gn, void* R, void* Kb, double lower_bound, double gscale, int gate,
+                double scale, int H, int NT, const int* ctok, const int* clen, hipStream_t s);
 int g2_fwd_h_v8o(const void* Wn, const void* Kn, const void* Un, const void* Gn, const void* QgA, const void* AqkA,
                  void* O, void* Ob, void* Vn, void* HbN, void* ANv, float scale, int B, int T, int H, const int* seg,
                  int nseg, const int* ctok, const int* clen, hipStream_t s);
@@ -100,9 +104,13 @@ Tables takeTables(Arena& arena, const Shape& shape, const Sizes& z) {
     return t;
 }
 
+// l2norm_qk (the K3 path): the R4 single-pass prep reads the raw q/k/g once, so neither qn/kn nor
+// the fp32 gate cumsum is materialized -- only its R (fp32 A partials) and Kb (bf16 k*beta*2^g)
+// hand-offs.  Without in-kernel l2norm the X1 chain (gate -> fwd_intra2_split -> to_gn) runs.
+// Vn (v_new) is a backward-only tensor: the forward does not write it.
 struct ForwardLayout {
     Tables tab;
-    void *qn, *kn, *g, *Wn, *Kn, *Un, *QgA, *AqkA, *R, *Gn, *Vn;
+    void *g, *Kb, *Wn, *Kn, *Un, *QgA, *AqkA, *R, *Gn;
 };
 
 ForwardLayout layoutForward(const Shape& shape, void* base, std::uint64_t* used) {
@@ -110,9 +118,8 @@ ForwardLayout layoutForward(const Shape& shape, void* base, std::uint64_t* used)
     Arena a(base);
     ForwardLayout L{};
     L.tab  = takeTables(a, shape, z);
-    L.qn   = shape.l2norm_qk ? a.take(z.rows128() * 2) : nullptr;
-    L.kn   = shape.l2norm_qk ? a.take(z.rows128() * 2) : nullptr;
-    L.g    = a.take(z.rows128() * 4);
+    L.g    = shape.l2norm_qk ? nullptr : a.take(z.rows128() * 4);
+    L.Kb   = shape.l2norm_qk ? a.take(z.rows128() * 2) : nullptr;
     L.Wn   = a.take(z.CH * 8192 * 2);
     L.Kn   = a.take(z.CH * 8192 * 2);
     L.Un   = a.take(z.CH * 8192 * 2);
@@ -120,7 +127,6 @@ ForwardLayout layoutForward(const Shape& shape, void* base, std::uint64_t* used)
     L.AqkA = a.take(z.CH * 4096 * 2);
     L.R    = a.take(z.CH * 5120 * 4);
     L.Gn   = a.take(z.CH * 128 * 4);
-    L.Vn   = a.take(z.CH * 8192 * 2);
     if (used != nullptr) { *used = a.used(); }
     return L;
 }
@@ -152,8 +158,8 @@ BackwardLayout layoutBackward(const Shape& shape, void* base, std::uint64_t* use
     L.Gn                    = a.take(z.CH * 128 * 4);
     L.kgB                   = a.take(z.CH * 8192 * 2);
     L.vB                    = a.take(z.CH * 8192 * 2);
-    L.ANv                   = a.take(z.CH * 8192 * 2);
-    L.HbN                   = a.take(z.CH * 16384 * 2);
+    L.ANv                   = shape.has_state ? nullptr : a.take(z.CH * 8192 * 2);  // given by the forward
+    L.HbN                   = shape.has_state ? nullptr : a.take(z.CH * 16384 * 2);
     L.aNdo                  = a.take(z.CH * 8192 * 2);
     char* b1                = static_cast<char*>(a.take(z.CH * 3 * 8192 * 2));
     char* b2                = static_cast<char*>(a.take(z.CH * 6 * 8192 * 2));
@@ -210,24 +216,28 @@ void forward(const Shape& shape, const ForwardArgs& p, void* workspace, FTrainSt
         check(g2_kda_tables(p.cu_seqlens, static_cast<int>(z.N), T, NT, L.tab.ctok, L.tab.clen, L.tab.seg, stream),
               "tables");
     }
-    const void* qn = p.q;
-    const void* kn = p.k;
-    if (shape.l2norm_qk) {
-        check(g2_head_l2n2(p.q, p.k, L.qn, L.kn, p.q_rstd, p.k_rstd, static_cast<long>(z.T * z.H), stream), "l2norm");
-        qn = L.qn;
-        kn = L.kn;
+    if (shape.l2norm_qk) {  // R4: l2norm + gate + fwd_intra2 + to_gn in two kernels, bitwise the X1 chain
+        check(g2_fwd_prep(p.q, p.k, p.v, p.g, shape.gate_in_kernel ? p.a_log : nullptr,
+                          shape.gate_in_kernel ? p.dt_bias : nullptr, p.beta, L.Wn, L.Kn, L.Un, L.QgA, L.AqkA, p.aqk,
+                          p.akk, p.q_rstd, p.k_rstd, L.Gn, L.R, L.Kb, shape.gate_in_kernel ? p.lower_bound : 0.0,
+                          kRcpLn2, shape.gate_in_kernel ? 1 : 0, p.scale, H, NT, L.tab.ctok, L.tab.clen, stream),
+              "fwd_prep");
+    } else {
+        check(
+            g2_head_gate(p.g, shape.gate_in_kernel ? p.a_log : nullptr, shape.gate_in_kernel ? p.dt_bias : nullptr, L.g,
+                         p.lower_bound, kRcpLn2, shape.gate_in_kernel ? 1 : 0, NT, H, L.tab.ctok, L.tab.clen, stream),
+            "gate");
+        check(g2_fwd_intra2_split(p.q, p.k, p.v, L.g, p.beta, L.Wn, L.Kn, L.Un, L.QgA, L.AqkA, p.aqk, p.akk, L.R,
+                                  p.scale, 1, NT * 64, H, L.tab.ctok, L.tab.clen, stream),
+              "fwd_intra2");
+        check(g2_kda_to_gn(static_cast<const float*>(L.g), L.tab.ctok, L.tab.clen, H, NT, static_cast<float*>(L.Gn),
+                           stream),
+              "to_gn");
     }
-    check(g2_head_gate(p.g, shape.gate_in_kernel ? p.a_log : nullptr, shape.gate_in_kernel ? p.dt_bias : nullptr, L.g,
-                       p.lower_bound, kRcpLn2, shape.gate_in_kernel ? 1 : 0, NT, H, L.tab.ctok, L.tab.clen, stream),
-          "gate");
-    check(g2_fwd_intra2_split(qn, kn, p.v, L.g, p.beta, L.Wn, L.Kn, L.Un, L.QgA, L.AqkA, p.aqk, p.akk, L.R, p.scale, 1,
-                              NT * 64, H, L.tab.ctok, L.tab.clen, stream),
-          "fwd_intra2");
-    check(
-        g2_kda_to_gn(static_cast<const float*>(L.g), L.tab.ctok, L.tab.clen, H, NT, static_cast<float*>(L.Gn), stream),
-        "to_gn");
-    check(g2_fwd_h_v8o(L.Wn, L.Kn, L.Un, L.Gn, L.QgA, L.AqkA, nullptr, p.o, L.Vn, nullptr, nullptr, p.scale, 1, NT * 64,
-                       H, L.tab.seg, nseg, L.tab.ctok, L.tab.clen, stream),
+    // R5 keep-state: with p.state_* set, the recurrence also emits the backward's B2 state
+    // (bN(h), v_new native and A-natural) -- bit-identical to the backward's own recompute.
+    check(g2_fwd_h_v8o(L.Wn, L.Kn, L.Un, L.Gn, L.QgA, L.AqkA, nullptr, p.o, p.state_vn, p.state_hbn, p.state_anv,
+                       p.scale, 1, NT * 64, H, L.tab.seg, nseg, L.tab.ctok, L.tab.clen, stream),
           "fwd_h_o");
 }
 
@@ -253,20 +263,27 @@ void backward(const Shape& shape, const BackwardArgs& p, void* workspace, FTrain
     check(g2_head_gate(p.g, shape.gate_in_kernel ? p.a_log : nullptr, shape.gate_in_kernel ? p.dt_bias : nullptr, L.g,
                        p.lower_bound, kRcpLn2, shape.gate_in_kernel ? 1 : 0, NT, H, ctok, clen, stream),
           "gate");
-    check(g2_wu(kn, p.v, qn, p.beta, p.akk, L.g, L.Wn, L.Wb, L.Un, L.KgA, L.Kn, L.Qn, L.kgB, L.vB, 1, NT * 64, H, ctok,
-                clen, stream),
+    // R5 keep-state: the forward handed over the B2 state -> wu skips Wn/Un/Kn (fwd_h_bn's inputs
+    // only) and the bN recompute does not run.
+    const bool kept = p.state_hbn != nullptr;  // == shape.has_state (the workspace was laid out for it)
+    const void* Vn  = kept ? p.state_vn : L.Vn;
+    const void* HbN = kept ? p.state_hbn : L.HbN;
+    const void* ANv = kept ? p.state_anv : L.ANv;
+    check(g2_wu(kn, p.v, qn, p.beta, p.akk, L.g, kept ? nullptr : L.Wn, L.Wb, kept ? nullptr : L.Un, L.KgA,
+                kept ? nullptr : L.Kn, L.Qn, L.kgB, L.vB, 1, NT * 64, H, ctok, clen, stream),
           "wu");
     check(g2_kda_to_gn(static_cast<const float*>(L.g), ctok, clen, H, NT, static_cast<float*>(L.Gn), stream), "to_gn");
-    check(g2_fwd_h_v8o(L.Wn, L.Kn, L.Un, L.Gn, nullptr, nullptr, nullptr, nullptr, L.Vn, L.HbN, L.ANv, 1.f, 1, NT * 64,
-                       H, L.tab.seg, nseg, nullptr, nullptr, stream),
-          "fwd_h_bn");
-    check(g2_dav(p.d_o, L.Vn, p.aqk, L.dA, L.dVn, L.dOT, L.aNdo, p.scale, 1, NT * 64, H, ctok, clen, stream), "dav");
+    if (!kept) {
+        check(g2_fwd_h_v8o(L.Wn, L.Kn, L.Un, L.Gn, nullptr, nullptr, nullptr, nullptr, L.Vn, L.HbN, L.ANv, 1.f, 1,
+                           NT * 64, H, L.tab.seg, nseg, nullptr, nullptr, stream),
+              "fwd_h_bn");
+    }
+    check(g2_dav(p.d_o, Vn, p.aqk, L.dA, L.dVn, L.dOT, L.aNdo, p.scale, 1, NT * 64, H, ctok, clen, stream), "dav");
     check(g2_dhu_v8b(L.KgA, L.Qn, L.Wb, L.dOT, L.dVn, L.Gn, nullptr, L.HbNdh, L.ANv2, p.scale, 1, NT * 64, H, L.tab.seg,
                      nseg, stream),
           "dhu");
-    check(g2_wy_s4_split(L.kgB, kn, L.vB, L.ANv, L.g, p.beta, p.akk, L.HbN, L.aNdo, L.HbNdh, L.ANv2, L.dA, L.dq, L.dk,
-                         p.dv, L.dg, p.dbeta, L.dAout, L.dwT, L.dbPart, p.scale, NT * 64, H, NT, qn, p.v, ctok, clen,
-                         stream),
+    check(g2_wy_s4_split(L.kgB, kn, L.vB, ANv, L.g, p.beta, p.akk, HbN, L.aNdo, L.HbNdh, L.ANv2, L.dA, L.dq, L.dk, p.dv,
+                         L.dg, p.dbeta, L.dAout, L.dwT, L.dbPart, p.scale, NT * 64, H, NT, qn, p.v, ctok, clen, stream),
           "wy");
     // dbeta: the post-activation beta's gradient is wy's fp32 db, written in place (use_beta = 0).
     check(g2_bwd_tail(L.dq, L.dk, L.dg, p.dbeta, qn, kn, p.q_rstd, p.k_rstd, p.g,

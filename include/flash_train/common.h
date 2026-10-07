@@ -332,7 +332,8 @@ FTRAIN_API FTrainStatus ftrainPatternAddGroupedABGemm(FTrainPattern pattern, FTr
  * [T, H, D], g [T, H, K], beta [T, H]; cu_seqlens [N + 1] (int32) splits the T rows into
  * independent sequences. Ports a Primitive does not use for a call (a_log, dt_bias without
  * gate_in_kernel; cu_seqlens for one sequence; q_rstd, k_rstd without l2norm_qk) take
- * Tensors with null memory.
+ * Tensors with null memory. state is an optional output (null memory: not written) holding the
+ * recurrent state for the backward, see FTrainKdaForwardTensors.
  *
  * @return Status of the operation. All role IDs must belong to pattern.
  */
@@ -340,14 +341,16 @@ FTRAIN_API FTrainStatus ftrainPatternAddKdaForward(FTrainPattern pattern, FTrain
                                                    FTrainTensorId k, FTrainTensorId v, FTrainTensorId g,
                                                    FTrainTensorId beta, FTrainTensorId a_log, FTrainTensorId dt_bias,
                                                    FTrainTensorId cu_seqlens, FTrainTensorId o, FTrainTensorId q_rstd,
-                                                   FTrainTensorId k_rstd, FTrainTensorId aqk, FTrainTensorId akk);
+                                                   FTrainTensorId k_rstd, FTrainTensorId aqk, FTrainTensorId akk,
+                                                   FTrainTensorId state);
 
 /**
  * @brief Adds a KDA backward topology operation to a Pattern.
  *
  * Inputs: d_o, the forward's inputs (q, k, v, g, beta, a_log, dt_bias, cu_seqlens) and
  * saved tensors (q_rstd, k_rstd, aqk, akk). Outputs: dq, dk, dv, dg, dbeta, da_log,
- * ddt_bias (da_log/ddt_bias take null memory without gate_in_kernel).
+ * ddt_bias (da_log/ddt_bias take null memory without gate_in_kernel). state (input, last) is
+ * the forward's optional state output; null memory makes the backward recompute it.
  *
  * @return Status of the operation. All role IDs must belong to pattern.
  */
@@ -356,7 +359,7 @@ FTRAIN_API FTrainStatus ftrainPatternAddKdaBackward(
     FTrainTensorId v, FTrainTensorId g, FTrainTensorId beta, FTrainTensorId a_log, FTrainTensorId dt_bias,
     FTrainTensorId cu_seqlens, FTrainTensorId q_rstd, FTrainTensorId k_rstd, FTrainTensorId aqk, FTrainTensorId akk,
     FTrainTensorId dq, FTrainTensorId dk, FTrainTensorId dv, FTrainTensorId dg, FTrainTensorId dbeta,
-    FTrainTensorId da_log, FTrainTensorId ddt_bias);
+    FTrainTensorId da_log, FTrainTensorId ddt_bias, FTrainTensorId state);
 
 /* Ops matching. */
 

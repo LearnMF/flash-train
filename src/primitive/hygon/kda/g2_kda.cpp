@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <initializer_list>
 #include <memory>
+#include <type_traits>
 
 #include "flash_train/primitive/hygon/kda/g2_kda.hpp"
 
@@ -53,6 +54,18 @@ FTrainNumericType gateType(const KdaAttributes& attributes) {
     return attributes.isGateInKernel() ? FTRAIN_NUMERIC_TYPE_BF16 : FTRAIN_NUMERIC_TYPE_FP32;
 }
 
+// The state port's three regions (bf16 elements per chunk-head): bN(h) 16384 | v_new native
+// 8192 | v_new A-natural 8192. Null base -> all null (the state is not exchanged).
+template<typename Ptr>
+void splitState(Ptr base, const kda_g2::Shape& s, Ptr& hbn, Ptr& vn, Ptr& anv) {
+    using Byte    = std::conditional_t<std::is_const_v<std::remove_pointer_t<Ptr>>, const char, char>;
+    const auto ch = static_cast<std::uint64_t>(s.chunks()) * static_cast<std::uint64_t>(s.heads);
+    Byte* b       = static_cast<Byte*>(base);
+    hbn           = base == nullptr ? nullptr : static_cast<Ptr>(b);
+    vn            = base == nullptr ? nullptr : static_cast<Ptr>(b + ch * 16384 * 2);
+    anv           = base == nullptr ? nullptr : static_cast<Ptr>(b + ch * (16384 + 8192) * 2);
+}
+
 kda_g2::Shape makeShape(const KdaShape& shape, const KdaAttributes& attributes, bool has_cu) {
     kda_g2::Shape s;
     s.tokens         = shape.tokens;
@@ -89,7 +102,8 @@ Result G2KdaForward::isApplicable(const KdaForwardProblem& problem, const Constr
                            {P::kQRstd,     fp32                             },
                            {P::kKRstd,     fp32                             },
                            {P::kAqk,       bf16                             },
-                           {P::kAkk,       bf16                             }
+                           {P::kAkk,       bf16                             },
+                           {P::kState,     bf16                             }
     });
 }
 
@@ -112,8 +126,9 @@ void G2KdaForward::configure(const KdaForwardProblem& problem) {
     args_.k_rstd                    = problem.getAddress(P::kKRstd);
     args_.aqk                       = problem.getAddress(P::kAqk);
     args_.akk                       = problem.getAddress(P::kAkk);
-    args_.scale                     = attributes.getScale();
-    args_.lower_bound               = attributes.getLowerBound();
+    splitState<void*>(problem.getAddress(P::kState), shape_, args_.state_hbn, args_.state_vn, args_.state_anv);
+    args_.scale       = attributes.getScale();
+    args_.lower_bound = attributes.getLowerBound();
 }
 
 void G2KdaForward::executeImpl(const Resources& resources) {
@@ -151,7 +166,8 @@ Result G2KdaBackward::isApplicable(const KdaBackwardProblem& problem, const Cons
                            {P::kDg,        gt                       },
                            {P::kDBeta,     fp32                     },
                            {P::kDALog,     fp32                     },
-                           {P::kDDtBias,   fp32                     }
+                           {P::kDDtBias,   fp32                     },
+                           {P::kState,     bf16                     }
     });
 }
 
@@ -163,6 +179,7 @@ void G2KdaBackward::configure(const KdaBackwardProblem& problem) {
     using P                         = KdaBackwardProblem;
     const KdaAttributes& attributes = problem.getAttributes();
     shape_                          = makeShape(problem.getShape(), attributes, problem.hasMemory(P::kCuSeqlens));
+    shape_.has_state                = problem.hasMemory(P::kState);
     args_.d_o                       = problem.getAddress(P::kDO);
     args_.q                         = problem.getAddress(P::kQ);
     args_.k                         = problem.getAddress(P::kK);
@@ -183,8 +200,9 @@ void G2KdaBackward::configure(const KdaBackwardProblem& problem) {
     args_.dbeta                     = problem.getAddress(P::kDBeta);
     args_.da_log                    = problem.getAddress(P::kDALog);
     args_.ddt_bias                  = problem.getAddress(P::kDDtBias);
-    args_.scale                     = attributes.getScale();
-    args_.lower_bound               = attributes.getLowerBound();
+    splitState<const void*>(problem.getAddress(P::kState), shape_, args_.state_hbn, args_.state_vn, args_.state_anv);
+    args_.scale       = attributes.getScale();
+    args_.lower_bound = attributes.getLowerBound();
 }
 
 void G2KdaBackward::executeImpl(const Resources& resources) {

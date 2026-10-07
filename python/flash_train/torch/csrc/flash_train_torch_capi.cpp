@@ -69,17 +69,21 @@ unsigned char callKda(const KdaBridgeView* views, KdaBridgeAttributes attributes
 
 }  // namespace
 
+std::uint64_t kdaStateElements(std::int64_t tokens, std::int64_t heads, std::int64_t seqs, bool has_cu_seqlens) {
+    return ftrainKdaStateElements(tokens, heads, seqs, has_cu_seqlens ? 1 : 0);
+}
+
 unsigned char callKdaForward(const KdaBridgeView* views, KdaBridgeAttributes attributes, void* workspace,
                              std::uint64_t workspace_bytes, std::uint64_t* query_bytes, void* stream,
                              const char** message) {
-    return callKda<FTrainKdaForwardTensors, 13>(views, attributes, workspace, workspace_bytes, query_bytes, stream,
+    return callKda<FTrainKdaForwardTensors, 14>(views, attributes, workspace, workspace_bytes, query_bytes, stream,
                                                 message, ftrainKdaForwardGetWorkspaceBytes, ftrainKdaForward);
 }
 
 unsigned char callKdaBackward(const KdaBridgeView* views, KdaBridgeAttributes attributes, void* workspace,
                               std::uint64_t workspace_bytes, std::uint64_t* query_bytes, void* stream,
                               const char** message) {
-    return callKda<FTrainKdaBackwardTensors, 20>(views, attributes, workspace, workspace_bytes, query_bytes, stream,
+    return callKda<FTrainKdaBackwardTensors, 21>(views, attributes, workspace, workspace_bytes, query_bytes, stream,
                                                  message, ftrainKdaBackwardGetWorkspaceBytes, ftrainKdaBackward);
 }
 

@@ -38,7 +38,7 @@ struct Ports {
                                       view(6, hk, 2, fp32, gate), view(7, cu, 1, FTRAIN_NUMERIC_TYPE_INT32, false),
                                       view(8, thk, 3, bf16),      view(9, th, 2, fp32),
                                       view(10, th, 2, fp32),      view(11, th64, 3, bf16),
-                                      view(12, th64, 3, bf16)};
+                                      view(12, th64, 3, bf16),    view(13, cu, 1, bf16, false)};
     }
 };
 

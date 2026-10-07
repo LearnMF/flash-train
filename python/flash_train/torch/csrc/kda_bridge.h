@@ -27,9 +27,12 @@ struct KdaBridgeAttributes {
     std::int32_t l2norm_qk;
 };
 
-// views: 13 (forward) / 20 (backward) ports in the C API's port order. With query_bytes
+// views: 14 (forward) / 21 (backward) ports in the C API's port order. With query_bytes
 // non-null only the recommended Primitive's workspace size is reported. Returns the
 // FTrainStatus (0 = success); message receives the library's last message on failure.
+// Elements of the optional state port (ftrainKdaStateElements).
+std::uint64_t kdaStateElements(std::int64_t tokens, std::int64_t heads, std::int64_t seqs, bool has_cu_seqlens);
+
 unsigned char callKdaForward(const KdaBridgeView* views, KdaBridgeAttributes attributes, void* workspace,
                              std::uint64_t workspace_bytes, std::uint64_t* query_bytes, void* stream,
                              const char** message);

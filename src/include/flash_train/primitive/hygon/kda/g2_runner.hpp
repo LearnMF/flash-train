@@ -21,6 +21,8 @@ struct Shape {
     std::int64_t seqs   = 1;  // N: sequences (cu_seqlens has N + 1 entries; 1 when null)
     bool has_cu_seqlens = false;
     bool l2norm_qk      = true;   // l2-normalize q and k inside the operator
+    bool has_state      = false;  // backward only: the forward handed over its recurrent state
+                                  //   (BackwardArgs::state_*), so the bN recompute buffers are not needed
     bool gate_in_kernel = false;  // true: g is the raw K3 gate (bf16), activated in kernel as
                                   //   lower_bound * sigmoid(exp(A_log) * (g + dt_bias));
                                   // false: g is the per-token log decay (fp32), as given
@@ -47,6 +49,12 @@ struct ForwardArgs {
     void* k_rstd;  // fp32 [T, H] (l2norm_qk only)
     void* aqk;     // bf16 [T, H, 64]: saved for the backward
     void* akk;     // bf16 [T, H, 64]: saved for the backward
+    // Optional (all three or none), keep-state: the recurrence's B2 state handed to the backward
+    // so it skips its recompute (for activation-checkpoint recompute, where the forward runs
+    // right before the backward). bf16 natives, per (chunk, head): hbn 16384, vn / anv 8192.
+    void* state_hbn = nullptr;
+    void* state_vn  = nullptr;
+    void* state_anv = nullptr;
     float scale;
     float lower_bound;
 };
@@ -72,6 +80,10 @@ struct BackwardArgs {
     void* dbeta;     // fp32 [T, H]
     void* da_log;    // fp32 [H] (gate_in_kernel only)
     void* ddt_bias;  // fp32 [H, 128] (gate_in_kernel only)
+    // Optional (all three or none): the forward's keep-state outputs (ForwardArgs::state_*).
+    const void* state_hbn = nullptr;
+    const void* state_vn  = nullptr;
+    const void* state_anv = nullptr;
     float scale;
     float lower_bound;
 };

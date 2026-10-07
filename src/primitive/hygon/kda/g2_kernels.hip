@@ -8,6 +8,7 @@
 #include "g2/g2_head.cuh"
 #include "g2/g2_fwd_intra.cuh"
 #include "g2/g2_fwd_intra2.cuh"
+#include "g2/g2_fwd_prep.cuh"
 #include "g2/g2_fwd_v8.cuh"
 #include "g2/g2_engine.cuh"
 #include "g2/g2_wu.cuh"

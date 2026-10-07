@@ -55,17 +55,36 @@ FTRAIN_API FTrainStatus ftrainGemm(FTrainStorageView a, FTrainStorageView b, FTr
  * and dt_bias [H, 128] fp32 (gate_in_kernel only); cu_seqlens [N + 1] int32; the saved
  * tensors q_rstd, k_rstd [T, H] fp32 (l2norm_qk only) and aqk, akk [T, H, 64] bf16 are
  * outputs the backward consumes. Unused ports take null memory.
+ *
+ * state (optional output, bf16 [ftrainKdaStateElements(T, H, N, has_cu_seqlens)], opaque layout):
+ * when given, the forward also writes its recurrent state for the backward, which then skips
+ * recomputing it. Meant for activation-checkpoint recompute (the forward runs right before the
+ * backward, so the buffer is short-lived); results are bit-identical either way.
  */
 typedef struct {
     FTrainStorageView q, k, v, g, beta, a_log, dt_bias, cu_seqlens;
     FTrainStorageView o, q_rstd, k_rstd, aqk, akk;
+    FTrainStorageView state;
 } FTrainKdaForwardTensors;
 
-/** @brief The Tensor ports of one KDA backward call (see ftrainPatternAddKdaBackward). */
+/** @brief The Tensor ports of one KDA backward call (see ftrainPatternAddKdaBackward); state is
+ * the forward's optional state output (null memory when the forward did not write one). */
 typedef struct {
     FTrainStorageView d_o, q, k, v, g, beta, a_log, dt_bias, cu_seqlens, q_rstd, k_rstd, aqk, akk;
     FTrainStorageView dq, dk, dv, dg, dbeta, da_log, ddt_bias;
+    FTrainStorageView state;
 } FTrainKdaBackwardTensors;
+
+/**
+ * @brief Element count of the optional KDA state port for T packed tokens, H heads and N
+ * sequences: H * C * 32768, with C = T / 64 for one sequence of T % 64 == 0 rows, else
+ * ceil(T / 64) + N (the chunk capacity of the packed layout).
+ */
+static inline uint64_t ftrainKdaStateElements(int64_t tokens, int64_t heads, int64_t seqs, int has_cu_seqlens) {
+    const int64_t chunks =
+        (!has_cu_seqlens && tokens % 64 == 0) ? tokens / 64 : (tokens + 63) / 64 + (has_cu_seqlens ? seqs : 1);
+    return (uint64_t)heads * (uint64_t)chunks * 32768u;
+}
 
 /**
  * @brief Returns the workspace bytes the recommended KDA forward Primitive needs.

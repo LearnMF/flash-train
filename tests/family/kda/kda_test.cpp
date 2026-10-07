@@ -45,6 +45,7 @@ std::vector<Tensor> forwardPorts(std::int64_t T, std::int64_t H, std::int64_t K,
     p.push_back(makeTensor(10, {T, H}, kFp32));                      // k_rstd
     p.push_back(makeTensor(11, {T, H, 64}, kBf16));                  // aqk
     p.push_back(makeTensor(12, {T, H, 64}, kBf16));                  // akk
+    p.push_back(makeTensor(13, {1}, kBf16, false));                  // state (optional, absent)
     return p;
 }
 
@@ -54,11 +55,11 @@ KdaAttributes attributes(bool gate, bool l2 = true) {
 
 TEST(KdaFamilyTest, EnginesDefineTheSupportedPatterns) {
     const OpsEngine<KdaForwardFamily, KdaRegistrationOrderFinder> forward;
-    EXPECT_EQ(forward.getPattern().getNumOperands(), 13U);
+    EXPECT_EQ(forward.getPattern().getNumOperands(), 14U);
     ASSERT_EQ(forward.getPattern().getNumOps(), 1U);
     EXPECT_EQ(forward.getPattern().getOpNode(PatternOperationId{0}).getKind(), OperationKind::kKdaForward);
     const OpsEngine<KdaBackwardFamily, KdaRegistrationOrderFinder> backward;
-    EXPECT_EQ(backward.getPattern().getNumOperands(), 20U);
+    EXPECT_EQ(backward.getPattern().getNumOperands(), 21U);
     ASSERT_EQ(backward.getPattern().getNumOps(), 1U);
     EXPECT_EQ(backward.getPattern().getOpNode(PatternOperationId{0}).getKind(), OperationKind::kKdaBackward);
 }
@@ -101,6 +102,23 @@ TEST(KdaProblemTest, RejectsStructuralViolations) {
     std::vector<Tensor> no_rstd = forwardPorts(64, 2, 128, true);
     no_rstd[9]                  = makeTensor(9, {64, 2}, kFp32, false);
     expectInvalid(std::move(no_rstd), attributes(true, true));
+
+    std::vector<Tensor> bad_state        = forwardPorts(256, 4, 128, true);  // needs 4 * 4 * 32768 elements
+    bad_state[KdaForwardProblem::kState] = makeTensor(13, {4 * 4 * 32768 - 1}, kBf16);
+    expectInvalid(std::move(bad_state), attributes(true));
+}
+
+TEST(KdaProblemTest, AcceptsTheOptionalState) {
+    // dense T % 64 == 0: H * T/64 chunks; packed (cu_seqlens, N = 2): H * (ceil(T/64) + N)
+    std::vector<Tensor> dense        = forwardPorts(256, 4, 128, true);
+    dense[KdaForwardProblem::kState] = makeTensor(13, {4 * 4 * 32768}, kBf16);
+    const KdaForwardProblem a(std::move(dense), attributes(true));
+    EXPECT_TRUE(a.hasMemory(KdaForwardProblem::kState));
+    std::vector<Tensor> packed        = forwardPorts(256, 4, 128, true, true);
+    packed[KdaForwardProblem::kState] = makeTensor(13, {4 * (4 + 2) * 32768}, kBf16);
+    const KdaForwardProblem b(std::move(packed), attributes(true));
+    EXPECT_EQ(kdaStateElements(b.getShape(), true), 4 * 6 * 32768);
+    EXPECT_NE(a.getProblemKey(), KdaForwardProblem(forwardPorts(256, 4, 128, true), attributes(true)).getProblemKey());
 }
 
 }  // namespace

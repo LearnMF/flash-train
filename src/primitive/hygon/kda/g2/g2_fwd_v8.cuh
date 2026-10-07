@@ -32,7 +32,7 @@ struct FwdOParams {
     const bf16* AqkA;                                  // FLA Aqk (scale in), A-native (64-wide)
     float* O;                                          // [B,T,H,128] fp32, null = skip
     bf16* Ob;                                          // T9a: [B,T,H,128] bf16, null = skip
-    bf16* Vn;
+    bf16* Vn;                                          // null = skip (forward: unused)
     bf16* HbN;                                         // bN(h), null = skip
     bf16* ANv;                                         // aN(v_new), null = skip
     float scale; int H, NT;
@@ -148,7 +148,8 @@ __global__ void __launch_bounds__(512) g2_fwd_h_v8o_kernel(FwdOParams p) {
                 x[e] = bf_rne(uv - acc[e]);
                 reinterpret_cast<short*>(vB)[(16 * v1a + c_col(l, e)) * kPadT + 16 * r1 + m] = x[e];
             }
-            *reinterpret_cast<v4bh*>(p.Vn + (((chunk + i) * 4 + r1) * 8 + 2 * vs + v1a) * 256 + l * 4) = x;
+            if (p.Vn != nullptr)                         // forward: Vn unused (null)
+                *reinterpret_cast<v4bh*>(p.Vn + (((chunk + i) * 4 + r1) * 8 + 2 * vs + v1a) * 256 + l * 4) = x;
             if (p.ANv != nullptr)   // aN(v_new): A form, P3 block order; the C-frag
                 #pragma unroll      // col (l>>4)+4e swaps into 64*e + (l>>4)
                 for (int e = 0; e < 4; ++e)
@@ -234,6 +235,219 @@ __global__ void __launch_bounds__(512) g2_fwd_h_v8o_kernel(FwdOParams p) {
     }
 }
 
+
+// ================================================================ R1a: 4-wave v8o
+// KDA_G2_R1A=1 (default): 256 threads / 4 waves.  Wave w owns GEMM1 tiles (r1=w, both
+// v1a halves) and GEMM2 K-blocks {w, w+4}, so W/QgA/AqkA are loaded ONCE per CTA per
+// step (the 8-wave form loads them twice -- v1a=0/1 waves with equal r1 read the same
+// rows).  Every output tile's MMAC operand order is unchanged; only the owning wave and
+// the load multiplicity differ -> all outputs bit-identical (bench-verified).  LDS also
+// halves (oStage 4x256 instead of 8x256); runtime occupancy 3 -> 4 CTAs/CU.
+__device__ __forceinline__ void r1a_o_wave_order() {
+    __builtin_amdgcn_sched_barrier(0);
+    asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+    __builtin_amdgcn_sched_barrier(0);
+}
+
+template <bool VL>
+__global__ void __launch_bounds__(256) g2_fwd_h_v8o4_kernel(FwdOParams p) {
+    __shared__ __align__(16) bf16 hB[kBV * kPadK];
+    __shared__ __align__(16) bf16 vB[kBV * kPadT];
+    __shared__ __align__(16) bf16 oStage[4][256];
+    const int tid = threadIdx.x, wv = tid >> 6, l = tid & 63;   // wv in 0..3
+    const int vs = blockIdx.x;
+    const int sg = blockIdx.y / p.H, bh = blockIdx.y - sg * p.H;
+    const int c0 = p.seg ? p.seg[sg] : 0, c1 = p.seg ? p.seg[sg + 1] : p.NT;
+    if (c0 >= c1) return;
+    const size_t chunk = (size_t)bh * p.NT;
+    const int r1 = wv;                       // GEMM1/o T-tile
+    const int kb0 = wv, kb1 = wv + 4;        // GEMM2 K-blocks
+    const int m = l & 15, q4 = l >> 4;
+    const size_t rowT = (size_t)p.H * kK;
+    const size_t tok0 = chunk * kBT * rowT;
+
+    f4 ht0[2], ht1[2];
+    ht0[0] = f4{0.f,0.f,0.f,0.f}; ht0[1] = ht0[0];
+    ht1[0] = f4{0.f,0.f,0.f,0.f}; ht1[1] = ht1[0];
+    v4bh wf[8], kf0[4], kf1[4], uf0, uf1, qgf[8], aqf[4];
+    f4 gl0, gl1;
+
+    auto loadW = [&](int i) {
+        const bf16* src = p.Wn + (((chunk + i) * 4 + r1) * 8) * 256 + l * 4;
+        #pragma unroll
+        for (int kt = 0; kt < 8; ++kt) wf[kt] = ld8(src + kt * 256);
+    };
+    auto loadQg = [&](int i) {
+        const bf16* src = p.QgA + (((chunk + i) * 4 + r1) * 8) * 256 + l * 4;
+        #pragma unroll
+        for (int kt = 0; kt < 8; ++kt) qgf[kt] = ld8(src + kt * 256);
+    };
+    auto loadAq = [&](int i) {
+        const bf16* src = p.AqkA + (((chunk + i) * 4 + r1) * 4) * 256 + l * 4;
+        #pragma unroll
+        for (int st = 0; st < 4; ++st) aqf[st] = ld8(src + st * 256);
+    };
+    auto loadU = [&](int i, int v1a_, v4bh& uf) {
+        uf = ld8(p.Un + (((chunk + i) * 4 + r1) * 8 + 2 * vs + v1a_) * 256 + l * 4);
+    };
+    auto loadG = [&](int i, int kb, f4& gl) {
+        gl = *reinterpret_cast<const f4*>(p.Gn + ((chunk + i) * 8 + kb) * 16 + q4 * 4);
+    };
+    auto loadK = [&](int i, int kb, v4bh* kf) {
+        #pragma unroll
+        for (int rt = 0; rt < 4; ++rt)
+            kf[rt] = ld8(p.Kn + (((chunk + i) * 8 + kb) * 4 + rt) * 256 + l * 4);
+    };
+    v4bh hx[2];
+    auto write_h = [&](int kb, f4* ht) {
+        #pragma unroll
+        for (int vt = 0; vt < 2; ++vt)
+            #pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                hx[vt][e] = bf_rne(ht[vt][e]);
+                reinterpret_cast<short*>(hB)[(16 * vt + m) * kPadK + 16 * kb + c_col(l, e)] = hx[vt][e];
+            }
+    };
+    auto bN_emit = [&](int i2, int kb) {
+        if (p.HbN != nullptr) {
+            #pragma unroll
+            for (int vt = 0; vt < 2; ++vt) {
+                v4bh val;
+                #pragma unroll
+                for (int e = 0; e < 4; ++e)
+                    val[e] = reinterpret_cast<const short*>(hB)[(16 * vt + 4 * q4 + e) * kPadK + 16 * kb + pi16(m)];
+                const size_t off = ((((size_t)i2 * p.H + bh) * 8 + kb) * 8 + (2 * vs + vt)) * 256 + l * 4;
+                *reinterpret_cast<v4bh*>(p.HbN + off) = val;
+            }
+        }
+    };
+
+    loadW(c0); loadU(c0, 0, uf0); loadU(c0, 1, uf1);
+    loadG(c0, kb0, gl0); loadG(c0, kb1, gl1);
+    loadK(c0, kb0, kf0); loadK(c0, kb1, kf1);
+    write_h(kb0, ht0); write_h(kb1, ht1);
+    for (int i = c0; i < c1; ++i) {
+        const long otok = g2_row_tok<VL>(p.ctok, i);
+        const int olen = g2_row_len<VL>(p.clen, i);
+        const int nxt = i + 1 < c1 ? i + 1 : i;
+        lds_barrier();                                   // hB (h_i) ready
+        if (p.O != nullptr || p.Ob != nullptr) {         // R3: issue this step's
+            loadQg(i); loadAq(i);                        // QgA/AqkA right after bar1
+        }
+        bN_emit(i, kb0);
+        bN_emit(i, kb1);
+        // ---- GEMM1 both V-halves with ONE W load (the R1a dedup)
+        f4 acc0 = f4{0.f,0.f,0.f,0.f}, acc1 = f4{0.f,0.f,0.f,0.f};
+        #pragma unroll
+        for (int kt = 0; kt < 8; ++kt) {
+            acc0 = mmac(wf[kt], ld8(hB + (0 * 16 + m) * kPadK + 16 * kt + q4 * 4), acc0);
+            acc1 = mmac(wf[kt], ld8(hB + (1 * 16 + m) * kPadK + 16 * kt + q4 * 4), acc1);
+        }
+        loadW(nxt);
+        {
+            v4bh x0, x1;
+            #pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const float u0 = __uint_as_float(((uint32_t)(unsigned short)uf0[e]) << 16);
+                const float u1 = __uint_as_float(((uint32_t)(unsigned short)uf1[e]) << 16);
+                x0[e] = bf_rne(u0 - acc0[e]);
+                x1[e] = bf_rne(u1 - acc1[e]);
+                reinterpret_cast<short*>(vB)[(16 * 0 + c_col(l, e)) * kPadT + 16 * r1 + m] = x0[e];
+                reinterpret_cast<short*>(vB)[(16 * 1 + c_col(l, e)) * kPadT + 16 * r1 + m] = x1[e];
+            }
+            if (p.Vn != nullptr) {                       // forward: Vn unused (null)
+                *reinterpret_cast<v4bh*>(p.Vn + (((chunk + i) * 4 + r1) * 8 + 2 * vs + 0) * 256 + l * 4) = x0;
+                *reinterpret_cast<v4bh*>(p.Vn + (((chunk + i) * 4 + r1) * 8 + 2 * vs + 1) * 256 + l * 4) = x1;
+            }
+            if (p.ANv != nullptr)
+                #pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    reinterpret_cast<short*>(p.ANv)[((size_t)i * p.H + bh) * 8192 + (8 * r1 + 2 * vs + 0) * 256
+                           + (l >> 4) + 4 * (l & 15) + 64 * e] = x0[e];
+                    reinterpret_cast<short*>(p.ANv)[((size_t)i * p.H + bh) * 8192 + (8 * r1 + 2 * vs + 1) * 256
+                           + (l >> 4) + 4 * (l & 15) + 64 * e] = x1[e];
+                }
+        }
+        loadU(nxt, 0, uf0); loadU(nxt, 1, uf1);
+        {
+            f4 d0, d1;
+            #pragma unroll
+            for (int e = 0; e < 4; ++e) { d0[e] = exp2f(gl0[e]); d1[e] = exp2f(gl1[e]); }
+            ht0[0] *= d0; ht0[1] *= d0;
+            ht1[0] *= d1; ht1[1] *= d1;
+        }
+        loadG(nxt, kb0, gl0); loadG(nxt, kb1, gl1);
+        // ---- oh for both tiles (QgA/AqkA loaded ONCE)
+        f4 oh0 = f4{0.f,0.f,0.f,0.f}, oh1 = f4{0.f,0.f,0.f,0.f};
+        if (p.O != nullptr || p.Ob != nullptr) {
+            #pragma unroll
+            for (int kt = 0; kt < 8; ++kt) {
+                oh0 = mmac(qgf[kt], ld8(hB + (0 * 16 + m) * kPadK + 16 * kt + q4 * 4), oh0);
+                oh1 = mmac(qgf[kt], ld8(hB + (1 * 16 + m) * kPadK + 16 * kt + q4 * 4), oh1);
+            }
+        }
+        lds_barrier();                                   // vB (v_new_i) ready
+        if (p.O != nullptr || p.Ob != nullptr) {
+            #pragma unroll
+            for (int v1a = 0; v1a < 2; ++v1a) {
+                const f4& oh = v1a ? oh1 : oh0;
+                f4 oa = f4{0.f,0.f,0.f,0.f};
+                #pragma unroll
+                for (int st = 0; st < 4; ++st)
+                    oa = mmac(aqf[st], ld8(vB + (16 * v1a + m) * kPadT + 16 * st + q4 * 4), oa);
+                f4 o;
+                #pragma unroll
+                for (int e = 0; e < 4; ++e) o[e] = oh[e] * p.scale + oa[e];
+                const int orow = 16 * r1 + m;
+                const bool ook = g2_row_ok<VL ? 2 : 0>(orow, olen);
+                const size_t tok = (size_t)(otok + orow);
+                const size_t obase = tok * rowT + (size_t)bh * kK + 32 * vs + 16 * v1a;
+                if (p.O != nullptr) {
+                    if (ook) {
+                        #pragma unroll
+                        for (int e = 0; e < 4; ++e)
+                            p.O[obase + q4 + 4 * e] = o[e];
+                    }
+                } else {
+                    bf16* st_ = oStage[wv];
+                    #pragma unroll
+                    for (int e = 0; e < 4; ++e)
+                        reinterpret_cast<short*>(st_)[m * 16 + q4 + 4 * e] = bf_rne(o[e]);
+                    r1a_o_wave_order();
+                    const int m2 = l & 15, g2_ = l >> 4;
+                    const v4bh ov = *reinterpret_cast<const v4bh*>(
+                            reinterpret_cast<const short*>(st_) + m2 * 16 + 4 * g2_);
+                    if (ook) *reinterpret_cast<v4bh*>(p.Ob + obase + 4 * g2_) = ov;
+                }
+            }
+        }
+        // ---- GEMM2 for both K-blocks
+        #pragma unroll
+        for (int vt = 0; vt < 2; ++vt) {
+            f4 upd = f4{0.f,0.f,0.f,0.f};
+            #pragma unroll
+            for (int rt = 0; rt < 4; ++rt) {
+                const v4bh va = ld8(vB + (16 * vt + m) * kPadT + 16 * rt + q4 * 4);
+                upd = mmac(va, kf0[rt], upd);
+            }
+            ht0[vt] += upd;
+        }
+        #pragma unroll
+        for (int vt = 0; vt < 2; ++vt) {
+            f4 upd = f4{0.f,0.f,0.f,0.f};
+            #pragma unroll
+            for (int rt = 0; rt < 4; ++rt) {
+                const v4bh va = ld8(vB + (16 * vt + m) * kPadT + 16 * rt + q4 * 4);
+                upd = mmac(va, kf1[rt], upd);
+            }
+            ht1[vt] += upd;
+        }
+        loadK(nxt, kb0, kf0); loadK(nxt, kb1, kf1);
+        write_h(kb0, ht0);
+        write_h(kb1, ht1);
+    }
+}
+
 extern "C" int g2_fwd_h_v8o(const void* Wn, const void* Kn, const void* Un, const void* Gn,
                             const void* QgA, const void* AqkA, void* O, void* Ob, void* Vn,
                             void* HbN, void* ANv,
@@ -247,10 +461,16 @@ extern "C" int g2_fwd_h_v8o(const void* Wn, const void* Kn, const void* Un, cons
                  (const bf16*)QgA, (const bf16*)AqkA, (float*)O, (bf16*)Ob, (bf16*)Vn,
                  (bf16*)HbN, (bf16*)ANv,
                  scale, H, T / kBT, seg, nseg, ctok, clen};
-    if (ctok != nullptr)
-        hipLaunchKernelGGL(g2_fwd_h_v8o_kernel<true>, dim3(kK / kBV, nseg * H), dim3(512), 0, s, p);
-    else
-        hipLaunchKernelGGL(g2_fwd_h_v8o_kernel<false>, dim3(kK / kBV, nseg * H), dim3(512), 0, s, p);
+    int r1a = 1;   // R1a: 4-wave dedup form (bitwise equal; 0 restores the 8-wave form)
+    if (const char* e = getenv("KDA_G2_R1A")) r1a = atoi(e);
+    const dim3 grid(kK / kBV, (unsigned)nseg * H);
+    if (ctok != nullptr) {
+        if (r1a) hipLaunchKernelGGL(g2_fwd_h_v8o4_kernel<true>, grid, dim3(256), 0, s, p);
+        else     hipLaunchKernelGGL(g2_fwd_h_v8o_kernel<true>, grid, dim3(512), 0, s, p);
+    } else {
+        if (r1a) hipLaunchKernelGGL(g2_fwd_h_v8o4_kernel<false>, grid, dim3(256), 0, s, p);
+        else     hipLaunchKernelGGL(g2_fwd_h_v8o_kernel<false>, grid, dim3(512), 0, s, p);
+    }
     return (int)hipGetLastError();
 }
 

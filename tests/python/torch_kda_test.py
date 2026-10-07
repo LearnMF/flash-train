@@ -8,6 +8,8 @@ o 2e-2; dq, dk, dv 4e-2; dg, dbeta, dA_log, ddt_bias 6e-2. The G2 kernels comput
 operands with fp32 accumulation; observed errors are ~0.3-0.7%.
 """
 
+import os
+
 import pytest
 import torch
 
@@ -117,3 +119,67 @@ def test_rejects_decay_below_bound():
     x = make_inputs(64, 2, False)
     with pytest.raises(ValueError):
         ft.kimi_delta_attention(x["q"], x["k"], x["v"], x["g"] - 10.0, x["beta"])
+
+
+def _with_keep(mode, fn):
+    old = os.environ.get("FLASH_TRAIN_KDA_KEEP_STATE")
+    os.environ["FLASH_TRAIN_KDA_KEEP_STATE"] = mode
+    try:
+        return fn()
+    finally:
+        if old is None:
+            os.environ.pop("FLASH_TRAIN_KDA_KEEP_STATE")
+        else:
+            os.environ["FLASH_TRAIN_KDA_KEEP_STATE"] = old
+
+
+@pytest.mark.parametrize("gate_in_kernel", [True, False])
+@pytest.mark.parametrize("T,H,cu", CASES)
+def test_keep_state_is_bit_identical(T, H, cu, gate_in_kernel):
+    """The forward handing its recurrent state to the backward (instead of the backward
+    recomputing it) changes nothing: o and every gradient bit for bit."""
+    x = make_inputs(T, H, gate_in_kernel, seed=2 * T + H)
+    d_o = torch.randn(T, H, 128, device="cuda").bfloat16()
+    cu_t = torch.tensor(cu, dtype=torch.int32, device="cuda") if cu is not None else None
+    a = _with_keep("0", lambda: run(ft.kimi_delta_attention, x, d_o, cu_seqlens=cu_t))
+    b = _with_keep("1", lambda: run(ft.kimi_delta_attention, x, d_o, cu_seqlens=cu_t))
+    assert torch.equal(a[0], b[0])
+    for name in x:
+        assert torch.equal(a[1][name], b[1][name]), name
+
+
+def _recurrence_launches(fn):
+    from torch.profiler import ProfilerActivity, profile
+    with profile(activities=[ProfilerActivity.CUDA]) as p:
+        fn()
+        torch.cuda.synchronize()
+    return sum(e.count for e in p.key_averages() if "g2_fwd_h_v8o" in e.key)
+
+
+def test_checkpoint_recompute_keeps_state():
+    """Under a reentrant activation checkpoint (Megatron's recompute form) the recompute forward
+    keeps the state (auto): the backward runs no recurrence of its own -- 2 recurrence launches
+    (no-grad forward + recompute) instead of 3 -- and the gradients equal a plain call bit for bit."""
+    import torch.utils.checkpoint as tuc
+    T, H = 512, 4
+    x = make_inputs(T, H, True, seed=5)
+    d_o = torch.randn(T, H, 128, device="cuda").bfloat16()
+    plain = run(ft.kimi_delta_attention, x, d_o)
+
+    def ckpt(mode):
+        leaves = {n: t.detach().clone().requires_grad_(True) for n, t in x.items()}
+        order = ("q", "k", "v", "g", "beta", "A_log", "dt_bias")
+        f = lambda q, k, v, g, beta, a, dt: ft.kimi_delta_attention(q, k, v, g, beta, A_log=a, dt_bias=dt)
+
+        def step():
+            o = tuc.checkpoint(f, *(leaves[n] for n in order), use_reentrant=True)
+            o.backward(d_o)
+            return o
+        launches = _with_keep(mode, lambda: _recurrence_launches(step))
+        return launches, leaves
+
+    for mode, want in (("auto", 2), ("0", 3)):
+        launches, leaves = ckpt(mode)
+        assert launches == want, (mode, launches)
+        for name in x:
+            assert torch.equal(leaves[name].grad, plain[1][name]), (mode, name)
