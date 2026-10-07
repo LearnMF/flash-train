@@ -82,9 +82,8 @@ def test_deterministic():
 
 
 def test_packed_equals_separate():
-    """Sequences in one packed call are independent: bit-identical to separate varlen calls.
-    (The dense single-sequence path -- no cu_seqlens, T % 64 == 0 -- is a different kernel
-    instantiation and may differ in the last bits; it is checked against the tolerance.)"""
+    """Sequences in one packed call are independent: bit-identical to separate varlen calls,
+    and to the dense single-sequence path (no cu_seqlens, T % 64 == 0)."""
     lengths = [128, 64, 192]
     T, H = sum(lengths), 2
     x = make_inputs(T, H, True, seed=11)
@@ -99,8 +98,10 @@ def test_packed_equals_separate():
         assert torch.equal(op, o[s:s + n])
         for name in ("q", "k", "v", "g", "beta"):
             assert torch.equal(gp[name], g[name][s:s + n]), name
-        od, _ = run(ft.kimi_delta_attention, part, d_o[s:s + n])
-        assert rel_rms(od, op) < 1e-3
+        od, gd = run(ft.kimi_delta_attention, part, d_o[s:s + n])
+        assert torch.equal(od, op)
+        for name in ("q", "k", "v", "g", "beta"):
+            assert torch.equal(gd[name], gp[name]), name
         s += n
 
 

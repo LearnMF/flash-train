@@ -61,6 +61,11 @@ struct GateParams {
 // in fixed order (q0 + q1 + ...).
 template <int GATE, bool VL>
 __global__ void __launch_bounds__(256) g2_gate_kernel(GateParams p) {
+    // Z6: the VL and dense instantiations compiled to different FMA contraction choices
+    // (identical source, different guards -> different scheduling), giving ~1-2 bf16 ulp
+    // between the two instances on full chunks.  Pin contraction off for the whole body
+    // so both instantiations emit identical arithmetic.
+    #pragma clang fp contract(off)
     __shared__ float2 sTot[4][64];
     const int i = blockIdx.x, hh = blockIdx.y;
     const int c = threadIdx.x & 63, w = threadIdx.x >> 6;
