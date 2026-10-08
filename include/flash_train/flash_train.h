@@ -68,7 +68,8 @@ typedef struct {
 } FTrainKdaForwardTensors;
 
 /** @brief The Tensor ports of one KDA backward call (see ftrainPatternAddKdaBackward); state is
- * the forward's optional state output (null memory when the forward did not write one). */
+ * the forward's optional state output (null memory when the forward did not write one). The
+ * outputs dq, dk, dg also serve as scratch during the call and must not alias any input. */
 typedef struct {
     FTrainStorageView d_o, q, k, v, g, beta, a_log, dt_bias, cu_seqlens, q_rstd, k_rstd, aqk, akk;
     FTrainStorageView dq, dk, dv, dg, dbeta, da_log, ddt_bias;

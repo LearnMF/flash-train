@@ -46,6 +46,13 @@ def make_inputs(T, H, gate_in_kernel, seed=0):
     return x
 
 
+def make_d_o(T, H, seed):
+    # seeded: the default CUDA generator's seed differs per process, which made the
+    # tolerance checks (e.g. the 2-element dA_log of H = 2) vary from run to run
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    return torch.randn(T, H, 128, device="cuda", generator=gen).bfloat16()
+
+
 def run(fn, x, d_o, **kw):
     leaves = {n: t.detach().clone().requires_grad_(True) for n, t in x.items()}
     o = fn(leaves["q"], leaves["k"], leaves["v"], leaves["g"], leaves["beta"], A_log=leaves.get("A_log"),
@@ -62,7 +69,7 @@ CASES = [(64, 2, None), (100, 2, None), (257, 4, None), (512, 4, None),
 @pytest.mark.parametrize("T,H,cu", CASES)
 def test_matches_fp64_reference(T, H, cu, gate_in_kernel):
     x = make_inputs(T, H, gate_in_kernel, seed=T + H)
-    d_o = torch.randn(T, H, 128, device="cuda").bfloat16()
+    d_o = make_d_o(T, H, seed=T + H + 1)
     cu_t = torch.tensor(cu, dtype=torch.int32, device="cuda") if cu is not None else None
     o, g = run(ft.kimi_delta_attention, x, d_o, cu_seqlens=cu_t)
     ro, rg = run(ft.kda_reference, x, d_o, cu_seqlens=cu_t)
@@ -75,7 +82,7 @@ def test_matches_fp64_reference(T, H, cu, gate_in_kernel):
 
 def test_deterministic():
     x = make_inputs(512, 4, True, seed=3)
-    d_o = torch.randn(512, 4, 128, device="cuda").bfloat16()
+    d_o = make_d_o(512, 4, seed=4)
     a = run(ft.kimi_delta_attention, x, d_o)
     b = run(ft.kimi_delta_attention, x, d_o)
     assert torch.equal(a[0], b[0])
@@ -89,7 +96,7 @@ def test_packed_equals_separate():
     lengths = [128, 64, 192]
     T, H = sum(lengths), 2
     x = make_inputs(T, H, True, seed=11)
-    d_o = torch.randn(T, H, 128, device="cuda").bfloat16()
+    d_o = make_d_o(T, H, seed=12)
     cu = torch.tensor([0, 128, 192, 384], dtype=torch.int32, device="cuda")
     o, g = run(ft.kimi_delta_attention, x, d_o, cu_seqlens=cu)
     s = 0
@@ -139,7 +146,7 @@ def test_keep_state_is_bit_identical(T, H, cu, gate_in_kernel):
     """The forward handing its recurrent state to the backward (instead of the backward
     recomputing it) changes nothing: o and every gradient bit for bit."""
     x = make_inputs(T, H, gate_in_kernel, seed=2 * T + H)
-    d_o = torch.randn(T, H, 128, device="cuda").bfloat16()
+    d_o = make_d_o(T, H, seed=2 * T + H + 1)
     cu_t = torch.tensor(cu, dtype=torch.int32, device="cuda") if cu is not None else None
     a = _with_keep("0", lambda: run(ft.kimi_delta_attention, x, d_o, cu_seqlens=cu_t))
     b = _with_keep("1", lambda: run(ft.kimi_delta_attention, x, d_o, cu_seqlens=cu_t))
@@ -163,7 +170,7 @@ def test_checkpoint_recompute_keeps_state():
     import torch.utils.checkpoint as tuc
     T, H = 512, 4
     x = make_inputs(T, H, True, seed=5)
-    d_o = torch.randn(T, H, 128, device="cuda").bfloat16()
+    d_o = make_d_o(T, H, seed=6)
     plain = run(ft.kimi_delta_attention, x, d_o)
 
     def ckpt(mode):

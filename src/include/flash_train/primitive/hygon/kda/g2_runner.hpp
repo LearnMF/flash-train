@@ -44,7 +44,7 @@ struct ForwardArgs {
     const void* a_log;    // fp32 [H] (gate_in_kernel only)
     const void* dt_bias;  // fp32 [H, 128] (gate_in_kernel only)
     const int* cu_seqlens;
-    void* o;       // bf16 [T, H, 128]
+    void* o;       // bf16 [T, H, 128]; doubles as scratch until the recurrence writes it (must not alias inputs)
     void* q_rstd;  // fp32 [T, H] (l2norm_qk only): saved for the backward
     void* k_rstd;  // fp32 [T, H] (l2norm_qk only)
     void* aqk;     // bf16 [T, H, 64]: saved for the backward
@@ -73,6 +73,7 @@ struct BackwardArgs {
     const void* k_rstd;
     const void* aqk;
     const void* akk;
+    // dq / dk / dg double as scratch until the final kernel writes them: they must not alias any input.
     void* dq;        // bf16 [T, H, 128]
     void* dk;        // bf16 [T, H, 128]
     void* dv;        // bf16 [T, H, 128]

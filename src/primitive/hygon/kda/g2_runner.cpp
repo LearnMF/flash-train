@@ -107,10 +107,11 @@ Tables takeTables(Arena& arena, const Shape& shape, const Sizes& z) {
 // l2norm_qk (the K3 path): the R4 single-pass prep reads the raw q/k/g once, so neither qn/kn nor
 // the fp32 gate cumsum is materialized -- only its R (fp32 A partials) and Kb (bf16 k*beta*2^g)
 // hand-offs.  Without in-kernel l2norm the X1 chain (gate -> fwd_intra2_split -> to_gn) runs.
-// Vn (v_new) is a backward-only tensor: the forward does not write it.
+// Vn (v_new) is a backward-only tensor: the forward does not write it. Kb lives only between the
+// two prep kernels, so it is staged in the output o (same bf16 [T, H, 128]; the recurrence writes o last).
 struct ForwardLayout {
     Tables tab;
-    void *g, *Kb, *Wn, *Kn, *Un, *QgA, *AqkA, *R, *Gn;
+    void *g, *Wn, *Kn, *Un, *QgA, *AqkA, *R, *Gn;
 };
 
 ForwardLayout layoutForward(const Shape& shape, void* base, std::uint64_t* used) {
@@ -119,7 +120,6 @@ ForwardLayout layoutForward(const Shape& shape, void* base, std::uint64_t* used)
     ForwardLayout L{};
     L.tab  = takeTables(a, shape, z);
     L.g    = shape.l2norm_qk ? nullptr : a.take(z.rows128() * 4);
-    L.Kb   = shape.l2norm_qk ? a.take(z.rows128() * 2) : nullptr;
     L.Wn   = a.take(z.CH * 8192 * 2);
     L.Kn   = a.take(z.CH * 8192 * 2);
     L.Un   = a.take(z.CH * 8192 * 2);
@@ -136,9 +136,16 @@ ForwardLayout layoutForward(const Shape& shape, void* base, std::uint64_t* used)
 //   B2 = KgA | Qn | Wb | Vn | dVn | dOT (through dhu)  -> later fp32 dq | dk | dg (wy -> tail)
 // Both reuses fit exactly: 3 x 8192 = 16384 + 8192 elements per chunk-head, and
 // 6 x 8192 bf16 per chunk-head = 3 x 64 rows x 128 fp32 >= 3 x T x H x 128 fp32 bytes.
+//
+// Staged reuse of the caller's output memory: dq, dk, dg are only written by the final tail
+// kernel, so until then they host three row-sized intermediates (qn in dq, kn in dk, fp32 dA
+// [T, H, 64] in dg -- equal or smaller byte sizes, any packed layout). The tail reads each
+// qn / kn element before writing the dq / dk element at the same position (same lane), and dA
+// is dead after wy. This keeps the outputs out of the peak (they used to sit idle beside the
+// wy-stage working set): the workspace no longer holds qn, kn, dA.
 struct BackwardLayout {
     Tables tab;
-    void *qn, *kn, *g, *dA, *Gn;
+    void *g, *Gn;
     void *kgB, *vB, *ANv, *HbN, *aNdo;
     void *Wn, *Kn, *Un, *HbNdh, *ANv2;     // B1
     void *KgA, *Qn, *Wb, *Vn, *dVn, *dOT;  // B2
@@ -151,10 +158,7 @@ BackwardLayout layoutBackward(const Shape& shape, void* base, std::uint64_t* use
     Arena a(base);
     BackwardLayout L{};
     L.tab                   = takeTables(a, shape, z);
-    L.qn                    = shape.l2norm_qk ? a.take(z.rows128() * 2) : nullptr;
-    L.kn                    = shape.l2norm_qk ? a.take(z.rows128() * 2) : nullptr;
     L.g                     = a.take(z.rows128() * 4);
-    L.dA                    = a.take(z.T * z.H * 64 * 4);
     L.Gn                    = a.take(z.CH * 128 * 4);
     L.kgB                   = a.take(z.CH * 8192 * 2);
     L.vB                    = a.take(z.CH * 8192 * 2);
@@ -219,7 +223,7 @@ void forward(const Shape& shape, const ForwardArgs& p, void* workspace, FTrainSt
     if (shape.l2norm_qk) {  // R4: l2norm + gate + fwd_intra2 + to_gn in two kernels, bitwise the X1 chain
         check(g2_fwd_prep(p.q, p.k, p.v, p.g, shape.gate_in_kernel ? p.a_log : nullptr,
                           shape.gate_in_kernel ? p.dt_bias : nullptr, p.beta, L.Wn, L.Kn, L.Un, L.QgA, L.AqkA, p.aqk,
-                          p.akk, p.q_rstd, p.k_rstd, L.Gn, L.R, L.Kb, shape.gate_in_kernel ? p.lower_bound : 0.0,
+                          p.akk, p.q_rstd, p.k_rstd, L.Gn, L.R, p.o, shape.gate_in_kernel ? p.lower_bound : 0.0,
                           kRcpLn2, shape.gate_in_kernel ? 1 : 0, p.scale, H, NT, L.tab.ctok, L.tab.clen, stream),
               "fwd_prep");
     } else {
@@ -252,13 +256,14 @@ void backward(const Shape& shape, const BackwardArgs& p, void* workspace, FTrain
         check(g2_kda_tables(p.cu_seqlens, static_cast<int>(z.N), T, NT, L.tab.ctok, L.tab.clen, L.tab.seg, stream),
               "tables");
     }
+    void* dA       = p.dg;  // staged: fp32 [T, H, 64] fits g's-dtype [T, H, 128]; dead before the tail writes dg
     const void* qn = p.q;
     const void* kn = p.k;
     if (shape.l2norm_qk) {  // V1: bf16(x * rstd) from the saved rstd == the forward's qn/kn bit for bit
-        check(g2_l2n_apply(p.q, p.k, p.q_rstd, p.k_rstd, L.qn, L.kn, static_cast<long>(z.T * z.H), stream),
-              "l2n_apply");
-        qn = L.qn;
-        kn = L.kn;
+        check(g2_l2n_apply(p.q, p.k, p.q_rstd, p.k_rstd, p.dq, p.dk, static_cast<long>(z.T * z.H), stream),
+              "l2n_apply");  // staged in the dq / dk outputs (the tail overwrites them in place)
+        qn = p.dq;
+        kn = p.dk;
     }
     check(g2_head_gate(p.g, shape.gate_in_kernel ? p.a_log : nullptr, shape.gate_in_kernel ? p.dt_bias : nullptr, L.g,
                        p.lower_bound, kRcpLn2, shape.gate_in_kernel ? 1 : 0, NT, H, ctok, clen, stream),
@@ -278,11 +283,11 @@ void backward(const Shape& shape, const BackwardArgs& p, void* workspace, FTrain
                            NT * 64, H, L.tab.seg, nseg, nullptr, nullptr, stream),
               "fwd_h_bn");
     }
-    check(g2_dav(p.d_o, Vn, p.aqk, L.dA, L.dVn, L.dOT, L.aNdo, p.scale, 1, NT * 64, H, ctok, clen, stream), "dav");
+    check(g2_dav(p.d_o, Vn, p.aqk, dA, L.dVn, L.dOT, L.aNdo, p.scale, 1, NT * 64, H, ctok, clen, stream), "dav");
     check(g2_dhu_v8b(L.KgA, L.Qn, L.Wb, L.dOT, L.dVn, L.Gn, nullptr, L.HbNdh, L.ANv2, p.scale, 1, NT * 64, H, L.tab.seg,
                      nseg, stream),
           "dhu");
-    check(g2_wy_s4_split(L.kgB, kn, L.vB, ANv, L.g, p.beta, p.akk, HbN, L.aNdo, L.HbNdh, L.ANv2, L.dA, L.dq, L.dk, p.dv,
+    check(g2_wy_s4_split(L.kgB, kn, L.vB, ANv, L.g, p.beta, p.akk, HbN, L.aNdo, L.HbNdh, L.ANv2, dA, L.dq, L.dk, p.dv,
                          L.dg, p.dbeta, L.dAout, L.dwT, L.dbPart, p.scale, NT * 64, H, NT, qn, p.v, ctok, clen, stream),
           "wy");
     // dbeta: the post-activation beta's gradient is wy's fp32 db, written in place (use_beta = 0).
