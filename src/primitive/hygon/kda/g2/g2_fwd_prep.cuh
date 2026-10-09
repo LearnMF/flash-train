@@ -135,6 +135,15 @@ __device__ __forceinline__ float2 gate_carry(const float2* sTot) {
     return float2{carry.x - cc.x, carry.y - cc.y};
 }
 
+// V2 (kra P-2): hardware exp2 for arguments PROVEN to lie in [-126, 128).  exp2f lowers to a
+// 6-instruction sequence (cmp, cndmask, add, v_exp, cndmask, mul) that only differs from a
+// bare v_exp_f32 when the result would be denormal (x < -126); inside the range it adds 0 and
+// multiplies by 1.0, so the result is bitwise identical.  Only valid under the safe-gate
+// contract (per-token decay >= -5 nat = -7.2135 log2, the same contract the 16-row sub-blocks
+// with a mid/start reference rely on): |x| <= 8 rows * 7.2135 = 57.7 (P1a) and
+// <= 15 rows * 7.2135 = 108.2 (P1b eO).
+__device__ __forceinline__ float exp2_inrange(float x) { return __builtin_amdgcn_exp2f(x); }
+
 template <int GATE, bool VL>
 __global__ void __launch_bounds__(256) g2_fwd_prep_a_kernel(PrepAParams p) {
     using namespace fi2;
@@ -342,8 +351,8 @@ __global__ void __launch_bounds__(256) g2_fwd_prep_a_kernel(PrepAParams p) {
             #pragma unroll
             for (int kt = 0; kt < 4; ++kt) {
                 const int s0 = 2 * kt, s1 = 2 * kt + 1;
-                const f2 eA = f2{exp2f(G_(rb, s0) - gm[s0]), exp2f(G_(rb, s1) - gm[s1])};
-                const f2 eB = f2{exp2f(gm[s0] - G_(rb, s0)), exp2f(gm[s1] - G_(rb, s1))};
+                const f2 eA = f2{exp2_inrange(G_(rb, s0) - gm[s0]), exp2_inrange(G_(rb, s1) - gm[s1])};
+                const f2 eB = f2{exp2_inrange(gm[s0] - G_(rb, s0)), exp2_inrange(gm[s1] - G_(rb, s1))};
                 const f2 Bd = f2{K(rb, s0), K(rb, s1)} * eB;
                 acc[rb] = mmac32(f2{Q(rb, s0), Q(rb, s1)} * eA, Bd, acc[rb]);
                 acc[4 + rb] = mmac32(f2{K(rb, s0), K(rb, s1)} * eA, Bd, acc[4 + rb]);
@@ -375,7 +384,7 @@ __global__ void __launch_bounds__(256) g2_fwd_prep_a_kernel(PrepAParams p) {
                 #pragma unroll
                 for (int kt = 0; kt < 4; ++kt) {
                     const int s0 = 2 * kt, s1 = 2 * kt + 1;
-                    const f2 eO = f2{exp2f(G_(rb, s0) - gr[s0]), exp2f(G_(rb, s1) - gr[s1])};
+                    const f2 eO = f2{exp2_inrange(G_(rb, s0) - gr[s0]), exp2_inrange(G_(rb, s1) - gr[s1])};
                     const f2 Aq = f2{Q(rb, s0), Q(rb, s1)} * eO;
                     const f2 Ak = f2{K(rb, s0), K(rb, s1)} * eO;
                     #pragma unroll

@@ -876,16 +876,9 @@ p3_wy_s4a_kernel(WyS4AParams p) {
                 dA[st] = mmac(dva[vt], ld8(vBN + ((st * 8 + vt) * 64 + l) * 4), dA[st]);
         lds_barrier();                                                      // dvT dead -> dwT
 
-        v4bh af[8], bf0[8], bf1[8];
+        const v4bh (&af)[8] = dva;   // V4 (kra P-3): dvN fragments are already in dva -- no reload
         {   // pass W: -dw -> dwT (S), dA += (-dw) kg^T   [verbatim from the .inc]
-            #pragma unroll
-            for (int vt = 0; vt < 8; ++vt) af[vt] = aN(dvN, vt);
-            auto loadB = [&](int kt, v4bh* bf) {
-                const bf16* pb = hb + (kt * 8 * 64 + l) * 4;
-                #pragma unroll
-                for (int vt = 0; vt < 8; ++vt) bf[vt] = ld8(pb + vt * 256);
-            };
-            auto body = [&](int kt, v4bh* bf) {
+            auto body = [&](int kt, const v4bh* bf) {
                 f4 a4[4];
                 #pragma unroll
                 for (int j = 0; j < 4; ++j) a4[j] = f4{0.f, 0.f, 0.f, 0.f};
@@ -905,13 +898,30 @@ p3_wy_s4a_kernel(WyS4AParams p) {
                     dA[st] = mmac(dwn, kgb, dA[st]);
                 }
             };
-            loadB(0, bf0);
+            // V5 (kra P-4): the h block of step kt (8 vt fragments x 64 lanes x 8 B = 4 KB) does
+            // not depend on the wave, so the 4 waves used to fetch it 4 times with 8 B loads.
+            // Now the CTA fetches it ONCE with one 16 B load per thread into XT (free until the
+            // dA stage; 2 x 4 KB double buffer) and every wave reads its fragments from LDS in
+            // the global layout (lane-contiguous 8 B: bank-conflict free).  Values unchanged.
+            short* hs = reinterpret_cast<short*>(XT);
+            const bf16* hsrc = hb + 8 * tid;
+            f4 hreg = *reinterpret_cast<const f4*>(hsrc);                       // block 0
+            *reinterpret_cast<f4*>(hs + 8 * tid) = hreg;
+            hreg = *reinterpret_cast<const f4*>(hsrc + 2048);                   // block 1
+            lds_barrier();                                                      // block 0 visible
             #pragma unroll 1
-            for (int kt = 0; kt < 8; kt += 2) {
-                loadB(kt + 1, bf1);
-                body(kt, bf0);
-                loadB(kt < 6 ? kt + 2 : kt + 1, bf0);
-                body(kt + 1, bf1);
+            for (int kt = 0; kt < 8; ++kt) {
+                v4bh bf[8];
+                const bf16* hk = reinterpret_cast<const bf16*>(hs + (kt & 1) * 2048) + l * 4;
+                #pragma unroll
+                for (int vt = 0; vt < 8; ++vt) bf[vt] = ld8(hk + vt * 256);
+                if (kt < 7) {
+                    // buffer (kt+1)&1 was last read in step kt-1, before the barrier ending kt-1
+                    *reinterpret_cast<f4*>(hs + ((kt + 1) & 1) * 2048 + 8 * tid) = hreg;
+                    if (kt < 6) hreg = *reinterpret_cast<const f4*>(hsrc + (kt + 2) * 2048);
+                }
+                body(kt, bf);
+                lds_barrier();      // block kt+1 visible; reads of block kt done before reuse
             }
         }
         // dA stage: da = mask(dA*beta), XC = da A^T -> XT (LDS), dak = mask(-A^T XT) -> global

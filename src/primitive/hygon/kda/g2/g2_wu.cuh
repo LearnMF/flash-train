@@ -68,6 +68,22 @@ __device__ __forceinline__ size_t wu_vb_quad(int j, int vq, size_t nblk3) {
 }
 
 constexpr int kPadJ2 = 68;
+constexpr int kPadA = 68;   // sA row stride (shorts): 136 B rows spread the MMAC A-fragment reads over all banks
+
+// V1 (kra P-1): bank-conflict-free LDS layouts.  Pure address remaps -- every value is
+// computed exactly as before, so all outputs stay bitwise identical.
+//  slab: the 8 B column granule (j >> 2) of row r is XOR-ed with (r >> 3) & 15, which
+//        spreads the column-wise b16 fill stores of phases 1/2 (8-way -> 2-way) and keeps
+//        the MMAC B-fragment b64 reads conflict-free.
+//  tile: the 8 B granule of element e is XOR-ed with (e >> 10) & 7 (stays inside the
+//        8192-element block), spreading the B-form scalar stores (8-way -> 2-way) while
+//        the linear 8 B emit reads stay conflict-free.
+__device__ __forceinline__ int wu_slab_col(int r, int j) {
+    return ((((j >> 2) ^ (r >> 3)) & 15) << 2) | (j & 3);
+}
+__device__ __forceinline__ int wu_tile_idx(int e) {
+    return (((e >> 2) ^ ((e >> 10) & 7)) << 2) | (e & 3);
+}
 
 // VL (varlen phase 2): k/v/q/beta/A rows r >= clen read as 0 (the zero padding), g rows
 // are read from the CLAMPED row (address only, the value math is the dense code), incl.
@@ -79,7 +95,7 @@ __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p) {
     __shared__ __align__(16) short slab[128 * kPadJ2];
     __shared__ float sBeta[kBT];
     __shared__ __align__(16) float sGl[kK];   // chunk-last g row: kg = k * 2^(gl-g)
-    __shared__ __align__(16) short sA[kBT * kBT];
+    __shared__ __align__(16) short sA[kBT * kPadA];
     const int cl = g2_row_len<VL>(p.clen, i);
     // varlen: ONE uniform branch per CTA -- full chunks run the unmasked body (M=1)
     g2_vl_dispatch<VL>(cl, [&](auto mode_) {
@@ -100,7 +116,7 @@ __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p) {
                 ld16f(p.g + sbase + g2_row_g<M>(63, cl) * rstride + 4 * tid);
         for (int t = tid; t < 1024; t += 256) {          // sA: 64x64 bf16 row-major
             const int r = t >> 4, c4 = (t & 15) << 2;
-            *reinterpret_cast<v4bh*>(sA + r * kBT + c4) = g2_row_ok<M>(r, cl)
+            *reinterpret_cast<v4bh*>(sA + r * kPadA + c4) = g2_row_ok<M>(r, cl)
                 ? *reinterpret_cast<const v4bh*>(
                       p.A + g2_rm_tok(g2_row_tok<VL>(p.ctok, i) + r, hh, p.H, kBT) + c4)
                 : v4bh{0, 0, 0, 0};
@@ -120,10 +136,11 @@ __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p) {
             for (int vt = 0; vt < 8; ++vt) acc[vt] = f4{0.f, 0.f, 0.f, 0.f};
             for (int js = 0; js < 4; ++js) {
                 const v4bh af = *reinterpret_cast<const v4bh*>(
-                    sA + (size_t)(16 * wv + (l & 15)) * kBT + 16 * js + (l >> 4) * 4);
+                    sA + (size_t)(16 * wv + (l & 15)) * kPadA + 16 * js + (l >> 4) * 4);
                 #pragma unroll
                 for (int vt = 0; vt < 8; ++vt) {
-                    const size_t lo = (size_t)(16 * vt + (l & 15)) * kPadJ2 + 16 * js + (l >> 4) * 4;
+                    const int br = 16 * vt + (l & 15);
+                    const size_t lo = (size_t)br * kPadJ2 + wu_slab_col(br, 16 * js + (l >> 4) * 4);
                     acc[vt] = mmac(af, *reinterpret_cast<const v4bh*>(slab + lo), acc[vt]);
                 }
             }
@@ -175,7 +192,8 @@ __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p) {
                 // kbT staged with pi16-permuted rows (C-pi): the w-MMAC C
                 // fragment then holds lane-contiguous native Wn columns.
                 const int vv = vq + dv;
-                slab[(size_t)(16 * (vv >> 4) + pi16(vv & 15)) * kPadJ2 + j] =
+                const int sr = 16 * (vv >> 4) + pi16(vv & 15);
+                slab[(size_t)sr * kPadJ2 + wu_slab_col(sr, j)] =
                     bf_rne(bf2f(kv[dv]) * b * eg[dv]);
             }
             short gv[4], gkv[4];
@@ -213,7 +231,7 @@ __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p) {
             const float b = sBeta[j];
             #pragma unroll
             for (int dv = 0; dv < 4; ++dv)
-                slab[(size_t)(vq + dv) * kPadJ2 + j] = bf_rne(bf2f(vv[dv]) * b);
+                slab[(size_t)(vq + dv) * kPadJ2 + wu_slab_col(vq + dv, j)] = bf_rne(bf2f(vv[dv]) * b);
             *reinterpret_cast<v4bh*>(p.vB + wu_vb_quad(j, vq, nblk3)) = vv;
         }
         if (p.stop == 4) return;
@@ -239,12 +257,12 @@ __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p) {
                 const int ibn = (j & 3) + 4 * (vq & 15) + 64 * ((j >> 2) & 3)
                                 + 256 * (j >> 4) + 1024 * (vq >> 4);
                 #pragma unroll
-                for (int dv = 0; dv < 4; ++dv) tile[ibn + 4 * dv] = qgv[dv];
+                for (int dv = 0; dv < 4; ++dv) tile[wu_tile_idx(ibn + 4 * dv)] = qgv[dv];
             }
             __syncthreads();
             for (int t = tid; t < 2048; t += 256)            // linear 8B global emit
                 *reinterpret_cast<v4bh*>(p.Qn + nblk + 4 * t) =
-                    *reinterpret_cast<const v4bh*>(tile + 4 * t);
+                    *reinterpret_cast<const v4bh*>(tile + wu_tile_idx(4 * t));
         }
         if (p.stop == 7) return;
     });
