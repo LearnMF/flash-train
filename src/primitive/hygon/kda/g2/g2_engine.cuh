@@ -269,7 +269,14 @@ extern "C" __global__ void __launch_bounds__(512) g2_dhu_w8b_kernel(BwdNParams p
     }
 }
 
-extern "C" __global__ void __launch_bounds__(512) g2_dhu_v8b_kernel(BwdNParams p) {
+template <int MODE = 0>
+__global__ void __launch_bounds__(512) g2_dhu_v8b_kernel(BwdNParams p) {
+    // kra P-10: MODE 1 = production output set (HbN + ANv2; dv2 and dh null) as compile-time
+    // constants -- runtime-optional VMEM ops make the waitcnt pass count the skip path.
+    const bool hasBN = MODE == 0 ? p.HbN != nullptr : true;
+    const bool hasDH = MODE == 0 ? p.dh != nullptr : false;
+    const bool hasDV2 = MODE == 0 ? p.dv2 != nullptr : false;
+    const bool hasAN2 = MODE == 0 ? p.ANv2 != nullptr : true;
     __shared__ __align__(16) bf16 dhB[kBV * kPadK];      // dh as [v][k]   (GEMM-A B operand)
     __shared__ __align__(16) bf16 vB[kBV * kPadT];       // dv2 as [v][t]  (GEMM-B A operand)
     __shared__ __align__(16) v4bh dOs[2][8 * 64];        // dO^T A-frags [vt*4+rt][lane], double buffered
@@ -318,7 +325,7 @@ extern "C" __global__ void __launch_bounds__(512) g2_dhu_v8b_kernel(BwdNParams p
         lds_barrier();
         // bN(dh) emit: dhB holds this wave's k-tile after write_dh; slot (kt=wv, vt,
         // l, e) = dh[16*wv + pi(m)][16*(2*vs+vt) + 4*(l>>4) + e]
-        if (p.HbN != nullptr) {
+        if (hasBN) {
             const int q4_ = l >> 4, m_ = l & 15;
             #pragma unroll
             for (int vt = 0; vt < 2; ++vt) {
@@ -333,7 +340,7 @@ extern "C" __global__ void __launch_bounds__(512) g2_dhu_v8b_kernel(BwdNParams p
     }
     for (int s = 0; s < c1 - c0; ++s) {
         const int i = last - s, nxt = i > c0 ? i - 1 : c0;
-        if (p.dh != nullptr) {
+        if (hasDH) {
             #pragma unroll
             for (int vt = 0; vt < 2; ++vt)
                 *reinterpret_cast<v4bh*>(p.dh + (((chunk + i) * 8 + 2 * vs + vt) * 8 + wv) * 256 + l * 4) = hx[vt];
@@ -342,7 +349,7 @@ extern "C" __global__ void __launch_bounds__(512) g2_dhu_v8b_kernel(BwdNParams p
         loadDO(nxt);                                     // a full step ahead of its publish
         lds_barrier();                                   // dhB (entry state of chunk i) + dOs ready
         // bN(dh) emit: slot (kt=wv, vt, l, e) = dh[16*wv + pi(m)][16*(2*vs+vt) + 4*(l>>4) + e]
-        if (p.HbN != nullptr) {
+        if (hasBN) {
             const int q4_ = l >> 4, m_ = l & 15;
             #pragma unroll
             for (int vt = 0; vt < 2; ++vt) {
@@ -367,9 +374,9 @@ extern "C" __global__ void __launch_bounds__(512) g2_dhu_v8b_kernel(BwdNParams p
                 x[e] = bf_rne(d);
                 reinterpret_cast<short*>(vB)[(16 * v1 + c_col(l, e)) * kPadT + 16 * r1 + c_row(l)] = x[e];
             }
-            if (p.dv2 != nullptr)  // T9b: the global dV2n write is optional; the
+            if (hasDV2)  // T9b: the global dV2n write is optional; the
                 *reinterpret_cast<v4bh*>(p.dv2 + (((chunk + i) * 4 + r1) * 8 + 2 * vs + v1) * 256 + l * 4) = x;
-            if (p.ANv2 != nullptr)  // aN(dv2): same C-frag swap as the engines' aN emits
+            if (hasAN2)  // aN(dv2): same C-frag swap as the engines' aN emits
                 #pragma unroll
                 for (int e = 0; e < 4; ++e)
                     reinterpret_cast<short*>(p.ANv2)[((size_t)i * p.H + bh) * 8192 + (8 * r1 + 2 * vs + v1) * 256
@@ -407,7 +414,14 @@ extern "C" __global__ void __launch_bounds__(512) g2_dhu_v8b_kernel(BwdNParams p
 // 1.026x H=24, 1.093x H=48, occ 3->3, 185 VGPR 0 spill).  At deep saturation
 // (H=96, 384 CTAs) latency hiding is WORSE (0.961x) -> host auto-selects by CTA
 // count; KDA_G2_R1A_DHU=0/1 forces the 8-wave/4-wave form.
+template <int MODE = 0>
 __global__ void __launch_bounds__(256) g2_dhu_v8b4_kernel(BwdNParams p) {
+    // kra P-10: MODE 1 = production output set (HbN + ANv2; dv2 and dh null) as compile-time
+    // constants -- runtime-optional VMEM ops make the waitcnt pass count the skip path.
+    const bool hasBN = MODE == 0 ? p.HbN != nullptr : true;
+    const bool hasDH = MODE == 0 ? p.dh != nullptr : false;
+    const bool hasDV2 = MODE == 0 ? p.dv2 != nullptr : false;
+    const bool hasAN2 = MODE == 0 ? p.ANv2 != nullptr : true;
     __shared__ __align__(16) bf16 dhB[kBV * kPadK];
     __shared__ __align__(16) bf16 vB[kBV * kPadT];
     __shared__ __align__(16) v4bh dOs[2][8 * 64];
@@ -455,7 +469,7 @@ __global__ void __launch_bounds__(256) g2_dhu_v8b4_kernel(BwdNParams p) {
             }
     };
     auto bN_emit = [&](int i, int kb) {
-        if (p.HbN != nullptr) {
+        if (hasBN) {
             const int q4_ = l >> 4, m_ = l & 15;
             #pragma unroll
             for (int vt = 0; vt < 2; ++vt) {
@@ -482,7 +496,7 @@ __global__ void __launch_bounds__(256) g2_dhu_v8b4_kernel(BwdNParams p) {
     }
     for (int s = 0; s < c1 - c0; ++s) {
         const int i = last - s, nxt = i > c0 ? i - 1 : c0;
-        if (p.dh != nullptr) {
+        if (hasDH) {
             #pragma unroll
             for (int vt = 0; vt < 2; ++vt) {
                 *reinterpret_cast<v4bh*>(p.dh + (((chunk + i) * 8 + 2 * vs + vt) * 8 + kb0) * 256 + l * 4) = hx0[vt];
@@ -513,9 +527,9 @@ __global__ void __launch_bounds__(256) g2_dhu_v8b4_kernel(BwdNParams p) {
                 x[e] = bf_rne(d);
                 reinterpret_cast<short*>(vB)[(16 * v1 + c_col(l, e)) * kPadT + 16 * r1 + c_row(l)] = x[e];
             }
-            if (p.dv2 != nullptr)
+            if (hasDV2)
                 *reinterpret_cast<v4bh*>(p.dv2 + (((chunk + i) * 4 + r1) * 8 + 2 * vs + v1) * 256 + l * 4) = x;
-            if (p.ANv2 != nullptr)
+            if (hasAN2)
                 #pragma unroll
                 for (int e = 0; e < 4; ++e)
                     reinterpret_cast<short*>(p.ANv2)[((size_t)i * p.H + bh) * 8192 + (8 * r1 + 2 * vs + v1) * 256
@@ -581,10 +595,15 @@ extern "C" int g2_dhu_v8b(const void* KgA, const void* Qg, const void* Wb, const
     const long ctas = 4L * nseg * H;
     int dhu4 = (ctas >= 96 && ctas <= 256) ? 1 : 0;
     if (const char* e = getenv("KDA_G2_R1A_DHU")) dhu4 = atoi(e);
-    if (dhu4)
-        hipLaunchKernelGGL(g2_dhu_v8b4_kernel, dim3(kK / kBV, nseg * H), dim3(256), 0, s, p);
-    else
-        hipLaunchKernelGGL(g2_dhu_v8b_kernel, dim3(kK / kBV, nseg * H), dim3(512), 0, s, p);
+    // kra P-10: the production output set gets the compile-time instance
+    const bool prod = HbN != nullptr && ANv2 != nullptr && dv2 == nullptr;
+    if (dhu4) {
+        // v8b4: the compile-time instance measured 8% SLOWER (kra P-10) -> generic only
+        hipLaunchKernelGGL(g2_dhu_v8b4_kernel<0>, dim3(kK / kBV, nseg * H), dim3(256), 0, s, p);
+    } else {
+        if (prod) hipLaunchKernelGGL(g2_dhu_v8b_kernel<1>, dim3(kK / kBV, nseg * H), dim3(512), 0, s, p);
+        else      hipLaunchKernelGGL(g2_dhu_v8b_kernel<0>, dim3(kK / kBV, nseg * H), dim3(512), 0, s, p);
+    }
     return (int)hipGetLastError();
 }
 
