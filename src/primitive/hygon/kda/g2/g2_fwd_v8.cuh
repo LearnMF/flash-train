@@ -75,30 +75,30 @@ __global__ void __launch_bounds__(512) g2_fwd_h_v8o_kernel(FwdOParams p) {
     f4 gl;
 
     auto loadW = [&](int i) {
-        const bf16* src = p.Wn + (((chunk + i) * 4 + r1) * 8) * 256 + l * 4;
+        const bf16* src = p.Wn + (((chunk + i) * 4 + r1) * 8) * 256 + l * 8;      // kra L16: paired
         #pragma unroll
-        for (int kt = 0; kt < 8; ++kt) wf[kt] = ld8(src + kt * 256);
+        for (int j = 0; j < 4; ++j) ld16x2(src + j * 512, wf[2 * j], wf[2 * j + 1]);
     };
     auto loadQg = [&](int i) {
-        const bf16* src = p.QgA + (((chunk + i) * 4 + r1) * 8) * 256 + l * 4;
+        const bf16* src = p.QgA + (((chunk + i) * 4 + r1) * 8) * 256 + l * 8;      // kra L16: paired
         #pragma unroll
-        for (int kt = 0; kt < 8; ++kt) qgf[kt] = ld8(src + kt * 256);
+        for (int j = 0; j < 4; ++j) ld16x2(src + j * 512, qgf[2 * j], qgf[2 * j + 1]);
     };
     auto loadAq = [&](int i) {
-        const bf16* src = p.AqkA + (((chunk + i) * 4 + r1) * 4) * 256 + l * 4;
+        const bf16* src = p.AqkA + (((chunk + i) * 4 + r1) * 4) * 256 + l * 8;   // kra L16: paired
         #pragma unroll
-        for (int st = 0; st < 4; ++st) aqf[st] = ld8(src + st * 256);
+        for (int j = 0; j < 2; ++j) ld16x2(src + j * 512, aqf[2 * j], aqf[2 * j + 1]);
     };
     auto loadU = [&](int i) {
-        uf = ld8(p.Un + (((chunk + i) * 4 + r1) * 8 + 2 * vs + v1a) * 256 + l * 4);
+        uf = ld8(p.Un + nat16((((chunk + i) * 4 + r1) * 8 + 2 * vs + v1a) * 256 + l * 4));
     };
     auto loadG = [&](int i) {
         gl = *reinterpret_cast<const f4*>(p.Gn + ((chunk + i) * 8 + wv) * 16 + q4 * 4);
     };
     auto loadK = [&](int i) {
         #pragma unroll
-        for (int rt = 0; rt < 4; ++rt)
-            kf[rt] = ld8(p.Kn + (((chunk + i) * 8 + wv) * 4 + rt) * 256 + l * 4);
+        for (int j = 0; j < 2; ++j)                      // kra L16: paired
+            ld16x2(p.Kn + (((chunk + i) * 8 + wv) * 4) * 256 + j * 512 + l * 8, kf[2 * j], kf[2 * j + 1]);
     };
     v4bh hx[2];
     auto write_h = [&]() {
@@ -273,30 +273,32 @@ __global__ void __launch_bounds__(256) g2_fwd_h_v8o4_kernel(FwdOParams p) {
     f4 gl0, gl1;
 
     auto loadW = [&](int i) {
-        const bf16* src = p.Wn + (((chunk + i) * 4 + r1) * 8) * 256 + l * 4;
+        const bf16* src = p.Wn + (((chunk + i) * 4 + r1) * 8) * 256 + l * 8;      // kra L16: paired
         #pragma unroll
-        for (int kt = 0; kt < 8; ++kt) wf[kt] = ld8(src + kt * 256);
+        for (int j = 0; j < 4; ++j) ld16x2(src + j * 512, wf[2 * j], wf[2 * j + 1]);
     };
     auto loadQg = [&](int i) {
-        const bf16* src = p.QgA + (((chunk + i) * 4 + r1) * 8) * 256 + l * 4;
+        const bf16* src = p.QgA + (((chunk + i) * 4 + r1) * 8) * 256 + l * 8;      // kra L16: paired
         #pragma unroll
-        for (int kt = 0; kt < 8; ++kt) qgf[kt] = ld8(src + kt * 256);
+        for (int j = 0; j < 4; ++j) ld16x2(src + j * 512, qgf[2 * j], qgf[2 * j + 1]);
     };
     auto loadAq = [&](int i) {
-        const bf16* src = p.AqkA + (((chunk + i) * 4 + r1) * 4) * 256 + l * 4;
+        const bf16* src = p.AqkA + (((chunk + i) * 4 + r1) * 4) * 256 + l * 8;   // kra L16: paired
         #pragma unroll
-        for (int st = 0; st < 4; ++st) aqf[st] = ld8(src + st * 256);
+        for (int j = 0; j < 2; ++j) ld16x2(src + j * 512, aqf[2 * j], aqf[2 * j + 1]);
     };
     auto loadU = [&](int i, int v1a_, v4bh& uf) {
-        uf = ld8(p.Un + (((chunk + i) * 4 + r1) * 8 + 2 * vs + v1a_) * 256 + l * 4);
+        // kra L16: uf0/uf1 are one 16 B pair -- loaded on the v1a_ == 0 call (always paired)
+        if (v1a_ == 0) ld16x2(p.Un + (((chunk + i) * 4 + r1) * 8 + 2 * vs) * 256 + l * 8, uf0, uf1);
+        (void)uf;
     };
     auto loadG = [&](int i, int kb, f4& gl) {
         gl = *reinterpret_cast<const f4*>(p.Gn + ((chunk + i) * 8 + kb) * 16 + q4 * 4);
     };
     auto loadK = [&](int i, int kb, v4bh* kf) {
         #pragma unroll
-        for (int rt = 0; rt < 4; ++rt)
-            kf[rt] = ld8(p.Kn + (((chunk + i) * 8 + kb) * 4 + rt) * 256 + l * 4);
+        for (int j = 0; j < 2; ++j)                      // kra L16: paired
+            ld16x2(p.Kn + (((chunk + i) * 8 + kb) * 4) * 256 + j * 512 + l * 8, kf[2 * j], kf[2 * j + 1]);
     };
     v4bh hx[2];
     auto write_h = [&](int kb, f4* ht) {

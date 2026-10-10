@@ -88,6 +88,16 @@ __device__ __forceinline__ int wu_tile_idx(int e) {
 // VL (varlen phase 2): k/v/q/beta/A rows r >= clen read as 0 (the zero padding), g rows
 // are read from the CLAMPED row (address only, the value math is the dense code), incl.
 // the chunk-end row sGl = g[clen-1].  No row-major outputs.
+// kra L16: emit this CTA's 8192-element native block from the LDS tile as linear 16 B pairs
+// (pair t = sub-blocks 2(t>>6), 2(t>>6)+1 at lane t&63 -> nat16 position 8t).
+__device__ __forceinline__ void wu_emit16(short* dst, const short* tile, int tid) {
+    for (int t = tid; t < 1024; t += 256) {
+        const int o0 = 512 * (t >> 6) + 4 * (t & 63);
+        st16x2(dst + 8 * (size_t)t, *reinterpret_cast<const v4bh*>(tile + wu_tile_idx(o0)),
+               *reinterpret_cast<const v4bh*>(tile + wu_tile_idx(o0 + 256)));
+    }
+}
+
 template <bool VL>
 __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p) {
     const int i = blockIdx.x, hh = blockIdx.y, tid = threadIdx.x;
@@ -145,24 +155,36 @@ __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p) {
                 }
             }
             if (p.stop == stop_acc) return;
+            v4bh we8[8];
             #pragma unroll
-            for (int vt = 0; vt < 8; ++vt) {
-                short we[4];
+            for (int vt = 0; vt < 8; ++vt)
                 #pragma unroll
-                for (int e = 0; e < 4; ++e) we[e] = bf_rne(acc[vt][e]);
-                if (outC)   // C form is the C-fragment layout itself: one 8B vec store
-                    *reinterpret_cast<v4bh*>(outC + nblk + (size_t)(vt + 8 * wv) * 256 + l * 4) =
-                        *reinterpret_cast<const v4bh*>(we);
-                if (outA) { // A form, pi-staged: lane quad is native-contiguous
-                    *reinterpret_cast<v4bh*>(outA + nblk + (size_t)(4 * (l & 15) + 64 * (l >> 4)
-                        + 256 * vt + 2048 * wv)) = *reinterpret_cast<const v4bh*>(we);
-                }
-                if (outB) { // B form, pi-staged: t = 16wv+l&15, v = 16vt+4(l>>4)+e
+                for (int e = 0; e < 4; ++e) we8[vt][e] = bf_rne(acc[vt][e]);
+            // kra L16: C form (outC) and pi-staged A form (outA: 4(l&15) + 64(l>>4) == 4l) put
+            // lane l's quad of sub-block vt + 8wv at slot l, so the vt pair (2j, 2j+1) is ONE
+            // full 16 B store at nat16 position base(2j + 8wv) + 8l.
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const size_t pb = nblk + (size_t)(2 * j + 8 * wv) * 256 + 8 * l;
+                if (outC) st16x2(outC + pb, we8[2 * j], we8[2 * j + 1]);
+                if (outA) st16x2(outA + pb, we8[2 * j], we8[2 * j + 1]);
+            }
+            if (outB) { // B form, pi-staged: t = 16wv+l&15, v = 16vt+4(l>>4)+e
+                // kra L16: scalars -> LDS tile (the slab: every wave's MMAC reads are done
+                // after the barrier) -> linear 16 B pair emit; the barrier after the emit
+                // protects the tile from the next phase's slab fill.
+                short* tile = slab;
+                __syncthreads();
+                #pragma unroll
+                for (int vt = 0; vt < 8; ++vt) {
                     const int ib = ((l & 15) & 3) + 16 * (l >> 4) + 64 * ((l & 15) >> 2)
                                    + 256 * wv + 1024 * vt;
                     #pragma unroll
-                    for (int e = 0; e < 4; ++e) outB[nblk + ib + 4 * e] = we[e];
+                    for (int e = 0; e < 4; ++e) tile[wu_tile_idx(ib + 4 * e)] = we8[vt][e];
                 }
+                __syncthreads();
+                wu_emit16(outB + nblk, tile, tid);
+                __syncthreads();
             }
         };
 
@@ -205,17 +227,10 @@ __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p) {
             *reinterpret_cast<v4bh*>(p.kgB + wu_vb_quad(j, vq, nblk3)) =
                 *reinterpret_cast<const v4bh*>(gv);
             // KgA: A form, plain row nibble, P1/P2 block order
-            *reinterpret_cast<v4bh*>(p.KgA + nblk + (size_t)(4 * (j & 15)
-                + 64 * ((vq & 15) >> 2) + 256 * (vq >> 4) + 2048 * (j >> 4))) =
+            *reinterpret_cast<v4bh*>(p.KgA + nat16(nblk + (size_t)(4 * (j & 15)
+                + 64 * ((vq & 15) >> 2) + 256 * (vq >> 4) + 2048 * (j >> 4)))) =
                 *reinterpret_cast<const v4bh*>(gkv);
-            // Kn: B form -- the quad is 4 consecutive shorts at an e-dependent
-            // (generally unaligned) offset, so scalar stride-1 stores
-            const int ibn = (j & 3) + 4 * (vq & 15) + 64 * ((j >> 2) & 3)
-                            + 256 * (j >> 4) + 1024 * (vq >> 4);
-            if (p.Kn != nullptr) {                          // null: keep-state backward
-                #pragma unroll
-                for (int dv = 0; dv < 4; ++dv) p.Kn[nblk + ibn + 4 * dv] = gkv[dv];
-            }
+            // Kn (B form): emitted in phase 3 through the LDS tile (kra L16)
         }
         if (p.stop == 1) return;
         mmac_phase(p.Wn, p.Wb, nullptr, 2);
@@ -245,24 +260,55 @@ __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p) {
         // 8192-element native block, aliasing the slab union (16 KB <= 17.4 KB).
         {
             short* tile = slab;                             // 64x128 in native order
-            for (int t = tid; t < 2048; t += 256) {
+            auto qg_of = [&](int t, short* qgv) {           // T7 value, unchanged
                 const int j = t >> 5, vq = (t & 31) << 2;
                 const size_t so = sbase + (size_t)j * rstride + vq;
                 const v4bh qv = g2_row_ok<M>(j, cl) ? *reinterpret_cast<const v4bh*>(p.q + so)
                                                      : v4bh{0, 0, 0, 0};
                 const f4 gf = ld16f(p.g + sbase + (size_t)g2_row_g<M>(j, cl) * rstride + vq);
-                short qgv[4];
                 #pragma unroll
                 for (int dv = 0; dv < 4; ++dv) qgv[dv] = bf_rne(bf2f(qv[dv]) * exp2f(gf[dv]));
-                const int ibn = (j & 3) + 4 * (vq & 15) + 64 * ((j >> 2) & 3)
-                                + 256 * (j >> 4) + 1024 * (vq >> 4);
+                return gf;
+            };
+            auto ibn_of = [](int t) {
+                const int j = t >> 5, vq = (t & 31) << 2;
+                return (j & 3) + 4 * (vq & 15) + 64 * ((j >> 2) & 3) + 256 * (j >> 4) + 1024 * (vq >> 4);
+            };
+            if (p.Kn != nullptr) {                          // null: keep-state backward
+                // kra L16: one pass over k / q / g -- kg (phase 1's exact expression, same
+                // inputs) -> tile -> linear 16 B pair emit to Kn; qg waits in registers.
+                short qst[8][4];
+                __syncthreads();                            // every wave's u-MMAC slab reads done
                 #pragma unroll
-                for (int dv = 0; dv < 4; ++dv) tile[wu_tile_idx(ibn + 4 * dv)] = qgv[dv];
+                for (int it = 0; it < 8; ++it) {
+                    const int tt = tid + 256 * it;
+                    const int j = tt >> 5, vq = (tt & 31) << 2;
+                    const f4 gf = qg_of(tt, qst[it]);
+                    const v4bh kv = g2_row_ok<M>(j, cl)
+                        ? *reinterpret_cast<const v4bh*>(p.k + sbase + (size_t)j * rstride + vq)
+                        : v4bh{0, 0, 0, 0};
+                    const f4 gl = *reinterpret_cast<const f4*>(sGl + vq);
+                    #pragma unroll
+                    for (int dv = 0; dv < 4; ++dv)
+                        tile[wu_tile_idx(ibn_of(tt) + 4 * dv)] = bf_rne(bf2f(kv[dv]) * exp2f(gl[dv] - gf[dv]));
+                }
+                __syncthreads();
+                wu_emit16(p.Kn + nblk, tile, tid);
+                __syncthreads();
+                #pragma unroll
+                for (int it = 0; it < 8; ++it)
+                    #pragma unroll
+                    for (int dv = 0; dv < 4; ++dv) tile[wu_tile_idx(ibn_of(tid + 256 * it) + 4 * dv)] = qst[it][dv];
+            } else {
+                for (int t = tid; t < 2048; t += 256) {
+                    short qgv[4];
+                    qg_of(t, qgv);
+                    #pragma unroll
+                    for (int dv = 0; dv < 4; ++dv) tile[wu_tile_idx(ibn_of(t) + 4 * dv)] = qgv[dv];
+                }
             }
             __syncthreads();
-            for (int t = tid; t < 2048; t += 256)            // linear 8B global emit
-                *reinterpret_cast<v4bh*>(p.Qn + nblk + 4 * t) =
-                    *reinterpret_cast<const v4bh*>(tile + wu_tile_idx(4 * t));
+            wu_emit16(p.Qn + nblk, tile, tid);              // kra L16: linear 16B pair emit
         }
         if (p.stop == 7) return;
     });

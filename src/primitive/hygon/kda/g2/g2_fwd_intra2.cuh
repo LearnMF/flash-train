@@ -123,7 +123,7 @@ __device__ __forceinline__ void post(const FwdIParams& p, float* smem, int i, in
             }
             const v4bh b = pack4(x);
             if (tok_) *reinterpret_cast<v4bh*>(rowp + 16 * cb + 4 * q4) = b;
-            *reinterpret_cast<v4bh*>(p.AqkA + nblk64 + (size_t)(cb + 4 * I) * 256 + 4 * l) = b;
+            *reinterpret_cast<v4bh*>(p.AqkA + nat16(nblk64 + (size_t)(cb + 4 * I) * 256 + 4 * l)) = b;
         }
     }
     f4 Ai[4];
@@ -248,7 +248,7 @@ __device__ __forceinline__ void post(const FwdIParams& p, float* smem, int i, in
         short* out = pass == 0 ? p.Wn : p.Un;
         #pragma unroll
         for (int vt = 0; vt < 8; ++vt)
-            *reinterpret_cast<v4bh*>(out + nblk + (size_t)(vt + 8 * I) * 256 + 4 * l) = pack4(acc[vt]);
+            *reinterpret_cast<v4bh*>(out + nat16(nblk + (size_t)(vt + 8 * I) * 256 + 4 * l)) = pack4(acc[vt]);
         if (pass == 0 && p.stop == 3) return;
         lds_barrier();                               // B7 / B9: T2 consumed
     }
@@ -327,15 +327,15 @@ __global__ void __launch_bounds__(256, 2) g2_fwd_intra2_kernel(FwdIParams p) {
                 }
                 const size_t qb0 = nblk + (size_t)(2048 * rb + 256 * (cbase >> 4) + 4 * m
                                    + 128 * ((cbase >> 3) & 1));
-                *reinterpret_cast<v4bh*>(p.QgA + qb0) = qg[0];
-                *reinterpret_cast<v4bh*>(p.QgA + qb0 + 64) = qg[1];
+                *reinterpret_cast<v4bh*>(p.QgA + nat16(qb0)) = qg[0];
+                *reinterpret_cast<v4bh*>(p.QgA + nat16(qb0 + 64)) = qg[1];
             }
             lds_barrier();
             #pragma unroll
             for (int it = 0; it < 8; ++it) {
                 const int U = threadIdx.x + 256 * it;   // Kn offset 4U: [d0][d1][q][n][e]
                 const int dim = 16 * (U >> 8) + (U & 15), tok = 16 * ((U >> 6) & 3) + 4 * ((U >> 4) & 3);
-                *reinterpret_cast<v4bh*>(p.Kn + nblk + 4 * (size_t)U) =
+                *reinterpret_cast<v4bh*>(p.Kn + nat16(nblk + 4 * (size_t)U)) =
                     *reinterpret_cast<const v4bh*>(T2 + dim * kT2 + tok);
             }
             lds_barrier();                               // T2 consumed (R aliases it)
@@ -508,15 +508,15 @@ __global__ void __launch_bounds__(256) g2_fwd_intra2a_kernel(FI2AParams p) {
             }
             const size_t qb0 = nblk + (size_t)(2048 * rb + 256 * (cbase >> 4) + 4 * m
                                + 128 * ((cbase >> 3) & 1));
-            *reinterpret_cast<v4bh*>(p.QgA + qb0) = qg[0];
-            *reinterpret_cast<v4bh*>(p.QgA + qb0 + 64) = qg[1];
+            *reinterpret_cast<v4bh*>(p.QgA + nat16(qb0)) = qg[0];
+            *reinterpret_cast<v4bh*>(p.QgA + nat16(qb0 + 64)) = qg[1];
         }
         lds_barrier();
         #pragma unroll
         for (int it = 0; it < 8; ++it) {
             const int U = threadIdx.x + 256 * it;
             const int dim = 16 * (U >> 8) + (U & 15), tok = 16 * ((U >> 6) & 3) + 4 * ((U >> 4) & 3);
-            *reinterpret_cast<v4bh*>(p.Kn + nblk + 4 * (size_t)U) =
+            *reinterpret_cast<v4bh*>(p.Kn + nat16(nblk + 4 * (size_t)U)) =
                 *reinterpret_cast<const v4bh*>(T2 + dim * kT2 + tok);
         }
         lds_barrier();                               // T2 consumed (R aliases it)
@@ -643,7 +643,7 @@ __device__ __forceinline__ void s_post(const FI2BParams& p, float* smem, const f
             }
             const v4bh b = pack4(x);
             if (tok_) *reinterpret_cast<v4bh*>(rowp + 16 * cb + 4 * q4) = b;
-            *reinterpret_cast<v4bh*>(p.AqkA + nblk64 + (size_t)(cb + 4 * I) * 256 + 4 * l) = b;
+            *reinterpret_cast<v4bh*>(p.AqkA + nat16(nblk64 + (size_t)(cb + 4 * I) * 256 + 4 * l)) = b;
         }
     }
     f4 Ai[4];
@@ -767,7 +767,7 @@ __device__ __forceinline__ void s_post(const FI2BParams& p, float* smem, const f
         short* out = pass == 0 ? p.Wn : p.Un;
         #pragma unroll
         for (int vt = 0; vt < 8; ++vt)
-            *reinterpret_cast<v4bh*>(out + nblk + (size_t)(vt + 8 * I) * 256 + 4 * l) = pack4(acc[vt]);
+            *reinterpret_cast<v4bh*>(out + nat16(nblk + (size_t)(vt + 8 * I) * 256 + 4 * l)) = pack4(acc[vt]);
         lds_barrier();                               // B7 / B9
     }
 }

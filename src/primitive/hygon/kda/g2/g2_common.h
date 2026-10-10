@@ -49,6 +49,25 @@ __device__ __forceinline__ v4bh ld8(const bf16* p) {  // 4 consecutive bf16 (8-b
     return *reinterpret_cast<const v4bh*>(p);
 }
 __device__ __forceinline__ f4 ld16f(const float* p) { return *reinterpret_cast<const f4*>(p); }
+// kra L16 paired native layout (Wn Wb Un Kn KgA Qn QgA AqkA): inside every 512-element group
+// the two 256-element sub-blocks are interleaved per lane (o = 256s + 4l + e -> 8l + 4s + e),
+// so a lane's fragments of sub-blocks 2j and 2j+1 are ONE aligned 16 B load (a dwordx2 costs
+// ~16 issue cycles per CU, a dwordx4 ~18-23: measured, kra vmem_issue).  Bijective per 1 KB
+// group; commutes with any 512-aligned base.  Values unchanged -> bit-identical.
+__device__ __forceinline__ size_t nat16(size_t o) {
+    return (o & ~(size_t)511) | (((o >> 2) & 63) << 3) | (((o >> 8) & 1) << 2) | (o & 3);
+}
+typedef short v8bh_l16 __attribute__((ext_vector_type(8)));
+// store both halves of a pair at once (p = base(512-aligned) + 512*j + 8*lane)
+__device__ __forceinline__ void st16x2(void* p, v4bh a, v4bh b) {
+    *reinterpret_cast<v8bh_l16*>(p) = __builtin_shufflevector(a, b, 0, 1, 2, 3, 4, 5, 6, 7);
+}
+// fragments of sub-blocks 2j, 2j+1: p = base(512-aligned) + 512*j + 8*lane
+__device__ __forceinline__ void ld16x2(const bf16* p, v4bh& a, v4bh& b) {
+    const v8bh_l16 x = *reinterpret_cast<const v8bh_l16*>(p);
+    a = __builtin_shufflevector(x, x, 0, 1, 2, 3);
+    b = __builtin_shufflevector(x, x, 4, 5, 6, 7);
+}
 // RNE bf16 conversion for finite inputs, identical to __float2bfloat16.
 __device__ __forceinline__ short bf_rne(float x) {
     uint32_t u = __float_as_uint(x);

@@ -44,14 +44,14 @@ __global__ void __launch_bounds__(64 * NW) g2_fwd_h_v7_kernel(FwdNParams p) {
     for (int a = 0; a < 2; ++a) for (int b = 0; b < KPW; ++b) ht[a][b] = f4{0.f, 0.f, 0.f, 0.f};
     v4bh wf[8], kf[KPW][4], uf[NV1]; f4 gl[KPW];
     auto loadW = [&](int i) {
-        const bf16* src = p.Wn + (((chunk + i) * 4 + r1) * 8) * 256 + l * 4;
+        const bf16* src = p.Wn + (((chunk + i) * 4 + r1) * 8) * 256 + l * 8;      // kra L16: paired
         #pragma unroll
-        for (int kt = 0; kt < 8; ++kt) wf[kt] = ld8(src + kt * 256);
+        for (int j = 0; j < 4; ++j) ld16x2(src + j * 512, wf[2 * j], wf[2 * j + 1]);
     };
     auto loadU = [&](int i) {
         #pragma unroll
         for (int j = 0; j < NV1; ++j)
-            uf[j] = ld8(p.Un + (((chunk + i) * 4 + r1) * 8 + 2 * vs + v1a + j) * 256 + l * 4);
+            uf[j] = ld8(p.Un + nat16((((chunk + i) * 4 + r1) * 8 + 2 * vs + v1a + j) * 256 + l * 4));
     };
     auto loadG = [&](int i) {
         #pragma unroll
@@ -62,8 +62,9 @@ __global__ void __launch_bounds__(64 * NW) g2_fwd_h_v7_kernel(FwdNParams p) {
         #pragma unroll
         for (int kl = 0; kl < KPW; ++kl)
             #pragma unroll
-            for (int rt = 0; rt < 4; ++rt)
-                kf[kl][rt] = ld8(p.Kn + (((chunk + i) * 8 + KPW * wv + kl) * 4 + rt) * 256 + l * 4);
+            for (int j = 0; j < 2; ++j)                  // kra L16: paired
+                ld16x2(p.Kn + (((chunk + i) * 8 + KPW * wv + kl) * 4) * 256 + j * 512 + l * 8,
+                       kf[kl][2 * j], kf[kl][2 * j + 1]);
     };
     v4bh hx[2][KPW];
     auto write_h = [&]() {
@@ -177,17 +178,17 @@ extern "C" __global__ void __launch_bounds__(512) g2_dhu_w8b_kernel(BwdNParams p
     st[0] = f4{0.f, 0.f, 0.f, 0.f}; st[1] = st[0];
     v4bh ka[8], qb[4], wb[4], dof, dvf; f4 gl;       // dof: this wave's 1/8 of dO^T
     auto loadKA = [&](int i) {
-        const bf16* src = p.KgA + (((chunk + i) * 4 + r1) * 8) * 256 + l * 4;
+        const bf16* src = p.KgA + (((chunk + i) * 4 + r1) * 8) * 256 + l * 8;      // kra L16: paired
         #pragma unroll
-        for (int kt = 0; kt < 8; ++kt) ka[kt] = ld8(src + kt * 256);
+        for (int j = 0; j < 4; ++j) ld16x2(src + j * 512, ka[2 * j], ka[2 * j + 1]);
     };
     auto loadDV = [&](int i) { dvf = ld8(p.dv + (((chunk + i) * 4 + r1) * 8 + 2 * vs + v1) * 256 + l * 4); };
     auto loadG = [&](int i) { gl = *reinterpret_cast<const f4*>(p.Gn + ((chunk + i) * 8 + wv) * 16 + (l >> 4) * 4); };
     auto loadQW = [&](int i) {
         #pragma unroll
-        for (int rt = 0; rt < 4; ++rt) {
-            qb[rt] = ld8(p.Qg + (((chunk + i) * 8 + wv) * 4 + rt) * 256 + l * 4);
-            wb[rt] = ld8(p.Wb + (((chunk + i) * 8 + wv) * 4 + rt) * 256 + l * 4);
+        for (int j = 0; j < 2; ++j) {                    // kra L16: paired
+            ld16x2(p.Qg + (((chunk + i) * 8 + wv) * 4) * 256 + j * 512 + l * 8, qb[2 * j], qb[2 * j + 1]);
+            ld16x2(p.Wb + (((chunk + i) * 8 + wv) * 4) * 256 + j * 512 + l * 8, wb[2 * j], wb[2 * j + 1]);
         }
     };
     auto loadDO = [&](int i) {
@@ -283,17 +284,17 @@ extern "C" __global__ void __launch_bounds__(512) g2_dhu_v8b_kernel(BwdNParams p
     st[0] = f4{0.f, 0.f, 0.f, 0.f}; st[1] = st[0];
     v4bh ka[8], qb[4], wb[4], dof, dvf; f4 gl;       // dof: this wave's 1/8 of dO^T
     auto loadKA = [&](int i) {
-        const bf16* src = p.KgA + (((chunk + i) * 4 + r1) * 8) * 256 + l * 4;
+        const bf16* src = p.KgA + (((chunk + i) * 4 + r1) * 8) * 256 + l * 8;      // kra L16: paired
         #pragma unroll
-        for (int kt = 0; kt < 8; ++kt) ka[kt] = ld8(src + kt * 256);
+        for (int j = 0; j < 4; ++j) ld16x2(src + j * 512, ka[2 * j], ka[2 * j + 1]);
     };
     auto loadDV = [&](int i) { dvf = ld8(p.dv + (((chunk + i) * 4 + r1) * 8 + 2 * vs + v1) * 256 + l * 4); };
     auto loadG = [&](int i) { gl = *reinterpret_cast<const f4*>(p.Gn + ((chunk + i) * 8 + wv) * 16 + (l >> 4) * 4); };
     auto loadQW = [&](int i) {
         #pragma unroll
-        for (int rt = 0; rt < 4; ++rt) {
-            qb[rt] = ld8(p.Qg + (((chunk + i) * 8 + wv) * 4 + rt) * 256 + l * 4);
-            wb[rt] = ld8(p.Wb + (((chunk + i) * 8 + wv) * 4 + rt) * 256 + l * 4);
+        for (int j = 0; j < 2; ++j) {                    // kra L16: paired
+            ld16x2(p.Qg + (((chunk + i) * 8 + wv) * 4) * 256 + j * 512 + l * 8, qb[2 * j], qb[2 * j + 1]);
+            ld16x2(p.Wb + (((chunk + i) * 8 + wv) * 4) * 256 + j * 512 + l * 8, wb[2 * j], wb[2 * j + 1]);
         }
     };
     auto loadDO = [&](int i) {
@@ -423,9 +424,9 @@ __global__ void __launch_bounds__(256) g2_dhu_v8b4_kernel(BwdNParams p) {
     v4bh ka[8], qb0[4], wb0[4], qb1[4], wb1[4], dof0, dof1, dvf0, dvf1;
     f4 gl0, gl1;
     auto loadKA = [&](int i) {
-        const bf16* src = p.KgA + (((chunk + i) * 4 + r1) * 8) * 256 + l * 4;
+        const bf16* src = p.KgA + (((chunk + i) * 4 + r1) * 8) * 256 + l * 8;      // kra L16: paired
         #pragma unroll
-        for (int kt = 0; kt < 8; ++kt) ka[kt] = ld8(src + kt * 256);
+        for (int j = 0; j < 4; ++j) ld16x2(src + j * 512, ka[2 * j], ka[2 * j + 1]);
     };
     auto loadDV = [&](int i, int v1, v4bh& dvf) {
         dvf = ld8(p.dv + (((chunk + i) * 4 + r1) * 8 + 2 * vs + v1) * 256 + l * 4);
@@ -435,9 +436,9 @@ __global__ void __launch_bounds__(256) g2_dhu_v8b4_kernel(BwdNParams p) {
     };
     auto loadQW = [&](int i, int kb, v4bh* qb, v4bh* wb) {
         #pragma unroll
-        for (int rt = 0; rt < 4; ++rt) {
-            qb[rt] = ld8(p.Qg + (((chunk + i) * 8 + kb) * 4 + rt) * 256 + l * 4);
-            wb[rt] = ld8(p.Wb + (((chunk + i) * 8 + kb) * 4 + rt) * 256 + l * 4);
+        for (int j = 0; j < 2; ++j) {                    // kra L16: paired
+            ld16x2(p.Qg + (((chunk + i) * 8 + kb) * 4) * 256 + j * 512 + l * 8, qb[2 * j], qb[2 * j + 1]);
+            ld16x2(p.Wb + (((chunk + i) * 8 + kb) * 4) * 256 + j * 512 + l * 8, wb[2 * j], wb[2 * j + 1]);
         }
     };
     auto loadDO = [&](int i, int v1, v4bh& dof) {

@@ -326,16 +326,21 @@ __global__ void __launch_bounds__(256) g2_fwd_prep_a_kernel(PrepAParams p) {
             }
             const size_t qb0 = nblk + (size_t)(2048 * rb + 256 * (cbase >> 4) + 4 * m
                                + 128 * ((cbase >> 3) & 1));
-            *reinterpret_cast<v4bh*>(p.QgA + qb0) = qg[0];
-            *reinterpret_cast<v4bh*>(p.QgA + qb0 + 64) = qg[1];
+            *reinterpret_cast<v4bh*>(p.QgA + nat16(qb0)) = qg[0];
+            *reinterpret_cast<v4bh*>(p.QgA + nat16(qb0 + 64)) = qg[1];
         }
         lds_barrier();
         #pragma unroll
-        for (int it = 0; it < 8; ++it) {
-            const int U = threadIdx.x + 256 * it;
-            const int dim = 16 * (U >> 8) + (U & 15), tok = 16 * ((U >> 6) & 3) + 4 * ((U >> 4) & 3);
-            *reinterpret_cast<v4bh*>(p.Kn + nblk + 4 * (size_t)U) =
-                *reinterpret_cast<const v4bh*>(T2 + dim * kT2 + tok);
+        for (int it = 0; it < 4; ++it) {                    // kra L16: 16B pair emit
+            const int P = threadIdx.x + 256 * it;           // pair P = (group P>>6, lane P&63)
+            v4bh h[2];
+            #pragma unroll
+            for (int s = 0; s < 2; ++s) {
+                const int U = 128 * (P >> 6) + 64 * s + (P & 63);   // quad of sub-block 2g+s
+                const int dim = 16 * (U >> 8) + (U & 15), tok = 16 * ((U >> 6) & 3) + 4 * ((U >> 4) & 3);
+                h[s] = *reinterpret_cast<const v4bh*>(T2 + dim * kT2 + tok);
+            }
+            st16x2(p.Kn + nblk + 8 * (size_t)P, h[0], h[1]);
         }
         lds_barrier();
     }
@@ -462,7 +467,7 @@ __device__ __forceinline__ void b_post(const PrepBParams& p, float* smem, const 
             }
             const v4bh b = pack4(x);
             if (tok_) *reinterpret_cast<v4bh*>(rowp + 16 * cb + 4 * q4) = b;
-            *reinterpret_cast<v4bh*>(p.AqkA + nblk64 + (size_t)(cb + 4 * I) * 256 + 4 * l) = b;
+            *reinterpret_cast<v4bh*>(p.AqkA + nat16(nblk64 + (size_t)(cb + 4 * I) * 256 + 4 * l)) = b;
         }
     }
     f4 Ai[4];
@@ -581,8 +586,8 @@ __device__ __forceinline__ void b_post(const PrepBParams& p, float* smem, const 
         }
         short* out = pass == 0 ? p.Wn : p.Un;
         #pragma unroll
-        for (int vt = 0; vt < 8; ++vt)
-            *reinterpret_cast<v4bh*>(out + nblk + (size_t)(vt + 8 * I) * 256 + 4 * l) = pack4(acc[vt]);
+        for (int j = 0; j < 4; ++j)                         // kra L16: vt pair = one 16B store
+            st16x2(out + nblk + (size_t)(2 * j + 8 * I) * 256 + 8 * l, pack4(acc[2 * j]), pack4(acc[2 * j + 1]));
         lds_barrier();
     }
 }

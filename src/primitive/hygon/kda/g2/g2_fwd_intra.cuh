@@ -112,7 +112,7 @@ __global__ void __launch_bounds__(256) g2_fwd_intra_kernel(FwdIParams p) {
             const int t = 16 * rb + m, j = 16 * cb + q4 + 4 * e;
             const float val = (!mask_diag || j <= t) ? acc[e] * p.scale : 0.f;
             bstore(p.Aqk, g2_rm_tok(i * kBT + t, hh, p.H, kBT) + j, val);
-            bstore(p.AqkA, nblk64 + (size_t)(cb + 4 * rb) * 256 + 4 * m + q4 + 64 * e, val);
+            bstore(p.AqkA, nat16(nblk64 + (size_t)(cb + 4 * rb) * 256 + 4 * m + q4 + 64 * e), val);
         }
     };
     auto emit_Akk = [&](int slot, int rb, int cb) {
@@ -267,15 +267,15 @@ __global__ void __launch_bounds__(256) g2_fwd_intra_kernel(FwdIParams p) {
         }
         {   // QgA: A form -- the source quad is an e-run, contiguous
             const int d0 = row >> 4, d1 = cq >> 4, q = (cq & 15) >> 2;
-            *reinterpret_cast<v4bh*>(p.QgA + nblk + (size_t)(4 * (row & 15) + 64 * q
-                + 256 * d1 + 2048 * d0)) = qg;
+            *reinterpret_cast<v4bh*>(p.QgA + nat16(nblk + (size_t)(4 * (row & 15) + 64 * q
+                + 256 * d1 + 2048 * d0))) = qg;
         }
         {   // Kn: B form -- the source quad is an m-run, stride-4 scalars
             const int d1 = row >> 4, q = (row >> 2) & 3, e = row & 3;
             const int d0 = cq >> 4, mm = cq & 15;
             const size_t ib = nblk + e + 4 * mm + 64 * q + 256 * d1 + 1024 * d0;
             #pragma unroll
-            for (int j = 0; j < 4; ++j) p.Kn[ib + 4 * j] = kg[j];
+            for (int j = 0; j < 4; ++j) p.Kn[nat16(ib + 4 * j)] = kg[j];
         }
     }
     __syncthreads();
@@ -319,12 +319,12 @@ __global__ void __launch_bounds__(256) g2_fwd_intra_kernel(FwdIParams p) {
             #pragma unroll
             for (int e = 0; e < 4; ++e) we[e] = bf_rne(acc[vt][e]);
             if (outC)   // C form: the C fragment layout itself
-                *reinterpret_cast<v4bh*>(outC + nblk + (size_t)(vt + 8 * wv) * 256 + l * 4) =
+                *reinterpret_cast<v4bh*>(outC + nat16(nblk + (size_t)(vt + 8 * wv) * 256 + l * 4)) =
                     *reinterpret_cast<const v4bh*>(we);
             if (outA) { // A form: stride-64 scalars
                 const size_t ia = nblk + (size_t)(q4 + 4 * m + 256 * (vt + 8 * wv));
                 #pragma unroll
-                for (int e = 0; e < 4; ++e) outA[ia + 64 * e] = we[e];
+                for (int e = 0; e < 4; ++e) outA[nat16(ia + 64 * e)] = we[e];
             }
         }
         __syncthreads();
