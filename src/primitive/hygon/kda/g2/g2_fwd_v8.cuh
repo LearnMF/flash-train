@@ -343,7 +343,9 @@ __global__ void __launch_bounds__(256) g2_fwd_h_v8o4_kernel(FwdOParams p) {
         const int nxt = i + 1 < c1 ? i + 1 : i;
         lds_barrier();                                   // hB (h_i) ready
         if (hasO || hasOb) {         // R3: issue this step's
+            if constexpr (MODE == 1) __builtin_amdgcn_sched_barrier(0);   // kra P-11: keep load spacing
             loadQg(i); loadAq(i);                        // QgA/AqkA right after bar1
+            if constexpr (MODE == 1) __builtin_amdgcn_sched_barrier(0);   // kra P-11: keep load spacing
         }
         bN_emit(i, kb0);
         bN_emit(i, kb1);
@@ -354,7 +356,9 @@ __global__ void __launch_bounds__(256) g2_fwd_h_v8o4_kernel(FwdOParams p) {
             acc0 = mmac(wf[kt], ld8(hB + (0 * 16 + m) * kPadK + 16 * kt + q4 * 4), acc0);
             acc1 = mmac(wf[kt], ld8(hB + (1 * 16 + m) * kPadK + 16 * kt + q4 * 4), acc1);
         }
+        if constexpr (MODE == 1) __builtin_amdgcn_sched_barrier(0);   // kra P-11: keep load spacing
         loadW(nxt);
+        if constexpr (MODE == 1) __builtin_amdgcn_sched_barrier(0);   // kra P-11: keep load spacing
         {
             v4bh x0, x1;
             #pragma unroll
@@ -379,7 +383,9 @@ __global__ void __launch_bounds__(256) g2_fwd_h_v8o4_kernel(FwdOParams p) {
                            + (l >> 4) + 4 * (l & 15) + 64 * e] = x1[e];
                 }
         }
+        if constexpr (MODE == 1) __builtin_amdgcn_sched_barrier(0);   // kra P-11: keep load spacing
         loadU(nxt, 0, uf0); loadU(nxt, 1, uf1);
+        if constexpr (MODE == 1) __builtin_amdgcn_sched_barrier(0);   // kra P-11: keep load spacing
         {
             f4 d0, d1;
             #pragma unroll
@@ -387,7 +393,9 @@ __global__ void __launch_bounds__(256) g2_fwd_h_v8o4_kernel(FwdOParams p) {
             ht0[0] *= d0; ht0[1] *= d0;
             ht1[0] *= d1; ht1[1] *= d1;
         }
+        if constexpr (MODE == 1) __builtin_amdgcn_sched_barrier(0);   // kra P-11: keep load spacing
         loadG(nxt, kb0, gl0); loadG(nxt, kb1, gl1);
+        if constexpr (MODE == 1) __builtin_amdgcn_sched_barrier(0);   // kra P-11: keep load spacing
         // ---- oh for both tiles (QgA/AqkA loaded ONCE)
         f4 oh0 = f4{0.f,0.f,0.f,0.f}, oh1 = f4{0.f,0.f,0.f,0.f};
         if (hasO || hasOb) {
@@ -453,7 +461,9 @@ __global__ void __launch_bounds__(256) g2_fwd_h_v8o4_kernel(FwdOParams p) {
             }
             ht1[vt] += upd;
         }
+        if constexpr (MODE == 1) __builtin_amdgcn_sched_barrier(0);   // kra P-11: keep load spacing
         loadK(nxt, kb0, kf0); loadK(nxt, kb1, kf1);
+        if constexpr (MODE == 1) __builtin_amdgcn_sched_barrier(0);   // kra P-11: keep load spacing
         write_h(kb0, ht0);
         write_h(kb1, ht1);
     }
@@ -480,11 +490,13 @@ extern "C" int g2_fwd_h_v8o(const void* Wn, const void* Kn, const void* Un, cons
     // conservative waits the compiler clusters the loads and VMEM issue stalls return, while the
     // generic instance's waits happen to pace them.  Modes 2/3 measured ~5% faster.
     int mode = 0;
-    if (O == nullptr && Ob != nullptr && Vn && HbN && ANv) mode = 2;
+    if (O == nullptr && Ob != nullptr && !Vn && !HbN && !ANv) mode = 1;   // kra P-11: paced mode 1
+    else if (O == nullptr && Ob != nullptr && Vn && HbN && ANv) mode = 2;
     else if (O == nullptr && Ob == nullptr && Vn && HbN && ANv) mode = 3;
     auto v8o4 = [&](auto vl) {
         constexpr bool VL = decltype(vl)::value;
         switch (mode) {
+            case 1: hipLaunchKernelGGL((g2_fwd_h_v8o4_kernel<VL, 1>), grid, dim3(256), 0, s, p); break;
             case 2: hipLaunchKernelGGL((g2_fwd_h_v8o4_kernel<VL, 2>), grid, dim3(256), 0, s, p); break;
             case 3: hipLaunchKernelGGL((g2_fwd_h_v8o4_kernel<VL, 3>), grid, dim3(256), 0, s, p); break;
             default: hipLaunchKernelGGL((g2_fwd_h_v8o4_kernel<VL, 0>), grid, dim3(256), 0, s, p); break;
