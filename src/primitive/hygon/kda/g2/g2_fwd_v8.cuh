@@ -249,8 +249,17 @@ __device__ __forceinline__ void r1a_o_wave_order() {
     __builtin_amdgcn_sched_barrier(0);
 }
 
-template <bool VL>
+template <bool VL, int MODE = 0>
 __global__ void __launch_bounds__(256) g2_fwd_h_v8o4_kernel(FwdOParams p) {
+    // kra P-9: compile-time outputs.  With runtime-optional VMEM ops in the loop the compiler's
+    // waitcnt pass must count the path that skips them, so a vmcnt for an OLD load also forced
+    // younger, actually-issued loads to land (v8o4 fwd: one GEMM1 wait = 15.7% of the step).
+    // MODE 0 generic | 1 fwd (Ob) | 2 fwd keep-state (Ob+HbN+Vn+ANv) | 3 bwd recompute (HbN+Vn+ANv)
+    const bool hasO  = MODE == 0 ? p.O != nullptr : false;
+    const bool hasOb = MODE == 0 ? p.Ob != nullptr : MODE != 3;
+    const bool hasBN = MODE == 0 ? p.HbN != nullptr : MODE != 1;
+    const bool hasVn = MODE == 0 ? p.Vn != nullptr : MODE != 1;
+    const bool hasAN = MODE == 0 ? p.ANv != nullptr : MODE != 1;
     __shared__ __align__(16) bf16 hB[kBV * kPadK];
     __shared__ __align__(16) bf16 vB[kBV * kPadT];
     __shared__ __align__(16) bf16 oStage[4][256];
@@ -311,7 +320,7 @@ __global__ void __launch_bounds__(256) g2_fwd_h_v8o4_kernel(FwdOParams p) {
             }
     };
     auto bN_emit = [&](int i2, int kb) {
-        if (p.HbN != nullptr) {
+        if (hasBN) {
             #pragma unroll
             for (int vt = 0; vt < 2; ++vt) {
                 v4bh val;
@@ -333,7 +342,7 @@ __global__ void __launch_bounds__(256) g2_fwd_h_v8o4_kernel(FwdOParams p) {
         const int olen = g2_row_len<VL>(p.clen, i);
         const int nxt = i + 1 < c1 ? i + 1 : i;
         lds_barrier();                                   // hB (h_i) ready
-        if (p.O != nullptr || p.Ob != nullptr) {         // R3: issue this step's
+        if (hasO || hasOb) {         // R3: issue this step's
             loadQg(i); loadAq(i);                        // QgA/AqkA right after bar1
         }
         bN_emit(i, kb0);
@@ -357,11 +366,11 @@ __global__ void __launch_bounds__(256) g2_fwd_h_v8o4_kernel(FwdOParams p) {
                 reinterpret_cast<short*>(vB)[(16 * 0 + c_col(l, e)) * kPadT + 16 * r1 + m] = x0[e];
                 reinterpret_cast<short*>(vB)[(16 * 1 + c_col(l, e)) * kPadT + 16 * r1 + m] = x1[e];
             }
-            if (p.Vn != nullptr) {                       // forward: Vn unused (null)
+            if (hasVn) {                       // forward: Vn unused (null)
                 *reinterpret_cast<v4bh*>(p.Vn + (((chunk + i) * 4 + r1) * 8 + 2 * vs + 0) * 256 + l * 4) = x0;
                 *reinterpret_cast<v4bh*>(p.Vn + (((chunk + i) * 4 + r1) * 8 + 2 * vs + 1) * 256 + l * 4) = x1;
             }
-            if (p.ANv != nullptr)
+            if (hasAN)
                 #pragma unroll
                 for (int e = 0; e < 4; ++e) {
                     reinterpret_cast<short*>(p.ANv)[((size_t)i * p.H + bh) * 8192 + (8 * r1 + 2 * vs + 0) * 256
@@ -381,7 +390,7 @@ __global__ void __launch_bounds__(256) g2_fwd_h_v8o4_kernel(FwdOParams p) {
         loadG(nxt, kb0, gl0); loadG(nxt, kb1, gl1);
         // ---- oh for both tiles (QgA/AqkA loaded ONCE)
         f4 oh0 = f4{0.f,0.f,0.f,0.f}, oh1 = f4{0.f,0.f,0.f,0.f};
-        if (p.O != nullptr || p.Ob != nullptr) {
+        if (hasO || hasOb) {
             #pragma unroll
             for (int kt = 0; kt < 8; ++kt) {
                 oh0 = mmac(qgf[kt], ld8(hB + (0 * 16 + m) * kPadK + 16 * kt + q4 * 4), oh0);
@@ -389,7 +398,7 @@ __global__ void __launch_bounds__(256) g2_fwd_h_v8o4_kernel(FwdOParams p) {
             }
         }
         lds_barrier();                                   // vB (v_new_i) ready
-        if (p.O != nullptr || p.Ob != nullptr) {
+        if (hasO || hasOb) {
             #pragma unroll
             for (int v1a = 0; v1a < 2; ++v1a) {
                 const f4& oh = v1a ? oh1 : oh0;
@@ -404,7 +413,7 @@ __global__ void __launch_bounds__(256) g2_fwd_h_v8o4_kernel(FwdOParams p) {
                 const bool ook = g2_row_ok<VL ? 2 : 0>(orow, olen);
                 const size_t tok = (size_t)(otok + orow);
                 const size_t obase = tok * rowT + (size_t)bh * kK + 32 * vs + 16 * v1a;
-                if (p.O != nullptr) {
+                if (hasO) {
                     if (ook) {
                         #pragma unroll
                         for (int e = 0; e < 4; ++e)
@@ -466,11 +475,26 @@ extern "C" int g2_fwd_h_v8o(const void* Wn, const void* Kn, const void* Un, cons
     int r1a = 1;   // R1a: 4-wave dedup form (bitwise equal; 0 restores the 8-wave form)
     if (const char* e = getenv("KDA_G2_R1A")) r1a = atoi(e);
     const dim3 grid(kK / kBV, (unsigned)nseg * H);
+    // kra P-9: the production output sets get compile-time instances, others the generic one
+    // Mode 1 (forward, o only) is NOT selected: measured 4% slower (kra P-9) -- without the
+    // conservative waits the compiler clusters the loads and VMEM issue stalls return, while the
+    // generic instance's waits happen to pace them.  Modes 2/3 measured ~5% faster.
+    int mode = 0;
+    if (O == nullptr && Ob != nullptr && Vn && HbN && ANv) mode = 2;
+    else if (O == nullptr && Ob == nullptr && Vn && HbN && ANv) mode = 3;
+    auto v8o4 = [&](auto vl) {
+        constexpr bool VL = decltype(vl)::value;
+        switch (mode) {
+            case 2: hipLaunchKernelGGL((g2_fwd_h_v8o4_kernel<VL, 2>), grid, dim3(256), 0, s, p); break;
+            case 3: hipLaunchKernelGGL((g2_fwd_h_v8o4_kernel<VL, 3>), grid, dim3(256), 0, s, p); break;
+            default: hipLaunchKernelGGL((g2_fwd_h_v8o4_kernel<VL, 0>), grid, dim3(256), 0, s, p); break;
+        }
+    };
     if (ctok != nullptr) {
-        if (r1a) hipLaunchKernelGGL(g2_fwd_h_v8o4_kernel<true>, grid, dim3(256), 0, s, p);
+        if (r1a) v8o4(std::true_type{});
         else     hipLaunchKernelGGL(g2_fwd_h_v8o_kernel<true>, grid, dim3(512), 0, s, p);
     } else {
-        if (r1a) hipLaunchKernelGGL(g2_fwd_h_v8o4_kernel<false>, grid, dim3(256), 0, s, p);
+        if (r1a) v8o4(std::false_type{});
         else     hipLaunchKernelGGL(g2_fwd_h_v8o_kernel<false>, grid, dim3(512), 0, s, p);
     }
     return (int)hipGetLastError();
