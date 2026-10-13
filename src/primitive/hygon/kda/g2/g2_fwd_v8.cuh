@@ -353,10 +353,13 @@ __global__ void __launch_bounds__(256) g2_fwd_h_v8o4_kernel(FwdOParams p) {
         bN_emit(i, kb1);
         // ---- GEMM1 both V-halves with ONE W load (the R1a dedup)
         f4 acc0 = f4{0.f,0.f,0.f,0.f}, acc1 = f4{0.f,0.f,0.f,0.f};
+        v4bh hbf0[8], hbf1[8];   // kra P-53: h fragments kept for the o pass (hB is unchanged until write_h)
         #pragma unroll
         for (int kt = 0; kt < 8; ++kt) {
-            acc0 = mmac(wf[kt], ld8(hB + (0 * 16 + m) * kPadK + 16 * kt + q4 * 4), acc0);
-            acc1 = mmac(wf[kt], ld8(hB + (1 * 16 + m) * kPadK + 16 * kt + q4 * 4), acc1);
+            hbf0[kt] = ld8(hB + (0 * 16 + m) * kPadK + 16 * kt + q4 * 4);
+            hbf1[kt] = ld8(hB + (1 * 16 + m) * kPadK + 16 * kt + q4 * 4);
+            acc0 = mmac(wf[kt], hbf0[kt], acc0);
+            acc1 = mmac(wf[kt], hbf1[kt], acc1);
         }
         if constexpr (MODE == 1) __builtin_amdgcn_sched_barrier(0);   // kra P-11: keep load spacing
         loadW(nxt);
@@ -408,8 +411,8 @@ __global__ void __launch_bounds__(256) g2_fwd_h_v8o4_kernel(FwdOParams p) {
         if (hasO || hasOb) {
             #pragma unroll
             for (int kt = 0; kt < 8; ++kt) {
-                oh0 = mmac(qgf[kt], ld8(hB + (0 * 16 + m) * kPadK + 16 * kt + q4 * 4), oh0);
-                oh1 = mmac(qgf[kt], ld8(hB + (1 * 16 + m) * kPadK + 16 * kt + q4 * 4), oh1);
+                oh0 = mmac(qgf[kt], hbf0[kt], oh0);   // kra P-53: GEMM1's fragments
+                oh1 = mmac(qgf[kt], hbf1[kt], oh1);
             }
         }
         lds_barrier();                                   // vB (v_new_i) ready
