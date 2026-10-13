@@ -147,6 +147,13 @@ __global__ void __launch_bounds__(256) g2_bwd_tail_kernel(TailParams p) {
             float dAs0 = 0.f, dAs0C = 0.f, ddt0 = 0.f, ddt0C = 0.f;
             float dAs1 = 0.f, dAs1C = 0.f, ddt1 = 0.f, ddt1C = 0.f;
             short b0[16], b1[16];
+            short2 gr2[16];                                 // kra P-54a: g_raw of both columns, 4 B per row
+            #pragma unroll
+            for (int u = 0; u < 16; ++u) {
+                const int t = tb + 15 - u;
+                gr2[u] = *reinterpret_cast<const short2*>(
+                    p.g_raw + ((size_t)(t0 + g2_row_g<M>(t, cl)) * p.H + hh) * kK + d0);
+            }
             // per column a separate straight-line block (the opaque branch keeps the SLP vectorizer from
             // pairing the two columns into packed fp32 ops, which would un-fuse the production's fmas)
             auto gate_col = [&](const float (&loc)[16], float carry, int j, float dtbj, short (&bo)[16],
@@ -154,9 +161,8 @@ __global__ void __launch_bounds__(256) g2_bwd_tail_kernel(TailParams p) {
                 #pragma unroll
                 for (int u = 0; u < 16; ++u) {
                     const int t = tb + 15 - u;
-                    const size_t sog = ((size_t)(t0 + g2_row_g<M>(t, cl)) * p.H + hh) * kK + d0 + j;
                     const float suffix = loc[u] + carry;
-                    const float gg = bf2f(p.g_raw[sog]) + dtbj;
+                    const float gg = bf2f(j ? gr2[u].y : gr2[u].x) + dtbj;   // kra P-54a
                     const float sg = 1.f / (1.f + expf(-(A * gg)));
                     float bdg = suffix * (p.lower_bound * (sg * (1.f - sg)));   // dyg*t1
                     bdg *= A;
@@ -220,6 +226,15 @@ __global__ void __launch_bounds__(256) g2_bwd_tail_kernel(TailParams p) {
                 }
             }
         } else {
+            // kra P-54a: lane j (j < 16) of the warp holds rstd of row 16w + j; rows are broadcast with
+            // v_readlane (the per-row uniform-address VMEM loads go).  Rows past the end hold 0, as before.
+            float rsl[2];
+            {
+                const int jr = wv * 16 + (l & 15);
+                const bool okr = g2_row_ok<M>(jr, cl);
+                rsl[0] = okr ? p.q_rstd[(size_t)(t0 + jr) * p.H + hh] : 0.f;
+                rsl[1] = okr ? p.k_rstd[(size_t)(t0 + jr) * p.H + hh] : 0.f;
+            }
             // q and k interleaved at the 4-row batch level: 8 row-loads in flight
             for (int rb = 0; rb < 16; rb += 4) {
                 const int r0 = wv * 16 + rb;                // warp w owns rows [16w,16w+16)
@@ -232,13 +247,12 @@ __global__ void __launch_bounds__(256) g2_bwd_tail_kernel(TailParams p) {
                 for (int w2 = 0; w2 < 2; ++w2) {
                     const float* dy = w2 ? p.dk : p.dq;
                     const short* y = w2 ? p.kn : p.qn;
-                    const float* rs = w2 ? p.k_rstd : p.q_rstd;
                     #pragma unroll
                     for (int u = 0; u < 4; ++u) {
                         if (g2_row_ok<M>(r0 + u, cl)) {
                             dyv[w2][u] = *reinterpret_cast<const float2*>(dy + so + u * (p.H * kK) + c2);
                             yv[w2][u] = *reinterpret_cast<const short2*>(y + so + u * (p.H * kK) + c2);
-                            r4[w2][u] = rs[(size_t)(row + u) * p.H + hh];
+                            r4[w2][u] = __int_as_float(__builtin_amdgcn_readlane(__float_as_int(rsl[w2]), rb + u));
                         } else {
                             dyv[w2][u] = float2{0.f, 0.f}; yv[w2][u] = short2{0, 0}; r4[w2][u] = 0.f;
                         }
