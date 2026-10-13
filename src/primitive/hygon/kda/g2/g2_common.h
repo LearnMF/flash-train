@@ -78,6 +78,12 @@ __device__ __forceinline__ short bfr(float x) { return bf_rne(x); }
 __device__ __forceinline__ float bf2f(short s) { return __uint_as_float(((uint32_t)(unsigned short)s) << 16); }
 // P3's output-column permutation: lane index n reads source column 4*(n&3) + (n>>2).
 __device__ __forceinline__ int pi16(int n) { return 4 * (n & 3) + (n >> 2); }
+// kra P-52: opaque register copy (ends the source's live range at this point; value unchanged)
+__device__ __forceinline__ float g2_vcopy(float x) {
+    float y;
+    asm volatile("v_mov_b32 %0, %1" : "=v"(y) : "v"(x));
+    return y;
+}
 __device__ __forceinline__ float xsum16(float x) {     // sum over the 4 lanes sharing (l&15)
     x += __shfl_xor(x, 16, 64); x += __shfl_xor(x, 32, 64); return x;
 }

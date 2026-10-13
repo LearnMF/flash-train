@@ -276,7 +276,7 @@ __global__ void __launch_bounds__(256) g2_fwd_prep_a_kernel(PrepAParams p) {
                 #pragma unroll
                 for (int e = 0; e < 4; ++e) {
                     const int col = rc4 + e;
-                    gnp[(col >> 4) * 16 + (col & 3) * 4 + ((col & 15) >> 2)] = refv[e];
+                    gnp[(col >> 4) * 16 + (col & 3) * 4 + ((col & 15) >> 2)] = exp2f(refv[e]);   // kra P-52
                 }
             }
         }

@@ -28,7 +28,8 @@ int g2_fwd_prep(const void* q, const void* k, const void* v, const void* g_raw, 
                 double scale, int H, int NT, const int* ctok, const int* clen, hipStream_t s);
 int g2_fwd_h_v8o(const void* Wn, const void* Kn, const void* Un, const void* Gn, const void* QgA, const void* AqkA,
                  void* O, void* Ob, void* Vn, void* HbN, void* ANv, float scale, int B, int T, int H, const int* seg,
-                 int nseg, const int* ctok, const int* clen, hipStream_t s);
+                 int nseg, const int* ctok, const int* clen, const void* GnRaw, hipStream_t s);
+int g2_exp2_inplace(float* x, long n, hipStream_t s);  // kra P-52: Gn -> exp2f(Gn) decays
 int g2_wu(const void* k, const void* v, const void* q, const void* beta, const void* A, const void* g, void* Wn,
           void* Wb, void* Un, void* KgA, void* Kn, void* Qn, void* kgB, void* vB, int B, int T, int H, const int* ctok,
           const int* clen, hipStream_t s);
@@ -152,7 +153,7 @@ ForwardLayout layoutForward(const Shape& shape, void* base, std::uint64_t* used)
 // wy-stage working set): the workspace no longer holds qn, kn, dA.
 struct BackwardLayout {
     Tables tab;
-    void *g, *Gn;
+    void *g, *Gn, *GnRaw;
     void *kgB, *HbN;
     void *Wn, *Kn, *Un, *HbNdh, *ANv2;     // B1
     void *KgA, *Qn, *Wb, *Vn, *dVn, *dOT;  // B2
@@ -167,6 +168,7 @@ BackwardLayout layoutBackward(const Shape& shape, void* base, std::uint64_t* use
     L.tab                   = takeTables(a, shape, z);
     L.g                     = a.take(z.rows128() * 4);
     L.Gn                    = a.take(z.CH * 128 * 4);
+    L.GnRaw                 = a.take(z.CH * 128 * 4);   // kra P-52
     L.kgB                   = a.take(z.CH * 8192 * 2);
     // kra P-17/P-20/P-22a: no vB / aN_do / aN(v_new) copies (s4a reads v row-major, s4b reads dO
     // row-major and rebuilds aN(v_new) from Vn).  Vn lives OUTSIDE b2: s4b reads it while wy
@@ -244,11 +246,12 @@ void forward(const Shape& shape, const ForwardArgs& p, void* workspace, FTrainSt
         check(g2_kda_to_gn(static_cast<const float*>(L.g), L.tab.ctok, L.tab.clen, H, NT, static_cast<float*>(L.Gn),
                            stream),
               "to_gn");
+        check(g2_exp2_inplace(static_cast<float*>(L.Gn), static_cast<long>(z.CH * 128), stream), "gn_exp2");
     }
     // R5 keep-state: with p.state_* set, the recurrence also emits the backward's B2 state
     // (bN(h), v_new native and A-natural) -- bit-identical to the backward's own recompute.
     check(g2_fwd_h_v8o(L.Wn, L.Kn, L.Un, L.Gn, L.QgA, L.AqkA, nullptr, p.o, p.state_vn, p.state_hbn, p.state_anv,
-                       p.scale, 1, NT * 64, H, L.tab.seg, nseg, L.tab.ctok, L.tab.clen, stream),
+                       p.scale, 1, NT * 64, H, L.tab.seg, nseg, L.tab.ctok, L.tab.clen, nullptr, stream),
           "fwd_h_o");
 }
 
@@ -285,10 +288,12 @@ void backward(const Shape& shape, const BackwardArgs& p, void* workspace, FTrain
                 kept ? nullptr : L.Kn, L.Qn, L.kgB, nullptr /* kra P-17: no vB */, 1, NT * 64, H, ctok, clen,
                 stream),
           "wu");
+    check(g2_kda_to_gn(static_cast<const float*>(L.g), ctok, clen, H, NT, static_cast<float*>(L.GnRaw), stream), "to_gn");
     check(g2_kda_to_gn(static_cast<const float*>(L.g), ctok, clen, H, NT, static_cast<float*>(L.Gn), stream), "to_gn");
+    check(g2_exp2_inplace(static_cast<float*>(L.Gn), static_cast<long>(z.CH * 128), stream), "gn_exp2");  // kra P-52
     if (!kept) {
         check(g2_fwd_h_v8o(L.Wn, L.Kn, L.Un, L.Gn, nullptr, nullptr, nullptr, nullptr, L.Vn, L.HbN, nullptr, 1.f, 1,
-                           NT * 64, H, L.tab.seg, nseg, nullptr, nullptr, stream),
+                           NT * 64, H, L.tab.seg, nseg, nullptr, nullptr, L.GnRaw, stream),
               "fwd_h_bn");
     }
     check(g2_dav(p.d_o, Vn, p.aqk, dA, L.dVn, L.dOT, nullptr /* kra P-20: no aN_do */, p.scale, 1, NT * 64, H,

@@ -113,7 +113,7 @@ __global__ void __launch_bounds__(64 * NW) g2_fwd_h_v7_kernel(FwdNParams p) {
         for (int kl = 0; kl < KPW; ++kl) {
             f4 d;
             #pragma unroll
-            for (int e = 0; e < 4; ++e) d[e] = exp2f(gl[kl][e]);
+            for (int e = 0; e < 4; ++e) d[e] = g2_vcopy(gl[kl][e]);   // kra P-52: Gn = exp2f(G)
             #pragma unroll
             for (int vt = 0; vt < 2; ++vt) ht[vt][kl] *= d;
         }
@@ -249,7 +249,7 @@ extern "C" __global__ void __launch_bounds__(512) g2_dhu_w8b_kernel(BwdNParams p
         {
             f4 d;
             #pragma unroll
-            for (int e = 0; e < 4; ++e) d[e] = exp2f(gl[e]);
+            for (int e = 0; e < 4; ++e) d[e] = g2_vcopy(gl[e]);   // kra P-52: Gn = exp2f(G)
             st[0] *= d; st[1] *= d;
         }
         loadG(nxt);
@@ -386,7 +386,7 @@ __global__ void __launch_bounds__(512) g2_dhu_v8b_kernel(BwdNParams p) {
         {
             f4 d;
             #pragma unroll
-            for (int e = 0; e < 4; ++e) d[e] = exp2f(gl[e]);
+            for (int e = 0; e < 4; ++e) d[e] = g2_vcopy(gl[e]);   // kra P-52: Gn = exp2f(G)
             st[0] *= d; st[1] *= d;
         }
         loadG(nxt);
@@ -549,7 +549,7 @@ __global__ void __launch_bounds__(256) g2_dhu_v8b4_kernel(BwdNParams p) {
         {
             f4 d0, d1;
             #pragma unroll
-            for (int e = 0; e < 4; ++e) { d0[e] = exp2f(gl0[e]); d1[e] = exp2f(gl1[e]); }
+            for (int e = 0; e < 4; ++e) { d0[e] = g2_vcopy(gl0[e]); d1[e] = g2_vcopy(gl1[e]); }   // kra P-52: Gn = exp2f(G)
             st0[0] *= d0; st0[1] *= d0;
             st1[0] *= d1; st1[1] *= d1;
         }

@@ -41,6 +41,7 @@ struct FwdOParams {
     const int* seg; int nseg;
     // Varlen phase 2: packed o rows (chunk i -> tokens ctok[i] .. +clen[i]); null = dense.
     const int* ctok; const int* clen;
+    const float* GnRaw;                                // kra P-52: raw G_last (GE=false instance)
 };
 
 // T9a: wave-scope LDS ordering -- wave-private oStage regions need the compiler
@@ -160,7 +161,7 @@ __global__ void __launch_bounds__(512) g2_fwd_h_v8o_kernel(FwdOParams p) {
         {
             f4 d;
             #pragma unroll
-            for (int e = 0; e < 4; ++e) d[e] = exp2f(gl[e]);
+            for (int e = 0; e < 4; ++e) d[e] = g2_vcopy(gl[e]);   // kra P-52: Gn = exp2f(G)
             ht[0] *= d; ht[1] *= d;
         }
         loadG(nxt);
@@ -249,7 +250,7 @@ __device__ __forceinline__ void r1a_o_wave_order() {
     __builtin_amdgcn_sched_barrier(0);
 }
 
-template <bool VL, int MODE = 0>
+template <bool VL, int MODE = 0, bool GE = true>   // kra P-52: GE = Gn holds exp2f(G)
 __global__ void __launch_bounds__(256) g2_fwd_h_v8o4_kernel(FwdOParams p) {
     // kra P-9: compile-time outputs.  With runtime-optional VMEM ops in the loop the compiler's
     // waitcnt pass must count the path that skips them, so a vmcnt for an OLD load also forced
@@ -389,8 +390,13 @@ __global__ void __launch_bounds__(256) g2_fwd_h_v8o4_kernel(FwdOParams p) {
         if constexpr (MODE == 1) __builtin_amdgcn_sched_barrier(0);   // kra P-11: keep load spacing
         {
             f4 d0, d1;
-            #pragma unroll
-            for (int e = 0; e < 4; ++e) { d0[e] = exp2f(gl0[e]); d1[e] = exp2f(gl1[e]); }
+            if constexpr (GE) {   // kra P-52: decays precomputed
+                #pragma unroll
+                for (int e = 0; e < 4; ++e) { d0[e] = g2_vcopy(gl0[e]); d1[e] = g2_vcopy(gl1[e]); }
+            } else {               // production instance (raw G_last)
+                #pragma unroll
+                for (int e = 0; e < 4; ++e) { d0[e] = exp2f(gl0[e]); d1[e] = exp2f(gl1[e]); }
+            }
             ht0[0] *= d0; ht0[1] *= d0;
             ht1[0] *= d1; ht1[1] *= d1;
         }
@@ -599,7 +605,7 @@ __global__ void __launch_bounds__(256) g2_fwd_h_v8o4w_kernel(FwdOParams p) {
         {
             f4 d0, d1;
             #pragma unroll
-            for (int e = 0; e < 4; ++e) { d0[e] = exp2f(gl0[e]); d1[e] = exp2f(gl1[e]); }
+            for (int e = 0; e < 4; ++e) { d0[e] = g2_vcopy(gl0[e]); d1[e] = g2_vcopy(gl1[e]); }   // kra P-52: Gn = exp2f(G)
             #pragma unroll
             for (int v = 0; v < NVH; ++v) { ht0[v] *= d0; ht1[v] *= d1; }
         }
@@ -678,11 +684,22 @@ __global__ void __launch_bounds__(256) g2_fwd_h_v8o4w_kernel(FwdOParams p) {
     }
 }
 
+// kra P-52: Gn -> exp2f(Gn) in place, the consumers' former per-step exp2f evaluated once
+__global__ void __launch_bounds__(256) g2_exp2_kernel(float* __restrict__ x, long n) {
+    const long i = (long)blockIdx.x * 256 + threadIdx.x;
+    if (i < n) x[i] = exp2f(x[i]);
+}
+extern "C" int g2_exp2_inplace(float* x, long n, hipStream_t s) {
+    if (n <= 0) return 0;
+    hipLaunchKernelGGL(g2_exp2_kernel, dim3((unsigned)((n + 255) / 256)), dim3(256), 0, s, x, n);
+    return (int)hipGetLastError();
+}
+
 extern "C" int g2_fwd_h_v8o(const void* Wn, const void* Kn, const void* Un, const void* Gn,
                             const void* QgA, const void* AqkA, void* O, void* Ob, void* Vn,
                             void* HbN, void* ANv,
                             float scale, int B, int T, int H, const int* seg, int nseg,
-                            const int* ctok, const int* clen, hipStream_t s) {
+                            const int* ctok, const int* clen, const void* GnRaw, hipStream_t s) {
     // T is the chunk-padded row count (NT = T / 64); with ctok/clen the o rows are packed.
     if (T % kBT || B != 1) return -1;                  // batch = segments (seg/nseg)
     if (seg == nullptr) nseg = 1;
@@ -690,7 +707,7 @@ extern "C" int g2_fwd_h_v8o(const void* Wn, const void* Kn, const void* Un, cons
     FwdOParams p{(const bf16*)Wn, (const bf16*)Kn, (const bf16*)Un, (const float*)Gn,
                  (const bf16*)QgA, (const bf16*)AqkA, (float*)O, (bf16*)Ob, (bf16*)Vn,
                  (bf16*)HbN, (bf16*)ANv,
-                 scale, H, T / kBT, seg, nseg, ctok, clen};
+                 scale, H, T / kBT, seg, nseg, ctok, clen, (const float*)GnRaw};
     int r1a = 1;   // R1a: 4-wave dedup form (bitwise equal; 0 restores the 8-wave form)
     if (const char* e = getenv("KDA_G2_R1A")) r1a = atoi(e);
     const dim3 grid(kK / kBV, (unsigned)nseg * H);
@@ -710,13 +727,22 @@ extern "C" int g2_fwd_h_v8o(const void* Wn, const void* Kn, const void* Un, cons
         const size_t dyn = throttle ? g2_lds_topup(kern, 24 * 1024) : 0;
         hipLaunchKernelGGL(kern, grid, dim3(256), dyn, s, p);
     };
+    // kra P-52: narrow MODE 4 at deep saturation keeps the production instance on the raw Gn
+    const bool raw4 = GnRaw != nullptr && 4L * nseg * H >= g2_env_long("KDA_G2_BN_RAW_MIN_CTAS", 192);
+    auto launch4raw = [&](auto kern) {
+        FwdOParams q = p; q.Gn = (const float*)GnRaw;
+        const size_t dyn = throttle ? g2_lds_topup(kern, 24 * 1024) : 0;
+        hipLaunchKernelGGL(kern, grid, dim3(256), dyn, s, q);
+    };
     auto v8o4 = [&](auto vl) {
         constexpr bool VL = decltype(vl)::value;
         switch (mode) {
             case 1: launch4(g2_fwd_h_v8o4_kernel<VL, 1>); break;
             case 2: launch4(g2_fwd_h_v8o4_kernel<VL, 2>); break;
             case 3: launch4(g2_fwd_h_v8o4_kernel<VL, 3>); break;
-            case 4: launch4(g2_fwd_h_v8o4_kernel<VL, 4>); break;
+            case 4: if (raw4) launch4raw(g2_fwd_h_v8o4_kernel<VL, 4, false>);
+                    else      launch4(g2_fwd_h_v8o4_kernel<VL, 4>);
+                    break;
             default: launch4(g2_fwd_h_v8o4_kernel<VL, 0>); break;
         }
     };
