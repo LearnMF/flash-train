@@ -42,6 +42,13 @@ int g2_wy_s4_split(const void* q_kgb, const void* k, const void* v_vb, const voi
                    const void* dAqk, void* dq, void* dk, void* dv2, void* dg, void* db, void* dA, void* dwT,
                    void* db_part, float scale, int T, int H, int NT, const void* q_row, const void* v_row,
                    const int* ctok, const int* clen, hipStream_t s);
+// kra P-20/P-22a: + do_row (row-major dO for s4b), dv2c (C-form dv2, unused here), vnc (C-form v_new)
+int g2_wy_s4_split_r(const void* q_kgb, const void* k, const void* v_vb, const void* v_new, const void* g,
+                     const void* beta, const void* A, const void* h, const void* do_, const void* dh, const void* dv,
+                     const void* dAqk, void* dq, void* dk, void* dv2, void* dg, void* db, void* dA, void* dwT,
+                     void* db_part, float scale, int T, int H, int NT, const void* q_row, const void* v_row,
+                     const int* ctok, const int* clen, const void* do_row, const void* dv2c, const void* vnc,
+                     hipStream_t s);
 int g2_bwd_tail(const void* dq, const void* dk, const void* dg, const void* db, const void* qn, const void* kn,
                 const void* q_rstd, const void* k_rstd, const void* g_raw, const void* A_log, const void* dt_bias,
                 const void* beta_raw, void* dqo, void* dko, void* dg_raw, void* dA_log, void* ddt_bias, void* db_out,
@@ -146,7 +153,7 @@ ForwardLayout layoutForward(const Shape& shape, void* base, std::uint64_t* used)
 struct BackwardLayout {
     Tables tab;
     void *g, *Gn;
-    void *kgB, *vB, *ANv, *HbN, *aNdo;
+    void *kgB, *HbN;
     void *Wn, *Kn, *Un, *HbNdh, *ANv2;     // B1
     void *KgA, *Qn, *Wb, *Vn, *dVn, *dOT;  // B2
     void *dq, *dk, *dg;                    // B2 reuse (fp32 rows)
@@ -161,10 +168,11 @@ BackwardLayout layoutBackward(const Shape& shape, void* base, std::uint64_t* use
     L.g                     = a.take(z.rows128() * 4);
     L.Gn                    = a.take(z.CH * 128 * 4);
     L.kgB                   = a.take(z.CH * 8192 * 2);
-    L.vB                    = a.take(z.CH * 8192 * 2);
-    L.ANv                   = shape.has_state ? nullptr : a.take(z.CH * 8192 * 2);  // given by the forward
+    // kra P-17/P-20/P-22a: no vB / aN_do / aN(v_new) copies (s4a reads v row-major, s4b reads dO
+    // row-major and rebuilds aN(v_new) from Vn).  Vn lives OUTSIDE b2: s4b reads it while wy
+    // writes dq/dk/dg over b2.  Keep-state: Vn and HbN come from the forward.
+    L.Vn                    = shape.has_state ? nullptr : a.take(z.CH * 8192 * 2);
     L.HbN                   = shape.has_state ? nullptr : a.take(z.CH * 16384 * 2);
-    L.aNdo                  = a.take(z.CH * 8192 * 2);
     char* b1                = static_cast<char*>(a.take(z.CH * 3 * 8192 * 2));
     char* b2                = static_cast<char*>(a.take(z.CH * 6 * 8192 * 2));
     const std::uint64_t blk = z.CH * 8192 * 2;  // one 8192-element bf16 native, bytes
@@ -179,7 +187,6 @@ BackwardLayout layoutBackward(const Shape& shape, void* base, std::uint64_t* use
         L.KgA                    = b2;
         L.Qn                     = b2 + blk;
         L.Wb                     = b2 + 2 * blk;
-        L.Vn                     = b2 + 3 * blk;
         L.dVn                    = b2 + 4 * blk;
         L.dOT                    = b2 + 5 * blk;
         const std::uint64_t rows = z.rows128() * 4;  // fp32 [T, H, 128] bytes, <= 2 blk
@@ -273,22 +280,26 @@ void backward(const Shape& shape, const BackwardArgs& p, void* workspace, FTrain
     const bool kept = p.state_hbn != nullptr;  // == shape.has_state (the workspace was laid out for it)
     const void* Vn  = kept ? p.state_vn : L.Vn;
     const void* HbN = kept ? p.state_hbn : L.HbN;
-    const void* ANv = kept ? p.state_anv : L.ANv;
+    const void* ANv = kept ? p.state_anv : nullptr;  // kra P-22a: s4b rebuilds aN(v_new) from Vn
     check(g2_wu(kn, p.v, qn, p.beta, p.akk, L.g, kept ? nullptr : L.Wn, L.Wb, kept ? nullptr : L.Un, L.KgA,
-                kept ? nullptr : L.Kn, L.Qn, L.kgB, L.vB, 1, NT * 64, H, ctok, clen, stream),
+                kept ? nullptr : L.Kn, L.Qn, L.kgB, nullptr /* kra P-17: no vB */, 1, NT * 64, H, ctok, clen,
+                stream),
           "wu");
     check(g2_kda_to_gn(static_cast<const float*>(L.g), ctok, clen, H, NT, static_cast<float*>(L.Gn), stream), "to_gn");
     if (!kept) {
-        check(g2_fwd_h_v8o(L.Wn, L.Kn, L.Un, L.Gn, nullptr, nullptr, nullptr, nullptr, L.Vn, L.HbN, L.ANv, 1.f, 1,
+        check(g2_fwd_h_v8o(L.Wn, L.Kn, L.Un, L.Gn, nullptr, nullptr, nullptr, nullptr, L.Vn, L.HbN, nullptr, 1.f, 1,
                            NT * 64, H, L.tab.seg, nseg, nullptr, nullptr, stream),
               "fwd_h_bn");
     }
-    check(g2_dav(p.d_o, Vn, p.aqk, dA, L.dVn, L.dOT, L.aNdo, p.scale, 1, NT * 64, H, ctok, clen, stream), "dav");
+    check(g2_dav(p.d_o, Vn, p.aqk, dA, L.dVn, L.dOT, nullptr /* kra P-20: no aN_do */, p.scale, 1, NT * 64, H,
+                 ctok, clen, stream),
+          "dav");
     check(g2_dhu_v8b(L.KgA, L.Qn, L.Wb, L.dOT, L.dVn, L.Gn, nullptr, L.HbNdh, L.ANv2, p.scale, 1, NT * 64, H, L.tab.seg,
                      nseg, stream),
           "dhu");
-    check(g2_wy_s4_split(L.kgB, kn, L.vB, ANv, L.g, p.beta, p.akk, HbN, L.aNdo, L.HbNdh, L.ANv2, dA, L.dq, L.dk, p.dv,
-                         L.dg, p.dbeta, L.dAout, L.dwT, L.dbPart, p.scale, NT * 64, H, NT, qn, p.v, ctok, clen, stream),
+    check(g2_wy_s4_split_r(L.kgB, kn, nullptr, ANv, L.g, p.beta, p.akk, HbN, nullptr, L.HbNdh, L.ANv2, dA, L.dq,
+                           L.dk, p.dv, L.dg, p.dbeta, L.dAout, L.dwT, L.dbPart, p.scale, NT * 64, H, NT, qn, p.v,
+                           ctok, clen, p.d_o, nullptr, kept ? nullptr : Vn, stream),
           "wy");
     // dbeta: the post-activation beta's gradient is wy's fp32 db, written in place (use_beta = 0).
     check(g2_bwd_tail(L.dq, L.dk, L.dg, p.dbeta, qn, kn, p.q_rstd, p.k_rstd, p.g,

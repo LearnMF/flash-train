@@ -105,39 +105,58 @@ __global__ void __launch_bounds__(256) g2_bwd_tail_kernel(TailParams p) {
         } else {
             const int tb = wv * 16;                         // block's first row
             const float A = expf(p.A_log[hh]);
+            // kra P-48: lane l owns the ADJACENT columns d0 = 2l, d0 + 1 (float2 / short2 accesses);
+            // partials go to the production (c, l) slot of their column -> production merge order
+            const int d0 = 2 * l;
+            auto slot = [&](int col, int b_) { return ((col >> 6) * 4 + b_) * 64 + (col & 63); };
+            const float2 dtb = *reinterpret_cast<const float2*>(p.dt_bias + (size_t)hh * kK + d0);
+            float loc0[16], loc1[16], run0 = 0.f, run0C = 0.f, run1 = 0.f, run1C = 0.f;
             #pragma unroll
-            for (int c = 0; c < 2; ++c) {
-                const int d = c * 64 + l;
-                const float dtb = p.dt_bias[(size_t)hh * kK + d];
-                float loc[16], run = 0.f, runC = 0.f;
+            for (int u = 0; u < 16; ++u) {
+                const int t = tb + 15 - u;
+                const float2 v = g2_row_ok<M>(t, cl)
+                    ? *reinterpret_cast<const float2*>(p.dg + ((size_t)(t0 + t) * p.H + hh) * kK + d0)
+                    : float2{0.f, 0.f};
+                {
+                    const float y = v.x - run0C;
+                    const float tt = run0 + y;
+                    run0C = (tt - run0) - y;  run0 = tt;
+                    loc0[u] = run0;
+                }
+                {
+                    const float y = v.y - run1C;
+                    const float tt = run1 + y;
+                    run1C = (tt - run1) - y;  run1 = tt;
+                    loc1[u] = run1;
+                }
+            }
+            sBlk[slot(d0, wv)] = run0;                      // block totals
+            sBlk[slot(d0 + 1, wv)] = run1;
+            __syncthreads();
+            float carry0 = 0.f, carry0C = 0.f, carry1 = 0.f, carry1C = 0.f;   // blocks above
+            for (int b = wv + 1; b < 4; ++b) {
+                {
+                    const float y = sBlk[slot(d0, b)] - carry0C, tt = carry0 + y;
+                    carry0C = (tt - carry0) - y;  carry0 = tt;
+                }
+                {
+                    const float y = sBlk[slot(d0 + 1, b)] - carry1C, tt = carry1 + y;
+                    carry1C = (tt - carry1) - y;  carry1 = tt;
+                }
+            }
+            float dAs0 = 0.f, dAs0C = 0.f, ddt0 = 0.f, ddt0C = 0.f;
+            float dAs1 = 0.f, dAs1C = 0.f, ddt1 = 0.f, ddt1C = 0.f;
+            short b0[16], b1[16];
+            // per column a separate straight-line block (the opaque branch keeps the SLP vectorizer from
+            // pairing the two columns into packed fp32 ops, which would un-fuse the production's fmas)
+            auto gate_col = [&](const float (&loc)[16], float carry, int j, float dtbj, short (&bo)[16],
+                                float& dAs, float& dAsC, float& ddt, float& ddtC) {
                 #pragma unroll
                 for (int u = 0; u < 16; ++u) {
                     const int t = tb + 15 - u;
-                    const float y = (g2_row_ok<M>(t, cl)
-                                     ? p.dg[((size_t)(t0 + t) * p.H + hh) * kK + d] : 0.f) - runC;
-                    const float tt = run + y;
-                    runC = (tt - run) - y;  run = tt;
-                    loc[u] = run;                          // suffix within block
-                }
-                sBlk[(c * 4 + wv) * 64 + l] = run;          // block total
-                __syncthreads();
-                float carry = 0.f, carryC = 0.f;            // blocks above: 3 max
-                for (int b = wv + 1; b < 4; ++b) {
-                    const float y = sBlk[(c * 4 + b) * 64 + l] - carryC, tt = carry + y;
-                    carryC = (tt - carry) - y;  carry = tt;
-                }
-                float dAs = 0.f, dAsC = 0.f, ddt = 0.f, ddtC = 0.f;
-                #pragma unroll
-                for (int u = 0; u < 16; ++u) {
-                    const int t = tb + 15 - u;
-                    const bool ok = g2_row_ok<M>(t, cl);
-                    const size_t so = ((size_t)(t0 + t) * p.H + hh) * kK + d;
+                    const size_t sog = ((size_t)(t0 + g2_row_g<M>(t, cl)) * p.H + hh) * kK + d0 + j;
                     const float suffix = loc[u] + carry;
-                    // g_raw from the CLAMPED row, no select: keeps the dense code shape
-                    // (fp-contract picks the same fma pattern -> bitwise); an invalid
-                    // row has suffix = 0, so its bdg and dA/ddt terms are exactly 0.
-                    const size_t sog = ((size_t)(t0 + g2_row_g<M>(t, cl)) * p.H + hh) * kK + d;
-                    const float gg = bf2f(p.g_raw[sog]) + dtb;
+                    const float gg = bf2f(p.g_raw[sog]) + dtbj;
                     const float sg = 1.f / (1.f + expf(-(A * gg)));
                     float bdg = suffix * (p.lower_bound * (sg * (1.f - sg)));   // dyg*t1
                     bdg *= A;
@@ -150,11 +169,22 @@ __global__ void __launch_bounds__(256) g2_bwd_tail_kernel(TailParams p) {
                         const float y = bf2f(b16) - ddtC, tt = ddt + y;
                         ddtC = (tt - ddt) - y;  ddt = tt;
                     }
-                    if (ok) p.dg_raw[so] = b16;
+                    bo[u] = b16;
                 }
-                sDDt[(c * 4 + wv) * 64 + l] = ddt;            // merged below: four
-                sDA[(c * 4 + wv) * 64 + l] = dAs;             // warps share a column
+            };
+            gate_col(loc0, carry0, 0, dtb.x, b0, dAs0, dAs0C, ddt0, ddt0C);
+            if (__builtin_amdgcn_readfirstlane(p.NT) > 0)           // opaque, always true
+                gate_col(loc1, carry1, 1, dtb.y, b1, dAs1, dAs1C, ddt1, ddt1C);
+            #pragma unroll
+            for (int u = 0; u < 16; ++u) {
+                const int t = tb + 15 - u;
+                if (g2_row_ok<M>(t, cl))
+                    *reinterpret_cast<short2*>(p.dg_raw + ((size_t)(t0 + t) * p.H + hh) * kK + d0) = short2{b0[u], b1[u]};
             }
+            sDDt[slot(d0, wv)] = ddt0;                      // merged below in the production order
+            sDDt[slot(d0 + 1, wv)] = ddt1;
+            sDA[slot(d0, wv)] = dAs0;
+            sDA[slot(d0 + 1, wv)] = dAs1;
         }
         __syncthreads();
         if (!p.gate_none && tid < kK) {                     // fixed-order per-column

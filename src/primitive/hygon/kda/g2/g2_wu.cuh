@@ -99,7 +99,9 @@ __device__ __forceinline__ void wu_emit16(short* dst, const short* tile, int tid
 }
 
 template <bool VL>
-__global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p) {
+__global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p_) {
+    // kra P-35: field-wise copy, pointers stamped global (global_* ops, not flat)
+    const WuParams p{g2_glb(p_.k), g2_glb(p_.v), g2_glb(p_.q), g2_glb(p_.beta), g2_glb(p_.A), g2_glb(p_.g), g2_glb(p_.Wn), g2_glb(p_.Wb), g2_glb(p_.Un), g2_glb(p_.KgA), g2_glb(p_.Kn), g2_glb(p_.Qn), g2_glb(p_.kgB), g2_glb(p_.vB), p_.H, p_.NT, g2_glb(p_.ctok), g2_glb(p_.clen), p_.stop};
     const int i = blockIdx.x, hh = blockIdx.y, tid = threadIdx.x;
     const int wv = tid >> 6, l = tid & 63;
     __shared__ __align__(16) short slab[128 * kPadJ2];
@@ -124,7 +126,9 @@ __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p) {
         if (tid < 32)                  // 128 floats = 32 f4 quads
             reinterpret_cast<f4*>(sGl)[tid] =
                 ld16f(p.g + sbase + g2_row_g<M>(63, cl) * rstride + 4 * tid);
-        for (int t = tid; t < 1024; t += 256) {          // sA: 64x64 bf16 row-major
+        #pragma unroll   // kra P-34: all loads in flight before the first wait
+        for (int it_ = 0; it_ < 4; ++it_) {
+            const int t = tid + 256 * it_;          // sA: 64x64 bf16 row-major
             const int r = t >> 4, c4 = (t & 15) << 2;
             *reinterpret_cast<v4bh*>(sA + r * kPadA + c4) = g2_row_ok<M>(r, cl)
                 ? *reinterpret_cast<const v4bh*>(
@@ -196,7 +200,11 @@ __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p) {
         // scalars) directly -- the old kg phases re-read k+g (290 MB @8K/48) purely
         // redundantly.  Value expressions are character-identical to the retired
         // stage_gated(last_ref)/emit_AB path (bitwise gate holds).
-        for (int t = tid; t < 2048; t += 256) {
+        v4bh kgr[8];                                     // kra P-19: kg quads carried to phase 3
+        f4 egr[8];                                       // kra P-19: exp2f(g) carried to phase 3
+        #pragma unroll
+        for (int it = 0; it < 8; ++it) {
+            const int t = tid + 256 * it;
             const int j = t >> 5, vq = (t & 31) << 2;
             const size_t so = sbase + (size_t)j * rstride + vq;
             const v4bh kv = g2_row_ok<M>(j, cl) ? *reinterpret_cast<const v4bh*>(p.k + so)
@@ -208,7 +216,7 @@ __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p) {
             // value; the multiply associations below are unchanged).
             f4 eg;
             #pragma unroll
-            for (int dv = 0; dv < 4; ++dv) eg[dv] = exp2f(gf[dv]);
+            for (int dv = 0; dv < 4; ++dv) eg[dv] = __builtin_amdgcn_exp2f(gf[dv]);
             #pragma unroll
             for (int dv = 0; dv < 4; ++dv) {
                 // kbT staged with pi16-permuted rows (C-pi): the w-MMAC C
@@ -222,8 +230,10 @@ __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p) {
             #pragma unroll
             for (int dv = 0; dv < 4; ++dv) {
                 gv[dv] = bf_rne(bf2f(kv[dv]) * eg[dv]);
-                gkv[dv] = bf_rne(bf2f(kv[dv]) * exp2f(gl[dv] - gf[dv]));
+                gkv[dv] = bf_rne(bf2f(kv[dv]) * __builtin_amdgcn_exp2f(gl[dv] - gf[dv]));
             }
+            kgr[it] = *reinterpret_cast<const v4bh*>(gkv);
+            egr[it] = eg;
             *reinterpret_cast<v4bh*>(p.kgB + wu_vb_quad(j, vq, nblk3)) =
                 *reinterpret_cast<const v4bh*>(gv);
             // KgA: A form, plain row nibble, P1/P2 block order
@@ -238,7 +248,10 @@ __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p) {
 
         // ---- phase 2: vbT = bf16(v*beta)^T ; u = A @ vb -> Un (C)
         // T1: vB = raw v (no beta) into the same vB layout, from the same load.
-        for (int t = tid; t < 2048; t += 256) {
+        if (p.vB == nullptr) {   // kra P-34b: production route, no dead store in the loop
+        #pragma unroll   // kra P-34: all loads in flight before the first wait
+        for (int it_ = 0; it_ < 8; ++it_) {
+            const int t = tid + 256 * it_;
             const int j = t >> 5, vq = (t & 31) << 2;
             const size_t so = sbase + (size_t)j * rstride + vq;
             const v4bh vv = g2_row_ok<M>(j, cl) ? *reinterpret_cast<const v4bh*>(p.v + so)
@@ -247,7 +260,22 @@ __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p) {
             #pragma unroll
             for (int dv = 0; dv < 4; ++dv)
                 slab[(size_t)(vq + dv) * kPadJ2 + wu_slab_col(vq + dv, j)] = bf_rne(bf2f(vv[dv]) * b);
-            *reinterpret_cast<v4bh*>(p.vB + wu_vb_quad(j, vq, nblk3)) = vv;
+        }
+        } else {
+        #pragma unroll   // kra P-34: all loads in flight before the first wait
+        for (int it_ = 0; it_ < 8; ++it_) {
+            const int t = tid + 256 * it_;
+            const int j = t >> 5, vq = (t & 31) << 2;
+            const size_t so = sbase + (size_t)j * rstride + vq;
+            const v4bh vv = g2_row_ok<M>(j, cl) ? *reinterpret_cast<const v4bh*>(p.v + so)
+                                                 : v4bh{0, 0, 0, 0};
+            const float b = sBeta[j];
+            #pragma unroll
+            for (int dv = 0; dv < 4; ++dv)
+                slab[(size_t)(vq + dv) * kPadJ2 + wu_slab_col(vq + dv, j)] = bf_rne(bf2f(vv[dv]) * b);
+            if (p.vB != nullptr)   // kra P-17: production route reads v row-major in s4a instead
+                *reinterpret_cast<v4bh*>(p.vB + wu_vb_quad(j, vq, nblk3)) = vv;
+        }
         }
         if (p.stop == 4) return;
         mmac_phase(nullptr, nullptr, p.Un, 5);
@@ -267,7 +295,7 @@ __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p) {
                                                      : v4bh{0, 0, 0, 0};
                 const f4 gf = ld16f(p.g + sbase + (size_t)g2_row_g<M>(j, cl) * rstride + vq);
                 #pragma unroll
-                for (int dv = 0; dv < 4; ++dv) qgv[dv] = bf_rne(bf2f(qv[dv]) * exp2f(gf[dv]));
+                for (int dv = 0; dv < 4; ++dv) qgv[dv] = bf_rne(bf2f(qv[dv]) * __builtin_amdgcn_exp2f(gf[dv]));
                 return gf;
             };
             auto ibn_of = [](int t) {
@@ -283,14 +311,15 @@ __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p) {
                 for (int it = 0; it < 8; ++it) {
                     const int tt = tid + 256 * it;
                     const int j = tt >> 5, vq = (tt & 31) << 2;
-                    const f4 gf = qg_of(tt, qst[it]);
-                    const v4bh kv = g2_row_ok<M>(j, cl)
-                        ? *reinterpret_cast<const v4bh*>(p.k + sbase + (size_t)j * rstride + vq)
+                    // kra P-19: qg_of's value with the carried exp2f(g); kg = the carried quad
+                    const v4bh qv = g2_row_ok<M>(j, cl)
+                        ? *reinterpret_cast<const v4bh*>(p.q + sbase + (size_t)j * rstride + vq)
                         : v4bh{0, 0, 0, 0};
-                    const f4 gl = *reinterpret_cast<const f4*>(sGl + vq);
+                    #pragma unroll
+                    for (int dv = 0; dv < 4; ++dv) qst[it][dv] = bf_rne(bf2f(qv[dv]) * egr[it][dv]);
                     #pragma unroll
                     for (int dv = 0; dv < 4; ++dv)
-                        tile[wu_tile_idx(ibn_of(tt) + 4 * dv)] = bf_rne(bf2f(kv[dv]) * exp2f(gl[dv] - gf[dv]));
+                        tile[wu_tile_idx(ibn_of(tt) + 4 * dv)] = kgr[it][dv];
                 }
                 __syncthreads();
                 wu_emit16(p.Kn + nblk, tile, tid);

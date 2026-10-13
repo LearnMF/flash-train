@@ -770,6 +770,37 @@ extern "C" int g2_wy_s4_variant(int variant, const void* q_kgb, const void* k, c
 // NOTE (fmaf): the prologue's db accumulation MUST stay the fused kernel's FMA form --
 // with a plain += the compiler chose mul+add here and db drifted +-1-4 ulp on 54% of
 // entries (measured); __builtin_fmaf pins it.
+// kra P-22: C-form fragment (lane l: row l&15, cols (l>>4) + 4e) -> A-form fragment (row l&15,
+// cols 4(l>>4) + e): a 4x4 transpose across the 4 lanes sharing the row, in two 32-bit exchanges
+// (swap q bit 1 <-> e bit 1 with lane l^32, then q bit 0 <-> e bit 0 with lane l^16).
+__device__ __forceinline__ v4bh g2_c2a(v4bh c, int l) {
+    uint32_t d0 = (uint32_t)(unsigned short)c[0] | ((uint32_t)(unsigned short)c[1] << 16);
+    uint32_t d1 = (uint32_t)(unsigned short)c[2] | ((uint32_t)(unsigned short)c[3] << 16);
+    const bool b1 = (l >> 5) & 1, b0 = (l >> 4) & 1;
+    uint32_t r = (uint32_t)__shfl_xor((int)(b1 ? d0 : d1), 32, 64);
+    if (b1) d0 = r; else d1 = r;
+    const uint32_t snd = b0 ? ((d0 & 0xFFFFu) | (d1 << 16)) : ((d0 >> 16) | (d1 & 0xFFFF0000u));
+    r = (uint32_t)__shfl_xor((int)snd, 16, 64);
+    if (b0) { d0 = (r & 0xFFFFu) | (d0 & 0xFFFF0000u); d1 = (r >> 16) | (d1 & 0xFFFF0000u); }
+    else    { d0 = (d0 & 0xFFFFu) | (r << 16);          d1 = (d1 & 0xFFFFu) | (r & 0xFFFF0000u); }
+    return v4bh{(short)(d0 & 0xFFFFu), (short)(d0 >> 16), (short)(d1 & 0xFFFFu), (short)(d1 >> 16)};
+}
+
+// kra P-38: g2_c2a with selects instead of divergent branches (identical bit operations)
+__device__ __forceinline__ v4bh g2_c2a_sel(v4bh c, int l) {
+    uint32_t d0 = (uint32_t)(unsigned short)c[0] | ((uint32_t)(unsigned short)c[1] << 16);
+    uint32_t d1 = (uint32_t)(unsigned short)c[2] | ((uint32_t)(unsigned short)c[3] << 16);
+    const bool b1 = (l >> 5) & 1, b0 = (l >> 4) & 1;
+    uint32_t r = (uint32_t)__shfl_xor((int)(b1 ? d0 : d1), 32, 64);
+    d0 = b1 ? r : d0;
+    d1 = b1 ? d1 : r;
+    const uint32_t snd = b0 ? ((d0 & 0xFFFFu) | (d1 << 16)) : ((d0 >> 16) | (d1 & 0xFFFF0000u));
+    r = (uint32_t)__shfl_xor((int)snd, 16, 64);
+    const uint32_t e0 = b0 ? ((r & 0xFFFFu) | (d0 & 0xFFFF0000u)) : ((d0 & 0xFFFFu) | (r << 16));
+    const uint32_t e1 = b0 ? ((r >> 16) | (d1 & 0xFFFF0000u)) : ((d1 & 0xFFFFu) | (r & 0xFFFF0000u));
+    return v4bh{(short)(e0 & 0xFFFFu), (short)(e0 >> 16), (short)(e1 & 0xFFFFu), (short)(e1 >> 16)};
+}
+
 struct WyS4AParams {
     const bf16 *kgb, *v_vb, *A, *h, *dv;
     const float* beta;
@@ -778,6 +809,7 @@ struct WyS4AParams {
     float *dA, *db_part;
     int T, H, NT;
     const int* ctok; const int* clen;   // varlen phase 2 (null = dense)
+    const bf16* dv2c;                   // kra P-22: C-form dv2 (std order), read when dv is null
 };
 
 struct WyS4BParams {
@@ -789,16 +821,22 @@ struct WyS4BParams {
     float scale;
     int T, H, NT;
     const int* ctok; const int* clen;   // varlen phase 2 (null = dense)
+    const bf16* do_row;                 // kra P-20: row-major do, read when do_ (aN_do) is null
+    const bf16* vnc;                    // kra P-22: C-form v_new (std order), read when v_new is null
 };
 
 // VL (varlen phase 2): the row tensors (v_row, A, beta, dv2 here; q_row, k, g, dAqk, dq,
 // dk, dg, db in B) are PACKED -- rows r >= clen read as 0 (g: clamped row) and are never
 // written.  The dA (dak) handoff between A and B is internal and stays chunk-padded.
-template <bool VL>
+template <bool VL, bool AFS = false>   // kra P-28c: AFS = stage the dA-stage A block in XT
 __global__ void __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(1, 3)))
-p3_wy_s4a_kernel(WyS4AParams p) {
+p3_wy_s4a_kernel(WyS4AParams p_) {
+    // kra P-35: field-wise copy, pointers stamped global (global_* ops, not flat)
+    const WyS4AParams p{g2_glb(p_.kgb), g2_glb(p_.v_vb), g2_glb(p_.A), g2_glb(p_.h), g2_glb(p_.dv), g2_glb(p_.beta), g2_glb(p_.v_row), g2_glb(p_.dv2), g2_glb(p_.dwT), g2_glb(p_.dA), g2_glb(p_.db_part), p_.T, p_.H, p_.NT, g2_glb(p_.ctok), g2_glb(p_.clen), g2_glb(p_.dv2c)};
     __shared__ __align__(16) bf16 S[kD * kPT];      // dvT -> dwT (same buffer reuse as the fused kernel)
     __shared__ __align__(16) bf16 XT[kBT * kPT];    // dA-stage XC staging (dAT staging dropped)
+    __shared__ __align__(16) bf16 KGs[2][4 * 64 * 4];   // kra P-28: kgB tile of step kt (double buffer)
+    __shared__ float BETAs[kBT];                        // kra P-28: masked beta of the chunk's rows
     const int tid = threadIdx.x, r = tid >> 6, l = tid & 63, m = l & 15, q = l >> 4, pm = pi16(m);
     const int i = blockIdx.x, hh = blockIdx.y, H = p.H;
     const int tr = 16 * r + m;
@@ -825,17 +863,25 @@ p3_wy_s4a_kernel(WyS4AParams p) {
         const int ro = tr * R + 4 * q;
 
         const float beta_t = trok ? beta_[tr * H] : 0.f;
+        if (tid < kBT) BETAs[tid] = g2_row_ok<M>(tid, cl) ? beta_[tid * H] : 0.f;   // kra P-28
         v4bh aa[4];                                                         // A^T row tr = column tr of A
         {   // Y4: stage the 64x64 A block into LDS (transiently, S is free before dvT)
             // with coalesced 8B row loads, then gather the transposed column from LDS --
             // replaces 16 stride-RA 2-byte gathers per lane (X2: 20.3% of s4a stalls).
             short* As = reinterpret_cast<short*>(S);
-            for (int j = tid; j < 64 * 16; j += 256) {
-                const int row = j >> 4, qc = j & 15;
+            v4bh av_[4];                                   // kra P-43: all four loads in flight
+            #pragma unroll
+            for (int it_ = 0; it_ < 4; ++it_) {
+                const int j = tid + 256 * it_, row = j >> 4, qc = j & 15;
                 // VL: rows past the chunk's end are NOT in the packed buffer -- never load them
                 // (their aa entries are masked below anyway).
-                *reinterpret_cast<v4bh*>(As + row * 64 + 4 * qc) = g2_row_ok<M>(row, cl)
+                av_[it_] = g2_row_ok<M>(row, cl)
                     ? *reinterpret_cast<const v4bh*>(A_ + row * RA + 4 * qc) : v4bh{0, 0, 0, 0};
+            }
+            #pragma unroll
+            for (int it_ = 0; it_ < 4; ++it_) {
+                const int j = tid + 256 * it_, row = j >> 4, qc = j & 15;
+                *reinterpret_cast<v4bh*>(As + row * 64 + 4 * qc) = av_[it_];
             }
             lds_barrier();                                                  // A block visible
             #pragma unroll
@@ -855,12 +901,14 @@ p3_wy_s4a_kernel(WyS4AParams p) {
             for (int e = 0; e < 4; ++e) reinterpret_cast<short*>(S)[(16 * vt + 4 * q + e) * kPT + tr] = dva[vt][e];
         lds_barrier();                                                      // dvT
         float db = 0.f;
+        v4bh vrow[8];                // kra P-17: this lane's row-major v quads, kept for the dA MMAC
         #pragma unroll
         for (int vt = 0; vt < 8; ++vt) {
             f4 acc = {0.f, 0.f, 0.f, 0.f};
             #pragma unroll
             for (int st = 0; st < 4; ++st) acc = mmac(aa[st], ld8(S + (16 * vt + pm) * kPT + 16 * st + 4 * q), acc);
             const v4bh vv = trok ? ld8(v_ + ro + 16 * vt) : v4bh{0, 0, 0, 0};
+            vrow[vt] = vv;
             v4bh o;
             #pragma unroll
             for (int e = 0; e < 4; ++e) { o[e] = bfr(acc[e] * beta_t); db = __builtin_fmaf(acc[e], bf2f(vv[e]), db); }
@@ -869,12 +917,29 @@ p3_wy_s4a_kernel(WyS4AParams p) {
         f4 dA[4];
         #pragma unroll
         for (int st = 0; st < 4; ++st) dA[st] = f4{0.f, 0.f, 0.f, 0.f};
-        #pragma unroll
-        for (int vt = 0; vt < 8; ++vt)
+        if (p.v_vb != nullptr) {
             #pragma unroll
-            for (int st = 0; st < 4; ++st)
-                dA[st] = mmac(dva[vt], ld8(vBN + ((st * 8 + vt) * 64 + l) * 4), dA[st]);
-        lds_barrier();                                                      // dvT dead -> dwT
+            for (int vt = 0; vt < 8; ++vt)
+                #pragma unroll
+                for (int st = 0; st < 4; ++st)
+                    dA[st] = mmac(dva[vt], ld8(vBN + ((st * 8 + vt) * 64 + l) * 4), dA[st]);
+        } else {
+            // kra P-17: no vB copy -- the B fragment of (st, vt) is v[16*st + pi16(m)][16*vt+4q..+3],
+            // i.e. the row-major quads the CTA just loaded; stage them in S ([64][136] = all of S,
+            // free now that every wave finished reading dvT) and read the fragments from LDS.
+            constexpr int kVS = 2 * kPT;                            // 136-short rows
+            lds_barrier();                                          // dvT reads done
+            #pragma unroll
+            for (int vt = 0; vt < 8; ++vt)
+                *reinterpret_cast<v4bh*>(reinterpret_cast<short*>(S) + tr * kVS + 16 * vt + 4 * q) = vrow[vt];
+            lds_barrier();                                          // v tile visible
+            #pragma unroll
+            for (int vt = 0; vt < 8; ++vt)
+                #pragma unroll
+                for (int st = 0; st < 4; ++st)
+                    dA[st] = mmac(dva[vt], ld8(S + (16 * st + pm) * kVS + 16 * vt + 4 * q), dA[st]);
+        }
+        lds_barrier();                                                      // dvT/v tile dead -> dwT
 
         const v4bh (&af)[8] = dva;   // V4 (kra P-3): dvN fragments are already in dva -- no reload
         {   // pass W: -dw -> dwT (S), dA += (-dw) kg^T   [verbatim from the .inc]
@@ -894,10 +959,14 @@ p3_wy_s4a_kernel(WyS4AParams p) {
                 }
                 #pragma unroll
                 for (int st = 0; st < 4; ++st) {
-                    const v4bh kgb = ld8(kgB + ((st * 8 + kt) * 64 + l) * 4);
+                    const v4bh kgb = ld8(&KGs[kt & 1][0] + (st * 64 + l) * 4);   // kra P-28
                     dA[st] = mmac(dwn, kgb, dA[st]);
                 }
             };
+            // kra P-28: thread tid carries fragment (st = tid>>6, lane = tid&63) of the kgB tile
+            const bf16* kgsrc = kgB + (((tid >> 6) * 8) * 64 + (tid & 63)) * 4;
+            *reinterpret_cast<v4bh*>(&KGs[0][0] + 4 * tid) = ld8(kgsrc);            // tile 0
+            v4bh kgreg = ld8(kgsrc + 1 * 256);                                      // tile 1
             // V5 (kra P-4): the h block of step kt (8 vt fragments x 64 lanes x 8 B = 4 KB) does
             // not depend on the wave, so the 4 waves used to fetch it 4 times with 8 B loads.
             // Now the CTA fetches it ONCE with one 16 B load per thread into XT (free until the
@@ -918,7 +987,11 @@ p3_wy_s4a_kernel(WyS4AParams p) {
                 if (kt < 7) {
                     // buffer (kt+1)&1 was last read in step kt-1, before the barrier ending kt-1
                     *reinterpret_cast<f4*>(hs + ((kt + 1) & 1) * 2048 + 8 * tid) = hreg;
-                    if (kt < 6) hreg = *reinterpret_cast<const f4*>(hsrc + (kt + 2) * 2048);
+                    *reinterpret_cast<v4bh*>(&KGs[(kt + 1) & 1][0] + 4 * tid) = kgreg;   // kra P-28
+                    if (kt < 6) {
+                        hreg = *reinterpret_cast<const f4*>(hsrc + (kt + 2) * 2048);
+                        kgreg = ld8(kgsrc + (kt + 2) * 256);
+                    }
                 }
                 body(kt, bf);
                 lds_barrier();      // block kt+1 visible; reads of block kt done before reuse
@@ -933,9 +1006,28 @@ p3_wy_s4a_kernel(WyS4AParams p) {
             #pragma unroll
             for (int e = 0; e < 4; ++e) {
                 const int s = 16 * st + 4 * q + e;
-                da[st][e] = bfr(tr > s ? dA[st][e] * (g2_row_ok<M>(s, cl) ? beta_[s * H] : 0.f) : 0.f);
+                da[st][e] = bfr(tr > s ? dA[st][e] * BETAs[s] : 0.f);   // kra P-28: staged, same mask
             }
         f4 xc[4];
+        if constexpr (AFS) {   // kra P-28b/c: A block -> XT once per CTA (XT is free after pass W)
+            short* As2 = reinterpret_cast<short*>(XT);
+            #pragma unroll   // kra P-34: all loads in flight before the first wait
+            for (int it_ = 0; it_ < 4; ++it_) {
+                const int j = tid + 256 * it_;
+                const int row = j >> 4, qc = j & 15;
+                *reinterpret_cast<v4bh*>(As2 + row * kPT + 4 * qc) = g2_row_ok<M>(row, cl)
+                    ? *reinterpret_cast<const v4bh*>(A_ + row * RA + 4 * qc) : v4bh{0, 0, 0, 0};
+            }
+            lds_barrier();                                                  // A block visible
+            #pragma unroll
+            for (int ut = 0; ut < 4; ++ut) {
+                xc[ut] = f4{0.f, 0.f, 0.f, 0.f};
+                #pragma unroll
+                for (int st = 0; st < 4; ++st)
+                    xc[ut] = mmac(da[st], ld8(XT + (16 * ut + pm) * kPT + 16 * st + 4 * q), xc[ut]);
+            }
+            lds_barrier();                                                  // A reads done -> XC
+        } else {
         #pragma unroll
         for (int ut = 0; ut < 4; ++ut) {
             xc[ut] = f4{0.f, 0.f, 0.f, 0.f};
@@ -944,6 +1036,7 @@ p3_wy_s4a_kernel(WyS4AParams p) {
             for (int st = 0; st < 4; ++st)
                 xc[ut] = mmac(da[st], aok ? ld8(A_ + (16 * ut + pm) * RA + 16 * st + 4 * q)
                                           : v4bh{0, 0, 0, 0}, xc[ut]);
+        }
         }
         #pragma unroll
         for (int ut = 0; ut < 4; ++ut)
@@ -979,6 +1072,7 @@ struct S4BSmem {
     float gM[4][16];
     float cs1[2][4][16], cs2[2][4][16];
     bf16 stg[2][2][8 * 256];
+    bf16 dwTs[16 * 64];          // kra P-29: dwT tile of step kt, column groups XOR-swizzled by row
 };
 
 template <int A, int M>
@@ -1030,12 +1124,28 @@ __device__ __forceinline__ void s4b_tail(const WyS4BParams& p, S4BSmem& sm, cons
     const bf16* dhb = p.dh + cQ;
     v4bh ado[8], avn[8];
     {
-        const bf16* doN = p.do_ + g2_nat_blk(i, hh, H, 0, true, 4 * 8 * 256);
-        #pragma unroll
-        for (int vt = 0; vt < 8; ++vt) ado[vt] = ld8(doN + ((A * 8 + vt) * 64 + l) * 4);
-        const bf16* vnN = p.v_new + g2_nat_blk(i, hh, H, 0, true, 4 * 8 * 256);
-        #pragma unroll
-        for (int vt = 0; vt < 8; ++vt) avn[vt] = ld8(vnN + ((A * 8 + vt) * 64 + l) * 4);
+        if (p.do_ != nullptr) {
+            const bf16* doN = p.do_ + g2_nat_blk(i, hh, H, 0, true, 4 * 8 * 256);
+            #pragma unroll
+            for (int vt = 0; vt < 8; ++vt) ado[vt] = ld8(doN + ((A * 8 + vt) * 64 + l) * 4);
+        } else {
+            // kra P-20: the aN_do fragment (A*8 + vt, l) = do[row][16vt + 4q..+3], row = 16A + m
+            #pragma unroll
+            for (int vt = 0; vt < 8; ++vt)
+                ado[vt] = rok ? ld8(p.do_row + cb + ro + 16 * vt) : v4bh{0, 0, 0, 0};
+        }
+        if (p.v_new != nullptr) {
+            const bf16* vnN = p.v_new + g2_nat_blk(i, hh, H, 0, true, 4 * 8 * 256);
+            #pragma unroll
+            for (int vt = 0; vt < 8; ++vt) avn[vt] = ld8(vnN + ((A * 8 + vt) * 64 + l) * 4);
+        } else {                // kra P-22: from the C-form Vn via the in-register transpose
+            const bf16* vnc = p.vnc + g2_nat_blk(i, hh, H, p.NT, false, 8192) + A * 8 * 256 + l * 4;
+            v4bh raw_[8];                                   // kra P-38: all 8 loads in flight first
+            #pragma unroll
+            for (int vt = 0; vt < 8; ++vt) raw_[vt] = ld8(vnc + vt * 256);
+            #pragma unroll
+            for (int vt = 0; vt < 8; ++vt) avn[vt] = g2_c2a_sel(raw_[vt], l);
+        }
     }
     const int4* hg4 = reinterpret_cast<const int4*>(hb);
     const int4* dhg4 = reinterpret_cast<const int4*>(dhb);
@@ -1051,6 +1161,9 @@ __device__ __forceinline__ void s4b_tail(const WyS4BParams& p, S4BSmem& sm, cons
     #pragma unroll 1
     for (int kt = 0; kt < 8; ++kt) {
         const int buf = kt & 1, kc = 16 * kt;
+        // kra P-29: this kt's dwT tile, one 8 B load per thread (issued first: oldest in vmcnt)
+        const int dwr = threadIdx.x >> 4, dwc = threadIdx.x & 15;
+        const v4bh dwv = ld8(dwTg + (kc + dwr) * kBT + 4 * dwc);
         int4 pfh, pfd;
         const bf16* sh = &sm.stg[buf][0][0];
         const bf16* sdh = &sm.stg[buf][1][0];
@@ -1083,7 +1196,7 @@ __device__ __forceinline__ void s4b_tail(const WyS4BParams& p, S4BSmem& sm, cons
             #pragma unroll
             for (int e = 0; e < 4; ++e) {
                 const float c = msum(kd[e]);
-                if (m == 0) sm.cs2[buf][A][4 * q + e] = c;
+                sm.cs2[buf][A][4 * q + e] = c;            // kra P-40: all 16 lanes hold c
             }
         }
         {
@@ -1095,7 +1208,7 @@ __device__ __forceinline__ void s4b_tail(const WyS4BParams& p, S4BSmem& sm, cons
                 for (int e = 0; e < 4; ++e) hd += bf2f(h0[e]) * bf2f(d0[e]);
             }
             hd = xsum16(hd);
-            if (q == 0) sm.cs1[buf][A][pm] = hd;
+            sm.cs1[buf][A][pm] = hd;                      // kra P-40: 4 lanes, same value
         }
         // pass Q tile kt, ahead of the table barrier (ST=4 form)
         f4 dqiE;
@@ -1110,10 +1223,11 @@ __device__ __forceinline__ void s4b_tail(const WyS4BParams& p, S4BSmem& sm, cons
             #pragma unroll
             for (int e = 0; e < 4; ++e) dqiE[e] = accq[e] * ex2(gv[e]) * p.scale;
         }
-        f4 ep, en;
+        f4 ep, en, g8;
         #pragma unroll
         for (int e = 0; e < 4; ++e) {
-            const float d = gv[e] - __shfl(gv[e], 16 * q + 8, 64);
+            g8[e] = __shfl(gv[e], 16 * q + 8, 64);        // kra P-40: row 16A+8's g (== m==8 lane's gv)
+            const float d = gv[e] - g8[e];
             ep[e] = ex2(d);
             en[e] = ex2(-d);
         }
@@ -1125,10 +1239,9 @@ __device__ __forceinline__ void s4b_tail(const WyS4BParams& p, S4BSmem& sm, cons
             sm.TQ[o] = qf * ep[e];
             sm.TK[o] = kf * beta_t * ep[e];
         }
-        if (m == 8) {
-            #pragma unroll
-            for (int e = 0; e < 4; ++e) sm.gM[A][4 * e + q] = gv[e];
-        }
+        #pragma unroll
+        for (int e = 0; e < 4; ++e) sm.gM[A][4 * e + q] = g8[e];   // kra P-40: every lane, same value
+        *reinterpret_cast<v4bh*>(&sm.dwTs[dwr * 64 + 4 * (dwc ^ dwr)]) = dwv;   // kra P-29
         lds_barrier();
         if (kt + 2 < 8) {                          // tile kt+2 -> the buffer tile kt freed
             stg4[(buf * 2 + 0) * 256 + threadIdx.x] = pfh;
@@ -1138,7 +1251,7 @@ __device__ __forceinline__ void s4b_tail(const WyS4BParams& p, S4BSmem& sm, cons
         f4 acc = {0.f, 0.f, 0.f, 0.f};
         #pragma unroll
         for (int st = 0; st < 4; ++st)
-            acc = mmac(aa[st], ld8(dwTg + (kc + pm) * kBT + 16 * st + 4 * q), acc);
+            acc = mmac(aa[st], ld8(&sm.dwTs[pm * 64 + 4 * ((4 * st + q) ^ pm)]), acc);   // kra P-29
 
         f4 cq0 = {0.f, 0.f, 0.f, 0.f}, cq1 = cq0, ck0 = cq0, ck1 = cq0, ct0 = cq0, ct1 = cq0;
         {
@@ -1178,11 +1291,12 @@ __device__ __forceinline__ void s4b_tail(const WyS4BParams& p, S4BSmem& sm, cons
             float dk = dki[e] + acc[e] * (eg * beta_t);
             float dg = dgi[e] + kg * acc[e] * beta_t;
             db += acc[e] * kg;
-            if (row == rlast) {
+            {                                             // kra P-40: select, never "+ 0"
                 const int c = 4 * q + e;
                 const float s1 = ((sm.cs1[buf][0][c] + sm.cs1[buf][1][c]) + sm.cs1[buf][2][c]) + sm.cs1[buf][3][c];
                 const float s2 = ((sm.cs2[buf][0][c] + sm.cs2[buf][1][c]) + sm.cs2[buf][2][c]) + sm.cs2[buf][3][c];
-                dg += s1 * ex2(gn[e]) + s2;
+                const float dgc = dg + (s1 * ex2(gn[e]) + s2);
+                dg = row == rlast ? dgc : dg;
             }
             const float dq2 = (cq0[e] + cq1[e]) * ep[e];
             const float dk2 = (ck0[e] + ck1[e]) * ep[e];
@@ -1227,7 +1341,9 @@ p3_wy_s4b_kernel(WyS4BParams p) {
             // gather the transposed column from LDS; stg is re-initialised for the kt
             // loop right after, so the staging is transient (zero LDS growth).
             short* As = reinterpret_cast<short*>(&sm.stg[0][0][0]);
-            for (int j = tid; j < 64 * 16; j += 256) {
+            #pragma unroll   // kra P-34: all loads in flight before the first wait
+            for (int it_ = 0; it_ < 4; ++it_) {
+                const int j = tid + 256 * it_;
                 const int row = j >> 4, qc = j & 15;
                 // VL: rows past the chunk's end are NOT in the packed buffer -- never load them
                 // (their aa entries are masked below anyway).
@@ -1254,23 +1370,33 @@ p3_wy_s4b_kernel(WyS4BParams p) {
     });
 }
 
-extern "C" int g2_wy_s4_split(const void* q_kgb, const void* k, const void* v_vb,
-                              const void* v_new, const void* g, const void* beta,
-                              const void* A, const void* h, const void* do_, const void* dh,
-                              const void* dv, const void* dAqk, void* dq, void* dk,
-                              void* dv2, void* dg, void* db, void* dA, void* dwT,
-                              void* db_part, float scale, int T, int H, int NT,
-                              const void* q_row, const void* v_row, const int* ctok,
-                              const int* clen, hipStream_t s) {
+// kra P-20: + do_row (row-major do; read by s4b when do_ == nullptr)
+extern "C" int g2_wy_s4_split_r(const void* q_kgb, const void* k, const void* v_vb,
+                                const void* v_new, const void* g, const void* beta,
+                                const void* A, const void* h, const void* do_, const void* dh,
+                                const void* dv, const void* dAqk, void* dq, void* dk,
+                                void* dv2, void* dg, void* db, void* dA, void* dwT,
+                                void* db_part, float scale, int T, int H, int NT,
+                                const void* q_row, const void* v_row, const int* ctok,
+                                const int* clen, const void* do_row, const void* dv2c,
+                                const void* vnc, hipStream_t s) {
     // T = chunk-padded rows (NT = T/64); with ctok/clen the row tensors are packed.
     if (T % kBT || NT != T / kBT || ((ctok == nullptr) != (clen == nullptr))) return -1;
     {
         WyS4AParams pa{(const bf16*)q_kgb, (const bf16*)v_vb, (const bf16*)A, (const bf16*)h,
                        (const bf16*)dv, (const float*)beta, (const bf16*)v_row,
                        (bf16*)dv2, (bf16*)dwT, (float*)dA, (float*)db_part, T, H, NT,
-                       ctok, clen};
-        if (ctok) hipLaunchKernelGGL(p3_wy_s4a_kernel<true>, dim3(NT, H), dim3(256), 0, s, pa);
-        else hipLaunchKernelGGL(p3_wy_s4a_kernel<false>, dim3(NT, H), dim3(256), 0, s, pa);
+                       ctok, clen, (const bf16*)dv2c};
+        int afs_maxh = 12;   // kra P-28c (H=24 measured mixed: 1.036x at 8K, 0.94-0.97x at 32K-64K)
+        if (const char* e = getenv("KDA_G2_S4A_AFS_MAXH")) afs_maxh = atoi(e);
+        const bool afs = H <= afs_maxh;
+        if (ctok) {
+            if (afs) hipLaunchKernelGGL((p3_wy_s4a_kernel<true, true>), dim3(NT, H), dim3(256), 0, s, pa);
+            else     hipLaunchKernelGGL((p3_wy_s4a_kernel<true, false>), dim3(NT, H), dim3(256), 0, s, pa);
+        } else {
+            if (afs) hipLaunchKernelGGL((p3_wy_s4a_kernel<false, true>), dim3(NT, H), dim3(256), 0, s, pa);
+            else     hipLaunchKernelGGL((p3_wy_s4a_kernel<false, false>), dim3(NT, H), dim3(256), 0, s, pa);
+        }
         const int rc = (int)hipGetLastError();
         if (rc) return rc;
     }
@@ -1280,11 +1406,24 @@ extern "C" int g2_wy_s4_split(const void* q_kgb, const void* k, const void* v_vb
                        (const float*)g, (const float*)beta, (const float*)dAqk,
                        (const bf16*)dwT, (const float*)dA, (const float*)db_part,
                        (float*)dq, (float*)dk, (float*)dg, (float*)db, scale, T, H, NT,
-                       ctok, clen};
+                       ctok, clen, (const bf16*)do_row, (const bf16*)vnc};
         if (ctok) hipLaunchKernelGGL(p3_wy_s4b_kernel<true>, dim3(NT, H), dim3(256), 0, s, pb);
         else hipLaunchKernelGGL(p3_wy_s4b_kernel<false>, dim3(NT, H), dim3(256), 0, s, pb);
         return (int)hipGetLastError();
     }
+}
+
+extern "C" int g2_wy_s4_split(const void* q_kgb, const void* k, const void* v_vb,
+                              const void* v_new, const void* g, const void* beta,
+                              const void* A, const void* h, const void* do_, const void* dh,
+                              const void* dv, const void* dAqk, void* dq, void* dk,
+                              void* dv2, void* dg, void* db, void* dA, void* dwT,
+                              void* db_part, float scale, int T, int H, int NT,
+                              const void* q_row, const void* v_row, const int* ctok,
+                              const int* clen, hipStream_t s) {
+    return g2_wy_s4_split_r(q_kgb, k, v_vb, v_new, g, beta, A, h, do_, dh, dv, dAqk, dq, dk, dv2,
+                            dg, db, dA, dwT, db_part, scale, T, H, NT, q_row, v_row, ctok, clen,
+                            nullptr, nullptr, nullptr, s);
 }
 
 // ================================================================ V1: l2n apply

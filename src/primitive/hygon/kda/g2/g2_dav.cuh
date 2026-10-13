@@ -32,7 +32,9 @@ constexpr int kPadJ3 = 68;
 // VL (varlen phase 2): do / Aqk rows r >= clen read as 0 (= the zero padding; they only
 // feed MMAC operands), dA rows r >= clen are not stored.  Natives keep NT chunks.
 template <bool VL>
-__global__ void __launch_bounds__(256) g2_dav_kernel(DavParams p) {
+__global__ void __launch_bounds__(256) g2_dav_kernel(DavParams p_) {
+    // kra P-35: field-wise copy, pointers stamped global (global_* ops, not flat)
+    const DavParams p{g2_glb(p_.do_), g2_glb(p_.Vn), g2_glb(p_.A), g2_glb(p_.dA), g2_glb(p_.dVn), g2_glb(p_.dOT), g2_glb(p_.aNdo), p_.scale, p_.H, p_.NT, g2_glb(p_.ctok), g2_glb(p_.clen)};
     const int i = blockIdx.x, hh = blockIdx.y, tid = threadIdx.x;
     const int wv = tid >> 6, l = tid & 63;
     const long t0 = g2_row_tok<VL>(p.ctok, i);
@@ -53,7 +55,9 @@ __global__ void __launch_bounds__(256) g2_dav_kernel(DavParams p) {
         // ---- pass 1: dA = do @ vT, reduction over v (8 tiles), 4 j-tile outputs
         // (dA == nullptr skips the pass -- bisection hook, bindings never pass null)
         if (p.dA != nullptr)
-        for (int t = tid; t < 2048; t += 256) {
+        #pragma unroll   // kra P-34: all loads in flight before the first wait
+        for (int it_ = 0; it_ < 8; ++it_) {
+            const int t = tid + 256 * it_;
             const int sb = t >> 6, c = t & 63;                    // 32 sub-blocks x 64 quads
             const v4bh vq = *reinterpret_cast<const v4bh*>(p.Vn + nblk + (size_t)sb * 256 + c * 4);
             const int d0 = sb >> 3, d1 = sb & 7, m = c & 15, q = c >> 4;
@@ -79,15 +83,26 @@ __global__ void __launch_bounds__(256) g2_dav_kernel(DavParams p) {
                     acc[jt] = mmac(df, *reinterpret_cast<const v4bh*>(slab + lo), acc[jt]);
                 }
             }
+            // kra P-14: the same values, staged through the (now free) slab so they leave
+            // as 16 B row stores instead of 16 scalar 4 B stores per lane
+            __syncthreads();                                      // all waves done with Vn
+            float* dAs = reinterpret_cast<float*>(slab);          // [64][kPadJ3] fp32 = slab
             #pragma unroll
             for (int jt = 0; jt < 4; ++jt) {
                 const int t = 16 * wv + (l & 15), j0 = 16 * jt + (l >> 4);
-                if (!g2_row_ok<M>(t, cl)) continue;
                 #pragma unroll
                 for (int e = 0; e < 4; ++e) {           // C-frag col = (l>>4) + 4e
                     const float val = (t >= j0 + 4 * e) ? acc[jt][e] * p.scale : 0.f;
-                    p.dA[g2_rm_tok(t0 + t, hh, p.H, kBT) + j0 + 4 * e] = val;
+                    dAs[t * kPadJ3 + j0 + 4 * e] = val;
                 }
+            }
+            __syncthreads();
+            #pragma unroll
+            for (int it = 0; it < 4; ++it) {                      // 64 rows x 16 quads
+                const int c = tid + 256 * it, t = c >> 4, j = (c & 15) * 4;
+                if (!g2_row_ok<M>(t, cl)) continue;
+                *reinterpret_cast<f4*>(p.dA + g2_rm_tok(t0 + t, hh, p.H, kBT) + j) =
+                    *reinterpret_cast<const f4*>(dAs + t * kPadJ3 + j);
             }
         }
 
@@ -97,7 +112,10 @@ __global__ void __launch_bounds__(256) g2_dav_kernel(DavParams p) {
         // FLA's upper-triangle garbage must not leak in.
         __syncthreads();
         if (p.dVn != nullptr)
-        for (int t = tid; t < 2048; t += 256) {
+        if (p.aNdo == nullptr) {   // kra P-34b: production route, no dead store in the loop
+        #pragma unroll   // kra P-34: all loads in flight before the first wait
+        for (int it_ = 0; it_ < 8; ++it_) {
+            const int t = tid + 256 * it_;
             const int j = t >> 5, vq = (t & 31) << 2;
             const v4bh dv_ = g2_row_ok<M>(j, cl)
                 ? *reinterpret_cast<const v4bh*>(p.do_ + vbase + (size_t)j * rstride + vq)
@@ -109,14 +127,41 @@ __global__ void __launch_bounds__(256) g2_dav_kernel(DavParams p) {
             // block order) and P3's aN_do (A form, plain row nibble, P3 block order)
             // -- the two B3.5 convert2 calls (which re-read do, ~200 MB @8K/48)
             // disappear.  Index math identical to g2_wu's verified Kn/KgA emits.
-            *reinterpret_cast<v4bh*>(p.aNdo + nblk3 + (size_t)(4 * (j & 15)
-                + 64 * ((vq & 15) >> 2) + 256 * (vq >> 4) + 2048 * (j >> 4))) = dv_;
-            const int ibd = (j & 3) + 4 * (vq & 15) + 64 * ((j >> 2) & 3)
-                            + 256 * (j >> 4) + 1024 * (vq >> 4);
+        }
+        } else {
+        #pragma unroll   // kra P-34: all loads in flight before the first wait
+        for (int it_ = 0; it_ < 8; ++it_) {
+            const int t = tid + 256 * it_;
+            const int j = t >> 5, vq = (t & 31) << 2;
+            const v4bh dv_ = g2_row_ok<M>(j, cl)
+                ? *reinterpret_cast<const v4bh*>(p.do_ + vbase + (size_t)j * rstride + vq)
+                : v4bh{0, 0, 0, 0};
             #pragma unroll
-            for (int d = 0; d < 4; ++d) p.dOT[nblk + ibd + 4 * d] = dv_[d];
+            for (int d = 0; d < 4; ++d)
+                slab[(size_t)(vq + d) * kPadJ3 + j] = dv_[d];
+            // T3: the SAME do loads also emit P2's dOT (B form, stride-4 quads, std
+            // block order) and P3's aN_do (A form, plain row nibble, P3 block order)
+            // -- the two B3.5 convert2 calls (which re-read do, ~200 MB @8K/48)
+            // disappear.  Index math identical to g2_wu's verified Kn/KgA emits.
+            if (p.aNdo != nullptr)   // kra P-20: production route -- s4b reads do row-major
+                *reinterpret_cast<v4bh*>(p.aNdo + nblk3 + (size_t)(4 * (j & 15)
+                    + 64 * ((vq & 15) >> 2) + 256 * (vq >> 4) + 2048 * (j >> 4))) = dv_;
+        }
         }
         __syncthreads();
+        // kra P-14: dOT (B form) from the transposed staging, 16 B per store.  dOT index of
+        // element (j, v) = (j&3) + 4(v&15) + 64((j>>2)&3) + 256(j>>4) + 1024(v>>4): the 8
+        // shorts of chunk c are rows j0..j0+3 at columns v0 and v0+1 -- two 8 B slab reads.
+        if (p.dVn != nullptr)
+        #pragma unroll
+        for (int it = 0; it < 4; ++it) {
+            const int c = tid + 256 * it, x = 8 * c;
+            const int j0 = 4 * ((x >> 6) & 3) + 16 * ((x >> 8) & 3);
+            const int v0 = ((x >> 2) & 15) + 16 * (x >> 10);
+            const v4bh lo = *reinterpret_cast<const v4bh*>(slab + (size_t)v0 * kPadJ3 + j0);
+            const v4bh hi = *reinterpret_cast<const v4bh*>(slab + (size_t)(v0 + 1) * kPadJ3 + j0);
+            st16x2(p.dOT + nblk + x, lo, hi);
+        }
         if (p.dVn != nullptr)
         {
             f4 acc[8];

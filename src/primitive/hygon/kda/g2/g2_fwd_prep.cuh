@@ -163,7 +163,6 @@ __global__ void __launch_bounds__(256) g2_fwd_prep_a_kernel(PrepAParams p) {
     const int l = threadIdx.x & 63, m = l & 15, q4 = l >> 4;
     const long tok0 = g2_row_tok<VL>(p.ctok, i);
     const int cl = g2_row_len<VL>(p.clen, i);
-    if (VL && cl <= 0) return;      // empty capacity chunk (flash-train's chunk tables): no rows
     g2_vl_dispatch<VL>(cl, [&](auto mode_) {
     constexpr int M = decltype(mode_)::value;
     #define PA_RED(B, A) { f4* d_ = reinterpret_cast<f4*>(smem + (B) * 256 + l * 4); \
@@ -314,11 +313,11 @@ __global__ void __launch_bounds__(256) g2_fwd_prep_a_kernel(PrepAParams p) {
             const float bta = rok ? p.beta[g2_rm_tok(tok0 + row, hh, p.H, 1)] : 0.f;
             #pragma unroll
             for (int s = 0; s < 8; ++s) {
-                const float eg = exp2f(G_(rb, s));    // shared by QgA and Kb (same argument)
+                const float eg = __builtin_amdgcn_exp2f(G_(rb, s));    // shared by QgA and Kb (same argument)
                 qg[s >> 2][s & 3] = bf_rne(Q(rb, s) * eg);
                 // Kb = bf16(kn * beta * 2^g): fwd_intra2b's T2 pass-0 value, row-major like kn
                 kb[s >> 2][s & 3] = bf_rne(K(rb, s) * bta * eg);
-                T2[(cbase + s) * kT2 + 16 * rb + m] = bf_rne(K(rb, s) * exp2f(gn[s] - G_(rb, s)));
+                T2[(cbase + s) * kT2 + 16 * rb + m] = bf_rne(K(rb, s) * __builtin_amdgcn_exp2f(gn[s] - G_(rb, s)));
             }
             if (rok) {
                 *reinterpret_cast<v4bh*>(p.Kb + cta0 + (size_t)row * rs + cbase) = kb[0];
@@ -394,7 +393,7 @@ __global__ void __launch_bounds__(256) g2_fwd_prep_a_kernel(PrepAParams p) {
                     const f2 Ak = f2{K(rb, s0), K(rb, s1)} * eO;
                     #pragma unroll
                     for (int cb = 0; cb < rb; ++cb) {
-                        const f2 eBo = f2{exp2f(gr[s0] - G_(cb, s0)), exp2f(gr[s1] - G_(cb, s1))};
+                        const f2 eBo = f2{__builtin_amdgcn_exp2f(gr[s0] - G_(cb, s0)), __builtin_amdgcn_exp2f(gr[s1] - G_(cb, s1))};
                         const f2 Bo = f2{K(cb, s0), K(cb, s1)} * eBo;
                         const int x = pidx(rb, cb) - 3 * sp;
                         aq[x] = mmac32(Aq, Bo, aq[x]);
@@ -600,7 +599,6 @@ __global__ void __launch_bounds__(256) g2_fwd_prep_b_kernel(PrepBParams p) {
     const int l = threadIdx.x & 63;
     const long tok0 = g2_row_tok<VL>(p.ctok, i);
     const int cl = g2_row_len<VL>(p.clen, i);
-    if (VL && cl <= 0) return;      // empty capacity chunk: prep_a wrote nothing for it
     const float* Rg = p.R + g2_nat_blk(i, hh, p.H, p.NT, false, 5120);
     g2_vl_dispatch<VL>(cl, [&](auto mode_) {
     constexpr int M = decltype(mode_)::value;

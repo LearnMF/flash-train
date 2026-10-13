@@ -98,6 +98,28 @@ __device__ __forceinline__ float msum(float x) {        // sum over the 16 lanes
 __device__ __forceinline__ size_t g2_rm_tok(long tok, int hh, int H, int D) {
     return ((size_t)tok * H + hh) * D;
 }
+// kra P-24: L2-aware concurrency cap.  Returns the dynamic-LDS bytes that lift a kernel's static
+// LDS to `target_total` per CTA (so that floor(64 KB / target_total) CTAs fit per CU); 0 if the
+// kernel is already larger.  The static size comes from the code object (cached per kernel).
+template <typename K>
+inline size_t g2_lds_topup(K kernel, size_t target_total) {
+    hipFuncAttributes a{};
+    if (hipFuncGetAttributes(&a, reinterpret_cast<const void*>(kernel)) != hipSuccess) return 0;
+    return a.sharedSizeBytes < target_total ? target_total - a.sharedSizeBytes : 0;
+}
+inline long g2_env_long(const char* name, long dflt) {
+    const char* e = getenv(name);
+    return e ? atol(e) : dflt;
+}
+
+
+// kra P-35: stamp a pointer global (generic -> addrspace(1) -> generic); InferAddressSpaces then
+// emits global_* for every access through it, even after the value went through memory (lambdas).
+template <typename T>
+__device__ __forceinline__ T* g2_glb(T* x) {
+    return (T*)(__attribute__((address_space(1))) T*)x;
+}
+
 __device__ __forceinline__ size_t g2_nat_blk(int i, int hh, int H, int NT,
                                              bool p3, int nslot) {
     return (size_t)(p3 ? (size_t)i * H + hh : (size_t)hh * NT + i) * nslot;
