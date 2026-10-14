@@ -36,6 +36,7 @@ struct PrepAParams {
     float lower_bound, gscale;
     int H, NT;
     int stop;                           // phase timing (G2_PREP_STOP): 0 = full
+    int kp = 0;                         // kra P-61e: Kn lane-permuted + Gn natural-k (H <= KPERM_MAX_H)
 };
 
 struct PrepBParams {
@@ -276,7 +277,7 @@ __global__ void __launch_bounds__(256) g2_fwd_prep_a_kernel(PrepAParams p) {
                 #pragma unroll
                 for (int e = 0; e < 4; ++e) {
                     const int col = rc4 + e;
-                    gnp[(col >> 4) * 16 + (col & 3) * 4 + ((col & 15) >> 2)] = exp2f(refv[e]);   // kra P-52
+                    gnp[p.kp ? col : (col >> 4) * 16 + (col & 3) * 4 + ((col & 15) >> 2)] = exp2f(refv[e]);   // kra P-52, P-61e
                 }
             }
         }
@@ -339,7 +340,7 @@ __global__ void __launch_bounds__(256) g2_fwd_prep_a_kernel(PrepAParams p) {
                 const int dim = 16 * (U >> 8) + (U & 15), tok = 16 * ((U >> 6) & 3) + 4 * ((U >> 4) & 3);
                 h[s] = *reinterpret_cast<const v4bh*>(T2 + dim * kT2 + tok);
             }
-            st16x2(p.Kn + nblk + 8 * (size_t)P, h[0], h[1]);
+            st16x2(p.Kn + nblk + 8 * (size_t)(p.kp ? ((P & ~15) | pi16(P & 15)) : P), h[0], h[1]);   // kra P-61e
         }
         lds_barrier();
     }
@@ -630,6 +631,7 @@ extern "C" int g2_fwd_prep(const void* q, const void* k, const void* v, const vo
                            (float*)k_rstd, (float*)Gn, ctok, clen, (float)lower_bound,
                            (float)gscale, H, NT, 0};
     if (const char* e = getenv("G2_PREP_STOP")) pa.stop = atoi(e);
+    pa.kp = H <= g2::g2_env_long("KDA_G2_KPERM_MAX_H", 20);   // kra P-61e
     const dim3 grid(NT, H), blk(256);
     if (gate) {
         if (ctok) hipLaunchKernelGGL((g2::r4::g2_fwd_prep_a_kernel<1, true>), grid, blk, 0, s, pa);

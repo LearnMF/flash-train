@@ -250,7 +250,7 @@ __device__ __forceinline__ void r1a_o_wave_order() {
     __builtin_amdgcn_sched_barrier(0);
 }
 
-template <bool VL, int MODE = 0, bool GE = true, bool SG = false, bool PF = false>   // kra P-58: SG = SGPR wave index   // kra P-52: GE = Gn holds exp2f(G)
+template <bool VL, int MODE = 0, bool GE = true, bool SG = false, bool PF = false, bool KP = false>   // kra P-58: SG = SGPR wave index   // kra P-52: GE = Gn holds exp2f(G)
 __global__ void __launch_bounds__(256) g2_fwd_h_v8o4_kernel(FwdOParams p) {
     // kra P-9: compile-time outputs.  With runtime-optional VMEM ops in the loop the compiler's
     // waitcnt pass must count the path that skips them, so a vmcnt for an OLD load also forced
@@ -314,12 +314,16 @@ __global__ void __launch_bounds__(256) g2_fwd_h_v8o4_kernel(FwdOParams p) {
     v4bh hx[2];
     auto write_h = [&](int kb, f4* ht) {
         #pragma unroll
-        for (int vt = 0; vt < 2; ++vt)
+        for (int vt = 0; vt < 2; ++vt) {
             #pragma unroll
             for (int e = 0; e < 4; ++e) {
                 hx[vt][e] = bf_rne(ht[vt][e]);
-                reinterpret_cast<short*>(hB)[(16 * vt + m) * kPadK + 16 * kb + c_col(l, e)] = hx[vt][e];
+                if constexpr (!KP)
+                    reinterpret_cast<short*>(hB)[(16 * vt + m) * kPadK + 16 * kb + c_col(l, e)] = hx[vt][e];
             }
+            if constexpr (KP)   // kra P-61e: Kn lane-permuted -> lane holds k = 4 q4 + e (consecutive)
+                *reinterpret_cast<v4bh*>(hB + (16 * vt + m) * kPadK + 16 * kb + 4 * q4) = hx[vt];
+        }
     };
     auto bN_emit = [&](int i2, int kb) {
         if (hasBN) {
@@ -695,6 +699,55 @@ __global__ void __launch_bounds__(256) g2_exp2_kernel(float* __restrict__ x, lon
     const long i = (long)blockIdx.x * 256 + threadIdx.x;
     if (i < n) x[i] = exp2f(x[i]);
 }
+// kra P-61e: Gn_raw (pi16-permuted k: [16a + j] = k 16a + pi16(j)) -> Gn = exp2f(raw) in the permuted order (dhu),
+// Gn_nat = exp2f(raw) in natural k order (recompute), raw -> natural k order in place (deep-saturation raw recompute
+// instance).  One element per lane: a 16-group never straddles a wave and every lane's store depends on its own
+// load, so the wave's loads of the group return before any of its in-place stores.  Same exp2f -> bit-identical.
+__global__ void __launch_bounds__(256) g2_gn_kp_kernel(float* __restrict__ raw, float* __restrict__ gp,
+                                                       float* __restrict__ gnat, long n) {
+    const long i = (long)blockIdx.x * 256 + threadIdx.x;
+    if (i < n) {
+        const float x = raw[i];
+        const float v = exp2f(x);
+        const long j = (i & ~15L) | pi16((int)(i & 15));
+        gp[i] = v;
+        gnat[j] = v;
+        raw[j] = x;
+    }
+}
+extern "C" int g2_gn_kp(float* raw, float* gp, float* gnat, long n, hipStream_t s) {
+    if (n <= 0) return 0;
+    if (n % 16) return -1;
+    hipLaunchKernelGGL(g2_gn_kp_kernel, dim3((unsigned)((n + 255) / 256)), dim3(256), 0, s, raw, gp, gnat, n);
+    return (int)hipGetLastError();
+}
+// kra P-61e: in-place kp re-layout of a non-kp producer's Kn (16 B lane pairs: lane (q, m) <- lane (q, pi16(m))
+// inside every 512-element group) and Gn (permuted -> natural k).  One 64-lane wave per 512-element Kn group.
+__global__ void __launch_bounds__(256) g2_kp_relayout_kernel(short* __restrict__ kn, long nkg,
+                                                             float* __restrict__ gn, long ngg) {
+    const long w = ((long)blockIdx.x * 256 + threadIdx.x) >> 6;
+    const int l = threadIdx.x & 63;
+    if (w < nkg) {
+        v4bh a, b;
+        // one wave owns the group: its load instruction returns before its store issues (data dependence)
+        ld16x2(reinterpret_cast<const bf16*>(kn) + 512 * w + 8 * ((l & 48) | pi16(l & 15)), a, b);
+        st16x2(kn + 512 * w + 8 * l, a, b);
+    }
+    const long gi = (long)blockIdx.x * 256 + threadIdx.x;   // Gn: one element per lane (as g2_gn_kp)
+    if (gi < ngg) {
+        const float x = gn[gi];
+        gn[(gi & ~15L) | pi16((int)(gi & 15))] = x;
+    }
+}
+extern "C" int g2_kp_relayout(void* kn, long kn_elems, float* gn, long gn_elems, hipStream_t s) {
+    if (kn_elems % 512 || gn_elems % 16) return -1;
+    const long nkg = kn_elems / 512, ngg = gn_elems;
+    const long thr = nkg * 64 > ngg ? nkg * 64 : ngg;
+    if (thr == 0) return 0;
+    hipLaunchKernelGGL(g2_kp_relayout_kernel, dim3((unsigned)((thr + 255) / 256)), dim3(256), 0, s,
+                       (short*)kn, nkg, gn, ngg);
+    return (int)hipGetLastError();
+}
 extern "C" int g2_exp2_inplace(float* x, long n, hipStream_t s) {
     if (n <= 0) return 0;
     hipLaunchKernelGGL(g2_exp2_kernel, dim3((unsigned)((n + 255) / 256)), dim3(256), 0, s, x, n);
@@ -716,6 +769,8 @@ extern "C" int g2_fwd_h_v8o(const void* Wn, const void* Kn, const void* Un, cons
                  scale, H, T / kBT, seg, nseg, ctok, clen, (const float*)GnRaw};
     int r1a = 1;   // R1a: 4-wave dedup form (bitwise equal; 0 restores the 8-wave form)
     if (const char* e = getenv("KDA_G2_R1A")) r1a = atoi(e);
+    const bool kp = H <= g2_env_long("KDA_G2_KPERM_MAX_H", 20);   // kra P-61e: Kn lane-permuted / Gn natural-k producers
+    if (kp) r1a = 1;
     const dim3 grid(kK / kBV, (unsigned)nseg * H);
     // kra P-9: the production output sets get compile-time instances, others the generic one
     // Mode 1 (forward, o only) is NOT selected: measured 4% slower (kra P-9) -- without the
@@ -744,24 +799,35 @@ extern "C" int g2_fwd_h_v8o(const void* Wn, const void* Kn, const void* Un, cons
     const bool sg = 4L * nseg * H <= g2_env_long("KDA_G2_SGPR_MAX_CTAS", 80);
     auto v8o4 = [&](auto vl) {
         constexpr bool VL = decltype(vl)::value;
-        switch (mode) {
-            case 1: if (sg) launch4(g2_fwd_h_v8o4_kernel<VL, 1, true, true, true>);   // kra P-60
+        switch (mode) {   // kra P-61e: KP instances whenever the producers emit the kp layouts
+            case 1: if (sg) { if (kp) launch4(g2_fwd_h_v8o4_kernel<VL, 1, true, true, true, true>);   // kra P-60
+                              else    launch4(g2_fwd_h_v8o4_kernel<VL, 1, true, true, true>); }
+                    else if (kp) launch4(g2_fwd_h_v8o4_kernel<VL, 1, true, false, false, true>);
                     else    launch4(g2_fwd_h_v8o4_kernel<VL, 1>);
                     break;
-            case 2: launch4(g2_fwd_h_v8o4_kernel<VL, 2>); break;
-            case 3: launch4(g2_fwd_h_v8o4_kernel<VL, 3>); break;
-            case 4: if (raw4) launch4raw(g2_fwd_h_v8o4_kernel<VL, 4, false>);
-                    else if (sg) launch4(g2_fwd_h_v8o4_kernel<VL, 4, true, true>);
+            case 2: if (kp) launch4(g2_fwd_h_v8o4_kernel<VL, 2, true, false, false, true>);
+                    else    launch4(g2_fwd_h_v8o4_kernel<VL, 2>);
+                    break;
+            case 3: if (kp) launch4(g2_fwd_h_v8o4_kernel<VL, 3, true, false, false, true>);
+                    else    launch4(g2_fwd_h_v8o4_kernel<VL, 3>);
+                    break;
+            case 4: if (raw4) { if (kp) launch4raw(g2_fwd_h_v8o4_kernel<VL, 4, false, false, false, true>);
+                                else    launch4raw(g2_fwd_h_v8o4_kernel<VL, 4, false>); }
+                    else if (sg) { if (kp) launch4(g2_fwd_h_v8o4_kernel<VL, 4, true, true, false, true>);
+                                   else    launch4(g2_fwd_h_v8o4_kernel<VL, 4, true, true>); }
+                    else if (kp) launch4(g2_fwd_h_v8o4_kernel<VL, 4, true, false, false, true>);
                     else      launch4(g2_fwd_h_v8o4_kernel<VL, 4>);
                     break;
-            default: launch4(g2_fwd_h_v8o4_kernel<VL, 0>); break;
+            default: if (kp) launch4(g2_fwd_h_v8o4_kernel<VL, 0, true, false, false, true>);
+                     else    launch4(g2_fwd_h_v8o4_kernel<VL, 0>);
+                     break;
         }
     };
     // kra P-49: wide-head launches use 64-column V-slabs (2 CTAs per head): the K-side tiles of a step
     // are issued by 2 CTAs instead of 4 (bit-identical per column)
     // gated to long sequences: at NT < 512 the 96-CTA wide grid's CU imbalance cost more than the shared
     // loads it saves (16K/48 mode 4 0.91x, 8K/96 0.68x); 32K/48 1.02-1.12x, 64K/48 1.12-1.40x
-    if (r1a && H >= g2_env_long("KDA_G2_V8O4W_MIN_H", 40) && T / kBT >= g2_env_long("KDA_G2_V8O4W_MIN_NT", 512)) {
+    if (r1a && !kp && H >= g2_env_long("KDA_G2_V8O4W_MIN_H", 40) && T / kBT >= g2_env_long("KDA_G2_V8O4W_MIN_NT", 512)) {
         const dim3 gridw(kK / 64, (unsigned)nseg * H);
         auto v8o4w = [&](auto vl) {
             constexpr bool VL = decltype(vl)::value;

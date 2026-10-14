@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 
 #include <hip/hip_runtime.h>
@@ -30,6 +31,8 @@ int g2_fwd_h_v8o(const void* Wn, const void* Kn, const void* Un, const void* Gn,
                  void* O, void* Ob, void* Vn, void* HbN, void* ANv, float scale, int B, int T, int H, const int* seg,
                  int nseg, const int* ctok, const int* clen, const void* GnRaw, hipStream_t s);
 int g2_exp2_inplace(float* x, long n, hipStream_t s);  // kra P-52: Gn -> exp2f(Gn) decays
+int g2_gn_kp(float* raw, float* gp, float* gnat, long n, hipStream_t s);                  // kra P-61e
+int g2_kp_relayout(void* kn, long kn_elems, float* gn, long gn_elems, hipStream_t s);     // kra P-61e
 int g2_wu(const void* k, const void* v, const void* q, const void* beta, const void* A, const void* g, void* Wn,
           void* Wb, void* Un, void* KgA, void* Kn, void* Qn, void* kgB, void* vB, int B, int T, int H, const int* ctok,
           const int* clen, hipStream_t s);
@@ -97,6 +100,12 @@ struct Sizes {
     std::uint64_t rows128() const noexcept { return T * H * 128; }  // [T, H, 128]
 };
 
+// kra P-61e: the kp layouts (Kn lane-permuted, natural-k recompute decays) -- same rule as the kernels' launchers
+inline bool g2KpLayout(long H) {
+    const char* e = getenv("KDA_G2_KPERM_MAX_H");
+    return H <= (e ? atol(e) : 20);
+}
+
 struct Tables {
     int* ctok = nullptr;
     int* clen = nullptr;
@@ -153,7 +162,7 @@ ForwardLayout layoutForward(const Shape& shape, void* base, std::uint64_t* used)
 // wy-stage working set): the workspace no longer holds qn, kn, dA.
 struct BackwardLayout {
     Tables tab;
-    void *g, *Gn, *GnRaw;
+    void *g, *Gn, *GnRaw, *GnNat;
     void *kgB, *HbN;
     void *Wn, *Kn, *Un, *HbNdh, *ANv2;     // B1
     void *KgA, *Qn, *Wb, *Vn, *dVn, *dOT;  // B2
@@ -169,6 +178,7 @@ BackwardLayout layoutBackward(const Shape& shape, void* base, std::uint64_t* use
     L.g                     = a.take(z.rows128() * 4);
     L.Gn                    = a.take(z.CH * 128 * 4);
     L.GnRaw                 = a.take(z.CH * 128 * 4);   // kra P-52
+    L.GnNat                 = g2KpLayout(static_cast<long>(z.H)) ? a.take(z.CH * 128 * 4) : nullptr;   // kra P-61e
     L.kgB                   = a.take(z.CH * 8192 * 2);
     // kra P-17/P-20/P-22a: no vB / aN_do / aN(v_new) copies (s4a reads v row-major, s4b reads dO
     // row-major and rebuilds aN(v_new) from Vn).  Vn lives OUTSIDE b2: s4b reads it while wy
@@ -247,6 +257,11 @@ void forward(const Shape& shape, const ForwardArgs& p, void* workspace, FTrainSt
                            stream),
               "to_gn");
         check(g2_exp2_inplace(static_cast<float*>(L.Gn), static_cast<long>(z.CH * 128), stream), "gn_exp2");
+        if (g2KpLayout(H)) {  // kra P-61e: the recurrence's kp instances read lane-permuted Kn / natural-k Gn
+            check(g2_kp_relayout(L.Kn, static_cast<long>(z.CH * 8192), static_cast<float*>(L.Gn),
+                                 static_cast<long>(z.CH * 128), stream),
+                  "kp_relayout");
+        }
     }
     // R5 keep-state: with p.state_* set, the recurrence also emits the backward's B2 state
     // (bN(h), v_new native and A-natural) -- bit-identical to the backward's own recompute.
@@ -289,10 +304,17 @@ void backward(const Shape& shape, const BackwardArgs& p, void* workspace, FTrain
                 stream),
           "wu");
     check(g2_kda_to_gn(static_cast<const float*>(L.g), ctok, clen, H, NT, static_cast<float*>(L.GnRaw), stream), "to_gn");
-    check(g2_kda_to_gn(static_cast<const float*>(L.g), ctok, clen, H, NT, static_cast<float*>(L.Gn), stream), "to_gn");
-    check(g2_exp2_inplace(static_cast<float*>(L.Gn), static_cast<long>(z.CH * 128), stream), "gn_exp2");  // kra P-52
+    const bool kp = g2KpLayout(H);
+    if (kp) {  // kra P-61e: permuted Gn (dhu) + natural-k GnNat (recompute); GnRaw -> natural k in place
+        check(g2_gn_kp(static_cast<float*>(L.GnRaw), static_cast<float*>(L.Gn), static_cast<float*>(L.GnNat),
+                       static_cast<long>(z.CH * 128), stream),
+              "gn_kp");
+    } else {
+        check(g2_kda_to_gn(static_cast<const float*>(L.g), ctok, clen, H, NT, static_cast<float*>(L.Gn), stream), "to_gn");
+        check(g2_exp2_inplace(static_cast<float*>(L.Gn), static_cast<long>(z.CH * 128), stream), "gn_exp2");  // kra P-52
+    }
     if (!kept) {
-        check(g2_fwd_h_v8o(L.Wn, L.Kn, L.Un, L.Gn, nullptr, nullptr, nullptr, nullptr, L.Vn, L.HbN, nullptr, 1.f, 1,
+        check(g2_fwd_h_v8o(L.Wn, L.Kn, L.Un, kp ? L.GnNat : L.Gn, nullptr, nullptr, nullptr, nullptr, L.Vn, L.HbN, nullptr, 1.f, 1,
                            NT * 64, H, L.tab.seg, nseg, nullptr, nullptr, L.GnRaw, stream),
               "fwd_h_bn");
     }

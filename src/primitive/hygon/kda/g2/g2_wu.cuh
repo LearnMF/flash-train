@@ -58,6 +58,7 @@ struct WuParams {
     const int* ctok; const int* clen;   // varlen phase 2 (null = dense)
     int stop;      // T2 staged timing (G2_WU_STOP): 0 = full kernel; 1..9 return
                    // right after the named stage (uniform branch, no data effect)
+    int kp = 0;    // kra P-61e: Kn lane-permuted (H <= KPERM_MAX_H)
 };
 
 // vB-layout quad base for source quad (row j, column vq..vq+3): A form with the
@@ -98,10 +99,19 @@ __device__ __forceinline__ void wu_emit16(short* dst, const short* tile, int tid
     }
 }
 
+// kra P-61e: wu_emit16 with the STORE lane pi16-permuted inside every 16-lane group (tile reads unchanged)
+__device__ __forceinline__ void wu_emit16s(short* dst, const short* tile, int tid) {
+    for (int t = tid; t < 1024; t += 256) {
+        const int o0 = 512 * (t >> 6) + 4 * (t & 63);
+        st16x2(dst + 8 * (size_t)((t & ~15) | pi16(t & 15)), *reinterpret_cast<const v4bh*>(tile + wu_tile_idx(o0)),
+               *reinterpret_cast<const v4bh*>(tile + wu_tile_idx(o0 + 256)));
+    }
+}
+
 template <bool VL>
 __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p_) {
     // kra P-35: field-wise copy, pointers stamped global (global_* ops, not flat)
-    const WuParams p{g2_glb(p_.k), g2_glb(p_.v), g2_glb(p_.q), g2_glb(p_.beta), g2_glb(p_.A), g2_glb(p_.g), g2_glb(p_.Wn), g2_glb(p_.Wb), g2_glb(p_.Un), g2_glb(p_.KgA), g2_glb(p_.Kn), g2_glb(p_.Qn), g2_glb(p_.kgB), g2_glb(p_.vB), p_.H, p_.NT, g2_glb(p_.ctok), g2_glb(p_.clen), p_.stop};
+    const WuParams p{g2_glb(p_.k), g2_glb(p_.v), g2_glb(p_.q), g2_glb(p_.beta), g2_glb(p_.A), g2_glb(p_.g), g2_glb(p_.Wn), g2_glb(p_.Wb), g2_glb(p_.Un), g2_glb(p_.KgA), g2_glb(p_.Kn), g2_glb(p_.Qn), g2_glb(p_.kgB), g2_glb(p_.vB), p_.H, p_.NT, g2_glb(p_.ctok), g2_glb(p_.clen), p_.stop, p_.kp};
     const int i = blockIdx.x, hh = blockIdx.y, tid = threadIdx.x;
     const int wv = tid >> 6, l = tid & 63;
     __shared__ __align__(16) short slab[128 * kPadJ2];
@@ -322,7 +332,8 @@ __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p_) {
                         tile[wu_tile_idx(ibn_of(tt) + 4 * dv)] = kgr[it][dv];
                 }
                 __syncthreads();
-                wu_emit16(p.Kn + nblk, tile, tid);
+                if (p.kp) wu_emit16s(p.Kn + nblk, tile, tid);   // kra P-61e
+                else      wu_emit16(p.Kn + nblk, tile, tid);
                 __syncthreads();
                 #pragma unroll
                 for (int it = 0; it < 8; ++it)
@@ -359,6 +370,7 @@ extern "C" int g2_wu(const void* k, const void* v, const void* q, const void* be
                    (short*)Wn, (short*)Wb, (short*)Un, (short*)KgA, (short*)Kn, (short*)Qn,
                    (short*)kgB, (short*)vB,
                    H, T / 64, ctok, clen, stop};
+    p.kp = H <= g2::g2_env_long("KDA_G2_KPERM_MAX_H", 20);   // kra P-61e
     if (ctok)
         hipLaunchKernelGGL(g2::g2_wu_kernel<true>, dim3(T / 64, H), dim3(256), 0, s, p);
     else
