@@ -250,7 +250,7 @@ __device__ __forceinline__ void r1a_o_wave_order() {
     __builtin_amdgcn_sched_barrier(0);
 }
 
-template <bool VL, int MODE = 0, bool GE = true>   // kra P-52: GE = Gn holds exp2f(G)
+template <bool VL, int MODE = 0, bool GE = true, bool SG = false>   // kra P-58: SG = SGPR wave index   // kra P-52: GE = Gn holds exp2f(G)
 __global__ void __launch_bounds__(256) g2_fwd_h_v8o4_kernel(FwdOParams p) {
     // kra P-9: compile-time outputs.  With runtime-optional VMEM ops in the loop the compiler's
     // waitcnt pass must count the path that skips them, so a vmcnt for an OLD load also forced
@@ -265,7 +265,7 @@ __global__ void __launch_bounds__(256) g2_fwd_h_v8o4_kernel(FwdOParams p) {
     __shared__ __align__(16) bf16 hB[kBV * kPadK];
     __shared__ __align__(16) bf16 vB[kBV * kPadT];
     __shared__ __align__(16) bf16 oStage[4][256];
-    const int tid = threadIdx.x, wv = tid >> 6, l = tid & 63;   // wv in 0..3
+    const int tid = threadIdx.x, wv = SG ? __builtin_amdgcn_readfirstlane(tid >> 6) : (tid >> 6), l = tid & 63;   // kra P-58   // wv in 0..3
     const int vs = blockIdx.x;
     const int sg = blockIdx.y / p.H, bh = blockIdx.y - sg * p.H;
     const int c0 = p.seg ? p.seg[sg] : 0, c1 = p.seg ? p.seg[sg + 1] : p.NT;
@@ -737,13 +737,18 @@ extern "C" int g2_fwd_h_v8o(const void* Wn, const void* Kn, const void* Un, cons
         const size_t dyn = throttle ? g2_lds_topup(kern, 24 * 1024) : 0;
         hipLaunchKernelGGL(kern, grid, dim3(256), dyn, s, q);
     };
+    // kra P-58: SGPR wave index only in the chain-bound regime (at most one CTA per CU)
+    const bool sg = 4L * nseg * H <= g2_env_long("KDA_G2_SGPR_MAX_CTAS", 80);
     auto v8o4 = [&](auto vl) {
         constexpr bool VL = decltype(vl)::value;
         switch (mode) {
-            case 1: launch4(g2_fwd_h_v8o4_kernel<VL, 1>); break;
+            case 1: if (sg) launch4(g2_fwd_h_v8o4_kernel<VL, 1, true, true>);
+                    else    launch4(g2_fwd_h_v8o4_kernel<VL, 1>);
+                    break;
             case 2: launch4(g2_fwd_h_v8o4_kernel<VL, 2>); break;
             case 3: launch4(g2_fwd_h_v8o4_kernel<VL, 3>); break;
             case 4: if (raw4) launch4raw(g2_fwd_h_v8o4_kernel<VL, 4, false>);
+                    else if (sg) launch4(g2_fwd_h_v8o4_kernel<VL, 4, true, true>);
                     else      launch4(g2_fwd_h_v8o4_kernel<VL, 4>);
                     break;
             default: launch4(g2_fwd_h_v8o4_kernel<VL, 0>); break;
