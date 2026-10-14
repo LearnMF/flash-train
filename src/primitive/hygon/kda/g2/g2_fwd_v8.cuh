@@ -250,7 +250,7 @@ __device__ __forceinline__ void r1a_o_wave_order() {
     __builtin_amdgcn_sched_barrier(0);
 }
 
-template <bool VL, int MODE = 0, bool GE = true, bool SG = false>   // kra P-58: SG = SGPR wave index   // kra P-52: GE = Gn holds exp2f(G)
+template <bool VL, int MODE = 0, bool GE = true, bool SG = false, bool PF = false>   // kra P-58: SG = SGPR wave index   // kra P-52: GE = Gn holds exp2f(G)
 __global__ void __launch_bounds__(256) g2_fwd_h_v8o4_kernel(FwdOParams p) {
     // kra P-9: compile-time outputs.  With runtime-optional VMEM ops in the loop the compiler's
     // waitcnt pass must count the path that skips them, so a vmcnt for an OLD load also forced
@@ -339,12 +339,13 @@ __global__ void __launch_bounds__(256) g2_fwd_h_v8o4_kernel(FwdOParams p) {
     loadG(c0, kb0, gl0); loadG(c0, kb1, gl1);
     loadK(c0, kb0, kf0); loadK(c0, kb1, kf1);
     write_h(kb0, ht0); write_h(kb1, ht1);
+    if constexpr (PF) { loadQg(c0); loadAq(c0); }   // kra P-60: QgA/AqkA one step ahead
     for (int i = c0; i < c1; ++i) {
         const long otok = g2_row_tok<VL>(p.ctok, i);
         const int olen = g2_row_len<VL>(p.clen, i);
         const int nxt = i + 1 < c1 ? i + 1 : i;
         lds_barrier();                                   // hB (h_i) ready
-        if (hasO || hasOb) {         // R3: issue this step's
+        if (!PF && (hasO || hasOb)) {         // R3: issue this step's
             if constexpr (MODE == 1) __builtin_amdgcn_sched_barrier(0);   // kra P-11: keep load spacing
             loadQg(i); loadAq(i);                        // QgA/AqkA right after bar1
             if constexpr (MODE == 1) __builtin_amdgcn_sched_barrier(0);   // kra P-11: keep load spacing
@@ -415,6 +416,7 @@ __global__ void __launch_bounds__(256) g2_fwd_h_v8o4_kernel(FwdOParams p) {
                 oh1 = mmac(qgf[kt], hbf1[kt], oh1);
             }
         }
+        if constexpr (PF) { if constexpr (MODE == 1) __builtin_amdgcn_sched_barrier(0); loadQg(nxt); if constexpr (MODE == 1) __builtin_amdgcn_sched_barrier(0); }   // kra P-60: qgf's last use was the oh pass
         lds_barrier();                                   // vB (v_new_i) ready
         if (hasO || hasOb) {
             #pragma unroll
@@ -450,6 +452,7 @@ __global__ void __launch_bounds__(256) g2_fwd_h_v8o4_kernel(FwdOParams p) {
                 }
             }
         }
+        if constexpr (PF) { if constexpr (MODE == 1) __builtin_amdgcn_sched_barrier(0); loadAq(nxt); if constexpr (MODE == 1) __builtin_amdgcn_sched_barrier(0); }   // kra P-60: aqf's last use was the o pass
         // ---- GEMM2 for both K-blocks
         #pragma unroll
         for (int vt = 0; vt < 2; ++vt) {
@@ -742,7 +745,7 @@ extern "C" int g2_fwd_h_v8o(const void* Wn, const void* Kn, const void* Un, cons
     auto v8o4 = [&](auto vl) {
         constexpr bool VL = decltype(vl)::value;
         switch (mode) {
-            case 1: if (sg) launch4(g2_fwd_h_v8o4_kernel<VL, 1, true, true>);
+            case 1: if (sg) launch4(g2_fwd_h_v8o4_kernel<VL, 1, true, true, true>);   // kra P-60
                     else    launch4(g2_fwd_h_v8o4_kernel<VL, 1>);
                     break;
             case 2: launch4(g2_fwd_h_v8o4_kernel<VL, 2>); break;
