@@ -250,7 +250,7 @@ __device__ __forceinline__ void r1a_o_wave_order() {
     __builtin_amdgcn_sched_barrier(0);
 }
 
-template <bool VL, int MODE = 0, bool GE = true, bool SG = false, bool PF = false, bool KP = false, bool VP = false>   // kra P-58: SG = SGPR wave index   // kra P-52: GE = Gn holds exp2f(G)
+template <bool VL, int MODE = 0, bool GE = true, bool SG = false, bool PF = false, bool KP = false, bool VP = false, bool BP = false>   // kra P-58: SG = SGPR wave index   // kra P-52: GE = Gn holds exp2f(G)
 __global__ void __launch_bounds__(256) g2_fwd_h_v8o4_kernel(FwdOParams p) {
     // kra P-9: compile-time outputs.  With runtime-optional VMEM ops in the loop the compiler's
     // waitcnt pass must count the path that skips them, so a vmcnt for an OLD load also forced
@@ -312,7 +312,13 @@ __global__ void __launch_bounds__(256) g2_fwd_h_v8o4_kernel(FwdOParams p) {
             ld16x2(p.Kn + (((chunk + i) * 8 + kb) * 4) * 256 + j * 512 + l * 8, kf[2 * j], kf[2 * j + 1]);
     };
     v4bh hx[2];
-    auto write_h = [&](int kb, f4* ht) {
+    // kra P-63: selector A fragment S[m][k] = [k == pi16(m)] (bf16 1.0 / 0), lane (q4, m) holds k = 4 q4 + j
+    v4bh bsel;
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) bsel[j] = (4 * q4 + j == pi16(m)) ? (short)0x3f80 : (short)0;
+    const int hrow = BP ? pi16(m) : m;   // kra P-63: GEMM2 / hB row of this lane
+    v4bh bnv[2][2];   // kra P-63c: bN(h) values [kb0/kb1][vt], stored after the next barrier A
+    auto write_h = [&](int kb, f4* ht, int ib = -1) {
         #pragma unroll
         for (int vt = 0; vt < 2; ++vt) {
             #pragma unroll
@@ -322,7 +328,16 @@ __global__ void __launch_bounds__(256) g2_fwd_h_v8o4_kernel(FwdOParams p) {
                     reinterpret_cast<short*>(hB)[(16 * vt + m) * kPadK + 16 * kb + c_col(l, e)] = hx[vt][e];
             }
             if constexpr (KP)   // kra P-61e: Kn lane-permuted -> lane holds k = 4 q4 + e (consecutive)
-                *reinterpret_cast<v4bh*>(hB + (16 * vt + m) * kPadK + 16 * kb + 4 * q4) = hx[vt];
+                *reinterpret_cast<v4bh*>(hB + (16 * vt + hrow) * kPadK + 16 * kb + 4 * q4) = hx[vt];
+            if constexpr (BP) {   // kra P-63: bN(h) slot straight from the registers
+                if (hasBN && ib >= 0) {
+                    const f4 nz = f4{-0.f, -0.f, -0.f, -0.f};
+                    const f4 c = mmac(bsel, hx[vt], nz);
+                    #pragma unroll
+                    for (int e = 0; e < 4; ++e)   // kra P-63d: exact bf16 values -> high half
+                        bnv[kb == kb0 ? 0 : 1][vt][e] = (short)(__float_as_uint(c[e]) >> 16);
+                }
+            }
         }
     };
     auto bN_emit = [&](int i2, int kb) {
@@ -342,7 +357,7 @@ __global__ void __launch_bounds__(256) g2_fwd_h_v8o4_kernel(FwdOParams p) {
     loadW(c0); loadU(c0, 0, uf0); loadU(c0, 1, uf1);
     loadG(c0, kb0, gl0); loadG(c0, kb1, gl1);
     loadK(c0, kb0, kf0); loadK(c0, kb1, kf1);
-    write_h(kb0, ht0); write_h(kb1, ht1);
+    write_h(kb0, ht0, c0); write_h(kb1, ht1, c0);   // kra P-63: BP emits bN(h_c0) here
     if constexpr (PF) { loadQg(c0); loadAq(c0); }   // kra P-60: QgA/AqkA one step ahead
     for (int i = c0; i < c1; ++i) {
         const long otok = g2_row_tok<VL>(p.ctok, i);
@@ -354,8 +369,18 @@ __global__ void __launch_bounds__(256) g2_fwd_h_v8o4_kernel(FwdOParams p) {
             loadQg(i); loadAq(i);                        // QgA/AqkA right after bar1
             if constexpr (MODE == 1) __builtin_amdgcn_sched_barrier(0);   // kra P-11: keep load spacing
         }
-        bN_emit(i, kb0);
-        bN_emit(i, kb1);
+        if constexpr (!BP) {   // kra P-63: BP emitted bN(h_i) at the end of the previous step
+            bN_emit(i, kb0);
+            bN_emit(i, kb1);
+        } else if (hasBN) {    // kra P-63c: production store position, values from the registers
+            #pragma unroll
+            for (int kk = 0; kk < 2; ++kk)
+                #pragma unroll
+                for (int vt = 0; vt < 2; ++vt) {
+                    const size_t off = ((((size_t)i * p.H + bh) * 8 + (kk ? kb1 : kb0)) * 8 + (2 * vs + vt)) * 256 + l * 4;
+                    *reinterpret_cast<v4bh*>(p.HbN + off) = bnv[kk][vt];
+                }
+        }
         // ---- GEMM1 both V-halves with ONE W load (the R1a dedup)
         f4 acc0 = f4{0.f,0.f,0.f,0.f}, acc1 = f4{0.f,0.f,0.f,0.f};
         v4bh hbf0[8], hbf1[8];   // kra P-53: h fragments kept for the o pass (hB is unchanged until write_h)
@@ -497,7 +522,7 @@ __global__ void __launch_bounds__(256) g2_fwd_h_v8o4_kernel(FwdOParams p) {
             f4 upd = f4{0.f,0.f,0.f,0.f};
             #pragma unroll
             for (int rt = 0; rt < 4; ++rt) {
-                const v4bh va = ld8(vB + (16 * vt + m) * kPadT + 16 * rt + q4 * 4);
+                const v4bh va = ld8(vB + (16 * vt + hrow) * kPadT + 16 * rt + q4 * 4);   // kra P-63
                 upd = mmac(va, kf0[rt], upd);
             }
             ht0[vt] += upd;
@@ -507,7 +532,7 @@ __global__ void __launch_bounds__(256) g2_fwd_h_v8o4_kernel(FwdOParams p) {
             f4 upd = f4{0.f,0.f,0.f,0.f};
             #pragma unroll
             for (int rt = 0; rt < 4; ++rt) {
-                const v4bh va = ld8(vB + (16 * vt + m) * kPadT + 16 * rt + q4 * 4);
+                const v4bh va = ld8(vB + (16 * vt + hrow) * kPadT + 16 * rt + q4 * 4);   // kra P-63
                 upd = mmac(va, kf1[rt], upd);
             }
             ht1[vt] += upd;
@@ -517,8 +542,8 @@ __global__ void __launch_bounds__(256) g2_fwd_h_v8o4_kernel(FwdOParams p) {
             loadK(nxt, kb0, kf0); loadK(nxt, kb1, kf1);
             if constexpr (MODE == 1) __builtin_amdgcn_sched_barrier(0);   // kra P-11: keep load spacing
         }
-        write_h(kb0, ht0);
-        write_h(kb1, ht1);
+        write_h(kb0, ht0, i + 1 < c1 ? i + 1 : -1);   // kra P-63: h_{i+1} -> bN(h_{i+1})
+        write_h(kb1, ht1, i + 1 < c1 ? i + 1 : -1);
         if constexpr (PF) {   // kra P-64B: K prefetch after write_h
             __builtin_amdgcn_sched_barrier(0);
             loadK(nxt, kb0, kf0); loadK(nxt, kb1, kf1);
@@ -858,17 +883,17 @@ extern "C" int g2_fwd_h_v8o(const void* Wn, const void* Kn, const void* Un, cons
                     else if (kp) launch4(g2_fwd_h_v8o4_kernel<VL, 1, true, false, false, true, true>);
                     else    launch4(g2_fwd_h_v8o4_kernel<VL, 1>);
                     break;
-            case 2: if (kp) launch4(g2_fwd_h_v8o4_kernel<VL, 2, true, false, false, true, true>);
+            case 2: if (kp) launch4(g2_fwd_h_v8o4_kernel<VL, 2, true, false, false, true, true, true>);
                     else    launch4(g2_fwd_h_v8o4_kernel<VL, 2>);
                     break;
-            case 3: if (kp) launch4(g2_fwd_h_v8o4_kernel<VL, 3, true, false, false, true>);
+            case 3: if (kp) launch4(g2_fwd_h_v8o4_kernel<VL, 3, true, false, false, true, false, true>);
                     else    launch4(g2_fwd_h_v8o4_kernel<VL, 3>);
                     break;
-            case 4: if (raw4) { if (kp) launch4raw(g2_fwd_h_v8o4_kernel<VL, 4, false, false, false, true>);
+            case 4: if (raw4) { if (kp) launch4raw(g2_fwd_h_v8o4_kernel<VL, 4, false, false, false, true, false, true>);
                                 else    launch4raw(g2_fwd_h_v8o4_kernel<VL, 4, false>); }
-                    else if (sg) { if (kp) launch4(g2_fwd_h_v8o4_kernel<VL, 4, true, true, false, true>);
+                    else if (sg) { if (kp) launch4(g2_fwd_h_v8o4_kernel<VL, 4, true, true, false, true, false, true>);
                                    else    launch4(g2_fwd_h_v8o4_kernel<VL, 4, true, true>); }
-                    else if (kp) launch4(g2_fwd_h_v8o4_kernel<VL, 4, true, false, false, true>);
+                    else if (kp) launch4(g2_fwd_h_v8o4_kernel<VL, 4, true, false, false, true, false, true>);
                     else      launch4(g2_fwd_h_v8o4_kernel<VL, 4>);
                     break;
             default: if (kp) launch4(g2_fwd_h_v8o4_kernel<VL, 0, true, false, false, true, true>);
