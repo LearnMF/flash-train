@@ -512,11 +512,17 @@ __global__ void __launch_bounds__(256) g2_fwd_h_v8o4_kernel(FwdOParams p) {
             }
             ht1[vt] += upd;
         }
-        if constexpr (MODE == 1) __builtin_amdgcn_sched_barrier(0);   // kra P-11: keep load spacing
-        loadK(nxt, kb0, kf0); loadK(nxt, kb1, kf1);
-        if constexpr (MODE == 1) __builtin_amdgcn_sched_barrier(0);   // kra P-11: keep load spacing
+        if constexpr (!PF) {
+            if constexpr (MODE == 1) __builtin_amdgcn_sched_barrier(0);   // kra P-11: keep load spacing
+            loadK(nxt, kb0, kf0); loadK(nxt, kb1, kf1);
+            if constexpr (MODE == 1) __builtin_amdgcn_sched_barrier(0);   // kra P-11: keep load spacing
+        }
         write_h(kb0, ht0);
         write_h(kb1, ht1);
+        if constexpr (PF) {   // kra P-64B: K prefetch after write_h
+            __builtin_amdgcn_sched_barrier(0);
+            loadK(nxt, kb0, kf0); loadK(nxt, kb1, kf1);
+        }
     }
 }
 
