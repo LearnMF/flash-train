@@ -45,6 +45,7 @@ struct PrepBParams {
     const int *ctok, *clen;
     float scale;
     int H, NT;
+    int kp = 0;   // kra P-62: Un with the pm column order (as Wn) when H <= KPERM_MAX_H
 };
 
 
@@ -579,7 +580,7 @@ __device__ __forceinline__ void b_post(const PrepBParams& p, float* smem, const 
             const v4bh a = pack4(Ai[j]);
             #pragma unroll
             for (int vt = 0; vt < 8; ++vt) {
-                const int n = pass == 0 ? pm : m;
+                const int n = (pass == 0 || p.kp) ? pm : m;   // kra P-62
                 acc[vt] = mmac(a, *reinterpret_cast<const v4bh*>(T2 + (16 * vt + n) * kT2
                                                                + 16 * j + 4 * q4), acc[vt]);
             }
@@ -645,6 +646,7 @@ extern "C" int g2_fwd_prep(const void* q, const void* k, const void* v, const vo
     g2::r4::PrepBParams pb{(const short*)Kb, (const short*)v, (const float*)beta, (const float*)R,
                            (short*)Wn, (short*)Un, (short*)AqkA, (short*)Aqk, (short*)Akk,
                            ctok, clen, (float)scale, H, NT};
+    pb.kp = pa.kp;   // kra P-62
     if (ctok) hipLaunchKernelGGL(g2::r4::g2_fwd_prep_b_kernel<true>, grid, blk, 0, s, pb);
     else hipLaunchKernelGGL(g2::r4::g2_fwd_prep_b_kernel<false>, grid, blk, 0, s, pb);
     return (int)hipGetLastError();

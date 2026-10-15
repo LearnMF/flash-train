@@ -32,7 +32,7 @@ int g2_fwd_h_v8o(const void* Wn, const void* Kn, const void* Un, const void* Gn,
                  int nseg, const int* ctok, const int* clen, const void* GnRaw, hipStream_t s);
 int g2_exp2_inplace(float* x, long n, hipStream_t s);  // kra P-52: Gn -> exp2f(Gn) decays
 int g2_gn_kp(float* raw, float* gp, float* gnat, long n, hipStream_t s);                  // kra P-61e
-int g2_kp_relayout(void* kn, long kn_elems, float* gn, long gn_elems, hipStream_t s);     // kra P-61e
+int g2_kp_relayout(void* kn, long kn_elems, float* gn, long gn_elems, void* un, hipStream_t s);   // kra P-61e, P-62
 int g2_wu(const void* k, const void* v, const void* q, const void* beta, const void* A, const void* g, void* Wn,
           void* Wb, void* Un, void* KgA, void* Kn, void* Qn, void* kgB, void* vB, int B, int T, int H, const int* ctok,
           const int* clen, hipStream_t s);
@@ -259,7 +259,7 @@ void forward(const Shape& shape, const ForwardArgs& p, void* workspace, FTrainSt
         check(g2_exp2_inplace(static_cast<float*>(L.Gn), static_cast<long>(z.CH * 128), stream), "gn_exp2");
         if (g2KpLayout(H)) {  // kra P-61e: the recurrence's kp instances read lane-permuted Kn / natural-k Gn
             check(g2_kp_relayout(L.Kn, static_cast<long>(z.CH * 8192), static_cast<float*>(L.Gn),
-                                 static_cast<long>(z.CH * 128), stream),
+                                 static_cast<long>(z.CH * 128), L.Un, stream),   // kra P-62: + Un
                   "kp_relayout");
         }
     }
