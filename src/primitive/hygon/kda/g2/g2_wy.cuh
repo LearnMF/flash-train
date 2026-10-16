@@ -828,7 +828,7 @@ struct WyS4BParams {
 // VL (varlen phase 2): the row tensors (v_row, A, beta, dv2 here; q_row, k, g, dAqk, dq,
 // dk, dg, db in B) are PACKED -- rows r >= clen read as 0 (g: clamped row) and are never
 // written.  The dA (dak) handoff between A and B is internal and stays chunk-padded.
-template <bool VL, bool AFS = false>   // kra P-28c: AFS = stage the dA-stage A block in XT
+template <bool VL, bool AFS = false, int PF = 0>   // kra P-28c: AFS = stage the dA-stage A block in XT; P-83: PF
 __global__ void __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(1, 3)))
 p3_wy_s4a_kernel(WyS4AParams p_) {
     // kra P-35: field-wise copy, pointers stamped global (global_* ops, not flat)
@@ -863,13 +863,42 @@ p3_wy_s4a_kernel(WyS4AParams p_) {
         const int ro = tr * R + 4 * q;
 
         const float beta_t = trok ? beta_[tr * H] : 0.f;
+        // kra P-83 PF: the beta loads first, then every front-phase / pass-W operand in consumption order
+        v4bh pav[4], pdva[8], pvrow[8], pkg[8];
+        f4 phb[8];
+        if constexpr (PF) {
+            const float bts_ = (tid < kBT && g2_row_ok<M>(tid, cl)) ? beta_[tid * H] : 0.f;
+            #pragma unroll
+            for (int it_ = 0; it_ < 4; ++it_) {
+                const int j = tid + 256 * it_, row = j >> 4, qc = j & 15;
+                pav[it_] = g2_row_ok<M>(row, cl)
+                    ? *reinterpret_cast<const v4bh*>(A_ + row * RA + 4 * qc) : v4bh{0, 0, 0, 0};
+            }
+            #pragma unroll
+            for (int vt = 0; vt < 8; ++vt) pdva[vt] = aN(dvN, vt);
+            #pragma unroll
+            for (int vt = 0; vt < 8; ++vt) pvrow[vt] = trok ? ld8(v_ + ro + 16 * vt) : v4bh{0, 0, 0, 0};
+            const bf16* hsrc0 = hb + 8 * tid;
+            const bf16* kgsrc0 = kgB + (((tid >> 6) * 8) * 64 + (tid & 63)) * 4;
+            #pragma unroll
+            for (int kt = 0; kt < 8; ++kt) {
+                phb[kt] = *reinterpret_cast<const f4*>(hsrc0 + kt * 2048);
+                pkg[kt] = ld8(kgsrc0 + kt * 256);
+            }
+            if (tid < kBT) BETAs[tid] = bts_;
+        } else {
         if (tid < kBT) BETAs[tid] = g2_row_ok<M>(tid, cl) ? beta_[tid * H] : 0.f;   // kra P-28
+        }
         v4bh aa[4];                                                         // A^T row tr = column tr of A
         {   // Y4: stage the 64x64 A block into LDS (transiently, S is free before dvT)
             // with coalesced 8B row loads, then gather the transposed column from LDS --
             // replaces 16 stride-RA 2-byte gathers per lane (X2: 20.3% of s4a stalls).
             short* As = reinterpret_cast<short*>(S);
             v4bh av_[4];                                   // kra P-43: all four loads in flight
+            if constexpr (PF) {                            // kra P-83: issued up front
+                #pragma unroll
+                for (int it_ = 0; it_ < 4; ++it_) av_[it_] = pav[it_];
+            } else {
             #pragma unroll
             for (int it_ = 0; it_ < 4; ++it_) {
                 const int j = tid + 256 * it_, row = j >> 4, qc = j & 15;
@@ -877,6 +906,7 @@ p3_wy_s4a_kernel(WyS4AParams p_) {
                 // (their aa entries are masked below anyway).
                 av_[it_] = g2_row_ok<M>(row, cl)
                     ? *reinterpret_cast<const v4bh*>(A_ + row * RA + 4 * qc) : v4bh{0, 0, 0, 0};
+            }
             }
             #pragma unroll
             for (int it_ = 0; it_ < 4; ++it_) {
@@ -894,7 +924,7 @@ p3_wy_s4a_kernel(WyS4AParams p_) {
         }
         v4bh dva[8];
         #pragma unroll
-        for (int vt = 0; vt < 8; ++vt) dva[vt] = aN(dvN, vt);
+        for (int vt = 0; vt < 8; ++vt) dva[vt] = PF ? pdva[vt] : aN(dvN, vt);   // kra P-83
         #pragma unroll
         for (int vt = 0; vt < 8; ++vt)
             #pragma unroll
@@ -907,7 +937,7 @@ p3_wy_s4a_kernel(WyS4AParams p_) {
             f4 acc = {0.f, 0.f, 0.f, 0.f};
             #pragma unroll
             for (int st = 0; st < 4; ++st) acc = mmac(aa[st], ld8(S + (16 * vt + pm) * kPT + 16 * st + 4 * q), acc);
-            const v4bh vv = trok ? ld8(v_ + ro + 16 * vt) : v4bh{0, 0, 0, 0};
+            const v4bh vv = PF ? pvrow[vt] : (trok ? ld8(v_ + ro + 16 * vt) : v4bh{0, 0, 0, 0});   // kra P-83
             vrow[vt] = vv;
             v4bh o;
             #pragma unroll
@@ -963,6 +993,25 @@ p3_wy_s4a_kernel(WyS4AParams p_) {
                     dA[st] = mmac(dwn, kgb, dA[st]);
                 }
             };
+            if constexpr (PF) {   // kra P-83: blocks / tiles already in registers; pass W fully unrolled
+                short* hs = reinterpret_cast<short*>(XT);
+                *reinterpret_cast<v4bh*>(&KGs[0][0] + 4 * tid) = pkg[0];
+                *reinterpret_cast<f4*>(hs + 8 * tid) = phb[0];
+                lds_barrier();                                                  // block 0 visible
+                #pragma unroll
+                for (int kt = 0; kt < 8; ++kt) {
+                    v4bh bf[8];
+                    const bf16* hk = reinterpret_cast<const bf16*>(hs + (kt & 1) * 2048) + l * 4;
+                    #pragma unroll
+                    for (int vt = 0; vt < 8; ++vt) bf[vt] = ld8(hk + vt * 256);
+                    if (kt < 7) {
+                        *reinterpret_cast<f4*>(hs + ((kt + 1) & 1) * 2048 + 8 * tid) = phb[kt + 1];
+                        *reinterpret_cast<v4bh*>(&KGs[(kt + 1) & 1][0] + 4 * tid) = pkg[kt + 1];
+                    }
+                    body(kt, bf);
+                    lds_barrier();      // block kt+1 visible; reads of block kt done before reuse
+                }
+            } else {
             // kra P-28: thread tid carries fragment (st = tid>>6, lane = tid&63) of the kgB tile
             const bf16* kgsrc = kgB + (((tid >> 6) * 8) * 64 + (tid & 63)) * 4;
             *reinterpret_cast<v4bh*>(&KGs[0][0] + 4 * tid) = ld8(kgsrc);            // tile 0
@@ -996,6 +1045,7 @@ p3_wy_s4a_kernel(WyS4AParams p_) {
                 body(kt, bf);
                 lds_barrier();      // block kt+1 visible; reads of block kt done before reuse
             }
+            }   // kra P-83: !PF
         }
         // dA stage: da = mask(dA*beta), XC = da A^T -> XT (LDS), dak = mask(-A^T XT) -> global
         // dA.  The dAT LDS staging is dropped: segment B reads the transposed elements from
@@ -1390,12 +1440,17 @@ extern "C" int g2_wy_s4_split_r(const void* q_kgb, const void* k, const void* v_
         int afs_maxh = 12;   // kra P-28c (H=24 measured mixed: 1.036x at 8K, 0.94-0.97x at 32K-64K)
         if (const char* e = getenv("KDA_G2_S4A_AFS_MAXH")) afs_maxh = atoi(e);
         const bool afs = H <= afs_maxh;
+        const bool pf = g2::g2_env_long("KDA_G2_S4A_PF", 1) != 0;   // kra P-83 (default on)
         if (ctok) {
-            if (afs) hipLaunchKernelGGL((p3_wy_s4a_kernel<true, true>), dim3(NT, H), dim3(256), 0, s, pa);
-            else     hipLaunchKernelGGL((p3_wy_s4a_kernel<true, false>), dim3(NT, H), dim3(256), 0, s, pa);
+            if (afs) { if (pf) hipLaunchKernelGGL((p3_wy_s4a_kernel<true, true, 1>), dim3(NT, H), dim3(256), 0, s, pa);
+                       else    hipLaunchKernelGGL((p3_wy_s4a_kernel<true, true>), dim3(NT, H), dim3(256), 0, s, pa); }
+            else     { if (pf) hipLaunchKernelGGL((p3_wy_s4a_kernel<true, false, 1>), dim3(NT, H), dim3(256), 0, s, pa);
+                       else    hipLaunchKernelGGL((p3_wy_s4a_kernel<true, false>), dim3(NT, H), dim3(256), 0, s, pa); }
         } else {
-            if (afs) hipLaunchKernelGGL((p3_wy_s4a_kernel<false, true>), dim3(NT, H), dim3(256), 0, s, pa);
-            else     hipLaunchKernelGGL((p3_wy_s4a_kernel<false, false>), dim3(NT, H), dim3(256), 0, s, pa);
+            if (afs) { if (pf) hipLaunchKernelGGL((p3_wy_s4a_kernel<false, true, 1>), dim3(NT, H), dim3(256), 0, s, pa);
+                       else    hipLaunchKernelGGL((p3_wy_s4a_kernel<false, true>), dim3(NT, H), dim3(256), 0, s, pa); }
+            else     { if (pf) hipLaunchKernelGGL((p3_wy_s4a_kernel<false, false, 1>), dim3(NT, H), dim3(256), 0, s, pa);
+                       else    hipLaunchKernelGGL((p3_wy_s4a_kernel<false, false>), dim3(NT, H), dim3(256), 0, s, pa); }
         }
         const int rc = (int)hipGetLastError();
         if (rc) return rc;

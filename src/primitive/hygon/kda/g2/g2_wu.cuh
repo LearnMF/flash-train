@@ -108,7 +108,7 @@ __device__ __forceinline__ void wu_emit16s(short* dst, const short* tile, int ti
     }
 }
 
-template <bool VL>
+template <bool VL, bool KS = false>   // kra P-84b: KS
 __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p_) {
     // kra P-35: field-wise copy, pointers stamped global (global_* ops, not flat)
     const WuParams p{g2_glb(p_.k), g2_glb(p_.v), g2_glb(p_.q), g2_glb(p_.beta), g2_glb(p_.A), g2_glb(p_.g), g2_glb(p_.Wn), g2_glb(p_.Wb), g2_glb(p_.Un), g2_glb(p_.KgA), g2_glb(p_.Kn), g2_glb(p_.Qn), g2_glb(p_.kgB), g2_glb(p_.vB), p_.H, p_.NT, g2_glb(p_.ctok), g2_glb(p_.clen), p_.stop, p_.kp};
@@ -212,14 +212,24 @@ __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p_) {
         // stage_gated(last_ref)/emit_AB path (bitwise gate holds).
         v4bh kgr[8];                                     // kra P-19: kg quads carried to phase 3
         f4 egr[8];                                       // kra P-19: exp2f(g) carried to phase 3
+        if constexpr (KS) {   // kra P-84b: every k / g quad in flight before the first use (the kgB / KgA
+            #pragma unroll    // stores of an iteration would otherwise pin the next iteration's loads)
+            for (int it = 0; it < 8; ++it) {
+                const int t = tid + 256 * it;
+                const int j = t >> 5, vq = (t & 31) << 2;
+                const size_t so = sbase + (size_t)j * rstride + vq;
+                kgr[it] = g2_row_ok<M>(j, cl) ? *reinterpret_cast<const v4bh*>(p.k + so) : v4bh{0, 0, 0, 0};
+                egr[it] = ld16f(p.g + sbase + (size_t)g2_row_g<M>(j, cl) * rstride + vq);
+            }
+        }
         #pragma unroll
         for (int it = 0; it < 8; ++it) {
             const int t = tid + 256 * it;
             const int j = t >> 5, vq = (t & 31) << 2;
             const size_t so = sbase + (size_t)j * rstride + vq;
-            const v4bh kv = g2_row_ok<M>(j, cl) ? *reinterpret_cast<const v4bh*>(p.k + so)
-                                                 : v4bh{0, 0, 0, 0};
-            const f4 gf = ld16f(p.g + sbase + (size_t)g2_row_g<M>(j, cl) * rstride + vq);
+            const v4bh kv = KS ? kgr[it] : (g2_row_ok<M>(j, cl) ? *reinterpret_cast<const v4bh*>(p.k + so)
+                                                 : v4bh{0, 0, 0, 0});
+            const f4 gf = KS ? egr[it] : ld16f(p.g + sbase + (size_t)g2_row_g<M>(j, cl) * rstride + vq);
             const f4 gl = *reinterpret_cast<const f4*>(sGl + vq);
             const float b = sBeta[j];
             // T7: one exp2f(gf) per element serves both kb and kgB (identical
@@ -371,9 +381,13 @@ extern "C" int g2_wu(const void* k, const void* v, const void* q, const void* be
                    (short*)kgB, (short*)vB,
                    H, T / 64, ctok, clen, stop};
     p.kp = H <= g2::g2_env_long("KDA_G2_KPERM_MAX_H", 20);   // kra P-61e
-    if (ctok)
-        hipLaunchKernelGGL(g2::g2_wu_kernel<true>, dim3(T / 64, H), dim3(256), 0, s, p);
-    else
-        hipLaunchKernelGGL(g2::g2_wu_kernel<false>, dim3(T / 64, H), dim3(256), 0, s, p);
+    const bool ks = g2::g2_env_long("KDA_G2_WU_KS", 1) != 0;   // kra P-84b (default on)
+    if (ctok) {
+        if (ks) hipLaunchKernelGGL((g2::g2_wu_kernel<true, true>), dim3(T / 64, H), dim3(256), 0, s, p);
+        else    hipLaunchKernelGGL(g2::g2_wu_kernel<true>, dim3(T / 64, H), dim3(256), 0, s, p);
+    } else {
+        if (ks) hipLaunchKernelGGL((g2::g2_wu_kernel<false, true>), dim3(T / 64, H), dim3(256), 0, s, p);
+        else    hipLaunchKernelGGL(g2::g2_wu_kernel<false>, dim3(T / 64, H), dim3(256), 0, s, p);
+    }
     return (int)hipGetLastError();
 }
