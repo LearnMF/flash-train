@@ -1065,8 +1065,8 @@ p3_wy_s4a_kernel(WyS4AParams p_) {
             for (int it_ = 0; it_ < 4; ++it_) {
                 const int j = tid + 256 * it_;
                 const int row = j >> 4, qc = j & 15;
-                *reinterpret_cast<v4bh*>(As2 + row * kPT + 4 * qc) = g2_row_ok<M>(row, cl)
-                    ? *reinterpret_cast<const v4bh*>(A_ + row * RA + 4 * qc) : v4bh{0, 0, 0, 0};
+                *reinterpret_cast<v4bh*>(As2 + row * kPT + 4 * qc) = (PF == 2) ? pav[it_]   // kra P-83b
+                    : (g2_row_ok<M>(row, cl) ? *reinterpret_cast<const v4bh*>(A_ + row * RA + 4 * qc) : v4bh{0, 0, 0, 0});
             }
             lds_barrier();                                                  // A block visible
             #pragma unroll
@@ -1447,7 +1447,8 @@ extern "C" int g2_wy_s4_split_r(const void* q_kgb, const void* k, const void* v_
             else     { if (pf) hipLaunchKernelGGL((p3_wy_s4a_kernel<true, false, 1>), dim3(NT, H), dim3(256), 0, s, pa);
                        else    hipLaunchKernelGGL((p3_wy_s4a_kernel<true, false>), dim3(NT, H), dim3(256), 0, s, pa); }
         } else {
-            if (afs) { if (pf) hipLaunchKernelGGL((p3_wy_s4a_kernel<false, true, 1>), dim3(NT, H), dim3(256), 0, s, pa);
+            if (afs) { if (pf && g2::g2_env_long("KDA_G2_S4A_AFSR", 1)) hipLaunchKernelGGL((p3_wy_s4a_kernel<false, true, 2>), dim3(NT, H), dim3(256), 0, s, pa);   // kra P-83b
+                       else if (pf) hipLaunchKernelGGL((p3_wy_s4a_kernel<false, true, 1>), dim3(NT, H), dim3(256), 0, s, pa);
                        else    hipLaunchKernelGGL((p3_wy_s4a_kernel<false, true>), dim3(NT, H), dim3(256), 0, s, pa); }
             else     { if (pf) hipLaunchKernelGGL((p3_wy_s4a_kernel<false, false, 1>), dim3(NT, H), dim3(256), 0, s, pa);
                        else    hipLaunchKernelGGL((p3_wy_s4a_kernel<false, false>), dim3(NT, H), dim3(256), 0, s, pa); }

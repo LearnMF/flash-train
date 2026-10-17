@@ -108,7 +108,7 @@ __device__ __forceinline__ void wu_emit16s(short* dst, const short* tile, int ti
     }
 }
 
-template <bool VL, bool KS = false>   // kra P-84b: KS
+template <bool VL, bool KS = false, bool QS = false>   // kra P-84b: KS; P-84c: QS
 __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p_) {
     // kra P-35: field-wise copy, pointers stamped global (global_* ops, not flat)
     const WuParams p{g2_glb(p_.k), g2_glb(p_.v), g2_glb(p_.q), g2_glb(p_.beta), g2_glb(p_.A), g2_glb(p_.g), g2_glb(p_.Wn), g2_glb(p_.Wb), g2_glb(p_.Un), g2_glb(p_.KgA), g2_glb(p_.Kn), g2_glb(p_.Qn), g2_glb(p_.kgB), g2_glb(p_.vB), p_.H, p_.NT, g2_glb(p_.ctok), g2_glb(p_.clen), p_.stop, p_.kp};
@@ -349,6 +349,21 @@ __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p_) {
                 for (int it = 0; it < 8; ++it)
                     #pragma unroll
                     for (int dv = 0; dv < 4; ++dv) tile[wu_tile_idx(ibn_of(tid + 256 * it) + 4 * dv)] = qst[it][dv];
+            } else if constexpr (QS) {   // kra P-84c: carried exp2f(g) (the Kn branch's expression), q quads first
+                v4bh qvs[8];
+                #pragma unroll
+                for (int it = 0; it < 8; ++it) {
+                    const int tt = tid + 256 * it;
+                    const int j = tt >> 5, vq = (tt & 31) << 2;
+                    qvs[it] = g2_row_ok<M>(j, cl)
+                        ? *reinterpret_cast<const v4bh*>(p.q + sbase + (size_t)j * rstride + vq) : v4bh{0, 0, 0, 0};
+                }
+                __syncthreads();                            // every wave's u-MMAC slab reads done
+                #pragma unroll
+                for (int it = 0; it < 8; ++it)
+                    #pragma unroll
+                    for (int dv = 0; dv < 4; ++dv)
+                        tile[wu_tile_idx(ibn_of(tid + 256 * it) + 4 * dv)] = bf_rne(bf2f(qvs[it][dv]) * egr[it][dv]);
             } else {
                 for (int t = tid; t < 2048; t += 256) {
                     short qgv[4];
@@ -382,12 +397,15 @@ extern "C" int g2_wu(const void* k, const void* v, const void* q, const void* be
                    H, T / 64, ctok, clen, stop};
     p.kp = H <= g2::g2_env_long("KDA_G2_KPERM_MAX_H", 20);   // kra P-61e
     const bool ks = g2::g2_env_long("KDA_G2_WU_KS", 1) != 0;   // kra P-84b (default on)
+    const bool qs = g2::g2_env_long("KDA_G2_WU_QS", 1) != 0;   // kra P-84c (default on)
     if (ctok) {
-        if (ks) hipLaunchKernelGGL((g2::g2_wu_kernel<true, true>), dim3(T / 64, H), dim3(256), 0, s, p);
-        else    hipLaunchKernelGGL(g2::g2_wu_kernel<true>, dim3(T / 64, H), dim3(256), 0, s, p);
+        if (ks && qs) hipLaunchKernelGGL((g2::g2_wu_kernel<true, true, true>), dim3(T / 64, H), dim3(256), 0, s, p);
+        else if (ks)  hipLaunchKernelGGL((g2::g2_wu_kernel<true, true>), dim3(T / 64, H), dim3(256), 0, s, p);
+        else          hipLaunchKernelGGL(g2::g2_wu_kernel<true>, dim3(T / 64, H), dim3(256), 0, s, p);
     } else {
-        if (ks) hipLaunchKernelGGL((g2::g2_wu_kernel<false, true>), dim3(T / 64, H), dim3(256), 0, s, p);
-        else    hipLaunchKernelGGL(g2::g2_wu_kernel<false>, dim3(T / 64, H), dim3(256), 0, s, p);
+        if (ks && qs) hipLaunchKernelGGL((g2::g2_wu_kernel<false, true, true>), dim3(T / 64, H), dim3(256), 0, s, p);
+        else if (ks)  hipLaunchKernelGGL((g2::g2_wu_kernel<false, true>), dim3(T / 64, H), dim3(256), 0, s, p);
+        else          hipLaunchKernelGGL(g2::g2_wu_kernel<false>, dim3(T / 64, H), dim3(256), 0, s, p);
     }
     return (int)hipGetLastError();
 }
