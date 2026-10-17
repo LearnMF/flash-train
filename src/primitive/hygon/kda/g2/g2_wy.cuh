@@ -838,7 +838,9 @@ p3_wy_s4a_kernel(WyS4AParams p_) {
     __shared__ __align__(16) bf16 KGs[2][4 * 64 * 4];   // kra P-28: kgB tile of step kt (double buffer)
     __shared__ float BETAs[kBT];                        // kra P-28: masked beta of the chunk's rows
     const int tid = threadIdx.x, r = tid >> 6, l = tid & 63, m = l & 15, q = l >> 4, pm = pi16(m);
-    const int i = blockIdx.x, hh = blockIdx.y, H = p.H;
+    // kra P-88: head-fastest grid when launched as dim3(H, NT) (H == NT: both orders are the same bijection)
+    const bool hf_ = gridDim.x == (unsigned)p.H && gridDim.y != (unsigned)p.H;
+    const int i = hf_ ? (int)blockIdx.y : (int)blockIdx.x, hh = hf_ ? (int)blockIdx.x : (int)blockIdx.y, H = p.H;
     const int tr = 16 * r + m;
     const long tok0 = g2_row_tok<VL>(p.ctok, i);
         const int cl = g2_row_len<VL>(p.clen, i);
@@ -1130,7 +1132,9 @@ __device__ __forceinline__ void s4b_tail(const WyS4BParams& p, S4BSmem& sm, cons
                                          float db, float beta_t, long tok0, int cl) {
     using namespace ipi;
     const int l = threadIdx.x & 63, m = l & 15, q = l >> 4, pm = pi16(m);
-    const int i = blockIdx.x, hh = blockIdx.y, H = p.H;
+    // kra P-88: head-fastest grid when launched as dim3(H, NT) (H == NT: both orders are the same bijection)
+    const bool hf_ = gridDim.x == (unsigned)p.H && gridDim.y != (unsigned)p.H;
+    const int i = hf_ ? (int)blockIdx.y : (int)blockIdx.x, hh = hf_ ? (int)blockIdx.x : (int)blockIdx.y, H = p.H;
     const int R = H * kD, RA = H * kBT;
     const size_t cb = g2_rm_tok(tok0, hh, H, kD), cbA = g2_rm_tok(tok0, hh, H, kBT);
     const size_t cbAp = g2_rm_tok((long)i * kBT, hh, H, kBT);   // dA handoff (chunk-padded)
@@ -1375,7 +1379,9 @@ __global__ void __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(1, 3))
 p3_wy_s4b_kernel(WyS4BParams p) {
     __shared__ __align__(16) S4BSmem sm;
     const int tid = threadIdx.x, r = tid >> 6, l = tid & 63, m = l & 15, q = l >> 4;
-    const int i = blockIdx.x, hh = blockIdx.y, H = p.H;
+    // kra P-88: head-fastest grid when launched as dim3(H, NT) (H == NT: both orders are the same bijection)
+    const bool hf_ = gridDim.x == (unsigned)p.H && gridDim.y != (unsigned)p.H;
+    const int i = hf_ ? (int)blockIdx.y : (int)blockIdx.x, hh = hf_ ? (int)blockIdx.x : (int)blockIdx.y, H = p.H;
     const int tr = 16 * r + m;
     const long tok0 = g2_row_tok<VL>(p.ctok, i);
         const int cl = g2_row_len<VL>(p.clen, i);
@@ -1437,21 +1443,22 @@ extern "C" int g2_wy_s4_split_r(const void* q_kgb, const void* k, const void* v_
                        (const bf16*)dv, (const float*)beta, (const bf16*)v_row,
                        (bf16*)dv2, (bf16*)dwT, (float*)dA, (float*)db_part, T, H, NT,
                        ctok, clen, (const bf16*)dv2c};
+        const dim3 s4grd = g2::g2_env_long("KDA_G2_S4_HF", 1) ? dim3(H, NT) : dim3(NT, H);   // kra P-88 (default on)
         int afs_maxh = 12;   // kra P-28c (H=24 measured mixed: 1.036x at 8K, 0.94-0.97x at 32K-64K)
         if (const char* e = getenv("KDA_G2_S4A_AFS_MAXH")) afs_maxh = atoi(e);
         const bool afs = H <= afs_maxh;
         const bool pf = g2::g2_env_long("KDA_G2_S4A_PF", 1) != 0;   // kra P-83 (default on)
         if (ctok) {
-            if (afs) { if (pf) hipLaunchKernelGGL((p3_wy_s4a_kernel<true, true, 1>), dim3(NT, H), dim3(256), 0, s, pa);
-                       else    hipLaunchKernelGGL((p3_wy_s4a_kernel<true, true>), dim3(NT, H), dim3(256), 0, s, pa); }
-            else     { if (pf) hipLaunchKernelGGL((p3_wy_s4a_kernel<true, false, 1>), dim3(NT, H), dim3(256), 0, s, pa);
-                       else    hipLaunchKernelGGL((p3_wy_s4a_kernel<true, false>), dim3(NT, H), dim3(256), 0, s, pa); }
+            if (afs) { if (pf) hipLaunchKernelGGL((p3_wy_s4a_kernel<true, true, 1>), s4grd, dim3(256), 0, s, pa);
+                       else    hipLaunchKernelGGL((p3_wy_s4a_kernel<true, true>), s4grd, dim3(256), 0, s, pa); }
+            else     { if (pf) hipLaunchKernelGGL((p3_wy_s4a_kernel<true, false, 1>), s4grd, dim3(256), 0, s, pa);
+                       else    hipLaunchKernelGGL((p3_wy_s4a_kernel<true, false>), s4grd, dim3(256), 0, s, pa); }
         } else {
-            if (afs) { if (pf && g2::g2_env_long("KDA_G2_S4A_AFSR", 1)) hipLaunchKernelGGL((p3_wy_s4a_kernel<false, true, 2>), dim3(NT, H), dim3(256), 0, s, pa);   // kra P-83b
-                       else if (pf) hipLaunchKernelGGL((p3_wy_s4a_kernel<false, true, 1>), dim3(NT, H), dim3(256), 0, s, pa);
-                       else    hipLaunchKernelGGL((p3_wy_s4a_kernel<false, true>), dim3(NT, H), dim3(256), 0, s, pa); }
-            else     { if (pf) hipLaunchKernelGGL((p3_wy_s4a_kernel<false, false, 1>), dim3(NT, H), dim3(256), 0, s, pa);
-                       else    hipLaunchKernelGGL((p3_wy_s4a_kernel<false, false>), dim3(NT, H), dim3(256), 0, s, pa); }
+            if (afs) { if (pf && g2::g2_env_long("KDA_G2_S4A_AFSR", 1)) hipLaunchKernelGGL((p3_wy_s4a_kernel<false, true, 2>), s4grd, dim3(256), 0, s, pa);   // kra P-83b
+                       else if (pf) hipLaunchKernelGGL((p3_wy_s4a_kernel<false, true, 1>), s4grd, dim3(256), 0, s, pa);
+                       else    hipLaunchKernelGGL((p3_wy_s4a_kernel<false, true>), s4grd, dim3(256), 0, s, pa); }
+            else     { if (pf) hipLaunchKernelGGL((p3_wy_s4a_kernel<false, false, 1>), s4grd, dim3(256), 0, s, pa);
+                       else    hipLaunchKernelGGL((p3_wy_s4a_kernel<false, false>), s4grd, dim3(256), 0, s, pa); }
         }
         const int rc = (int)hipGetLastError();
         if (rc) return rc;
@@ -1463,8 +1470,9 @@ extern "C" int g2_wy_s4_split_r(const void* q_kgb, const void* k, const void* v_
                        (const bf16*)dwT, (const float*)dA, (const float*)db_part,
                        (float*)dq, (float*)dk, (float*)dg, (float*)db, scale, T, H, NT,
                        ctok, clen, (const bf16*)do_row, (const bf16*)vnc};
-        if (ctok) hipLaunchKernelGGL(p3_wy_s4b_kernel<true>, dim3(NT, H), dim3(256), 0, s, pb);
-        else hipLaunchKernelGGL(p3_wy_s4b_kernel<false>, dim3(NT, H), dim3(256), 0, s, pb);
+        const dim3 s4grd = g2::g2_env_long("KDA_G2_S4_HF", 1) ? dim3(H, NT) : dim3(NT, H);   // kra P-88 (default on)
+        if (ctok) hipLaunchKernelGGL(p3_wy_s4b_kernel<true>, s4grd, dim3(256), 0, s, pb);
+        else hipLaunchKernelGGL(p3_wy_s4b_kernel<false>, s4grd, dim3(256), 0, s, pb);
         return (int)hipGetLastError();
     }
 }
