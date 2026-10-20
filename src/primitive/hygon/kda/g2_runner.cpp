@@ -1,6 +1,7 @@
 // Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 // SPDX-License-Identifier: Apache-2.0
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -101,6 +102,30 @@ struct Sizes {
     std::uint64_t rows128() const noexcept { return T * H * 128; }  // [T, H, 128]
 };
 
+// Sub-buffers of one region that a kernel streams through together must not sit a multiple of
+// the HBM channel-hash period apart: the native / row sizes are multiples of large powers of two,
+// so back to back they put every stream on the same channels (measured on gfx936: s4b, which
+// writes the fp32 dq | dk | dg rows, 1.2-1.3x slower; TCP->TA data stalls 1.9x). spread(spacing,
+// n) is the smallest pad (64 KiB granular) after which n streams `spacing + pad` apart start at
+// least kHashGap from each other modulo the period.
+constexpr std::uint64_t kHashPeriod = std::uint64_t{32} << 20;
+constexpr std::uint64_t kHashGap    = std::uint64_t{4} << 20;
+constexpr std::uint64_t kHashStep   = std::uint64_t{64} << 10;
+
+std::uint64_t spread(std::uint64_t spacing, std::uint64_t n) noexcept {
+    const auto apart = [n](std::uint64_t r) {
+        for (std::uint64_t i = 1; i < n; ++i) {
+            const std::uint64_t d = i * r % kHashPeriod;
+            if (d < kHashGap || kHashPeriod - d < kHashGap) { return false; }
+        }
+        return true;
+    };
+    for (std::uint64_t pad = 0; pad < kHashPeriod; pad += kHashStep) {
+        if (apart((spacing + pad) % kHashPeriod)) { return pad; }
+    }
+    return 0;
+}
+
 // kra P-61e: the kp layouts (Kn lane-permuted, natural-k recompute decays) -- same rule as the kernels' launchers
 inline bool g2KpLayout(long H) {
     const char* e = getenv("KDA_G2_KPERM_MAX_H");
@@ -138,10 +163,13 @@ ForwardLayout layoutForward(const Shape& shape, void* base, std::uint64_t* used)
     ForwardLayout L{};
     L.tab  = takeTables(a, shape, z);
     L.g    = shape.l2norm_qk ? nullptr : a.take(z.rows128() * 4);
-    L.Wn   = a.take(z.CH * 8192 * 2);
-    L.Kn   = a.take(z.CH * 8192 * 2);
-    L.Un   = a.take(z.CH * 8192 * 2);
-    L.QgA  = a.take(z.CH * 8192 * 2);
+    // Wn | Kn | Un | QgA: the recurrence streams them together (spread over the channels, see spread())
+    const std::uint64_t blk = z.CH * 8192 * 2, pw = blk + spread(blk, 4);
+    char* w                 = static_cast<char*>(a.take(3 * pw + blk));
+    L.Wn                    = w;
+    L.Kn                    = w == nullptr ? nullptr : w + pw;
+    L.Un                    = w == nullptr ? nullptr : w + 2 * pw;
+    L.QgA                   = w == nullptr ? nullptr : w + 3 * pw;
     L.AqkA = a.take(z.CH * 4096 * 2);
     L.R    = a.take(z.CH * 5120 * 4);
     L.Gn   = a.take(z.CH * 128 * 4);
@@ -151,9 +179,9 @@ ForwardLayout layoutForward(const Shape& shape, void* base, std::uint64_t* used)
 
 // Backward lifetimes (the hip_kda order) let three regions be reused:
 //   B1 = Wn | Kn | Un (live through the bN recompute)   -> later bN(dh) | aN(dv2)
-//   B2 = KgA | Qn | Wb | Vn | dVn | dOT (through dhu)  -> later fp32 dq | dk | dg (wy -> tail)
-// Both reuses fit exactly: 3 x 8192 = 16384 + 8192 elements per chunk-head, and
-// 6 x 8192 bf16 per chunk-head = 3 x 64 rows x 128 fp32 >= 3 x T x H x 128 fp32 bytes.
+//   B2 = KgA | Qn | Wb | dVn | dOT (through dhu)       -> later fp32 dq | dk | dg (wy -> tail)
+// Both reuses fit: 3 x 8192 = 16384 + 8192 elements per chunk-head, and B2 is sized for the
+// larger of its two uses (3 x T x H x 128 fp32 <= 6 x 8192 bf16 per chunk-head).
 //
 // Staged reuse of the caller's output memory: dq, dk, dg are only written by the final tail
 // kernel, so until then they host three row-sized intermediates (qn in dq, kn in dk, fp32 dA
@@ -187,26 +215,34 @@ BackwardLayout layoutBackward(const Shape& shape, void* base, std::uint64_t* use
     // HbN comes from the forward and wu writes Vn.
     L.Vn                    = shape.has_state ? nullptr : a.take(z.CH * 8192 * 2);
     L.HbN                   = (shape.has_state || shape.has_saved_h) ? nullptr : a.take(z.CH * 16384 * 2);
-    char* b1                = static_cast<char*>(a.take(z.CH * 3 * 8192 * 2));
-    char* b2                = static_cast<char*>(a.take(z.CH * 6 * 8192 * 2));
-    const std::uint64_t blk = z.CH * 8192 * 2;  // one 8192-element bf16 native, bytes
+    // The streams of each region are spread over the HBM channels (see spread()): B1's Wn | Kn |
+    // Un (the recompute reads them together; bN(dh) | aN(dv2) reuse it), B2's KgA | Qn | Wb | dVn
+    // | dOT (dhu) and its fp32 dq | dk | dg rows (wy).
+    const std::uint64_t blk  = z.CH * 8192 * 2;    // one 8192-element bf16 native, bytes
+    const std::uint64_t rows = z.rows128() * 4;    // fp32 [T, H, 128] bytes, <= 2 blk
+    const bool recompute     = !shape.has_state && !shape.has_saved_h;   // Wn | Kn | Un are used
+    const std::uint64_t p1   = blk + (recompute ? spread(blk, 3) : 0);
+    const std::uint64_t pa   = 2 * p1 + spread(2 * p1, 2);   // bN(dh) [2 blk] | aN(dv2)
+    const std::uint64_t p2   = blk + spread(blk, 5);
+    const std::uint64_t pr   = rows + spread(rows, 3);
+    char* b1                 = static_cast<char*>(a.take(std::max(2 * p1, pa) + blk));
+    char* b2                 = static_cast<char*>(a.take(std::max(4 * p2 + blk, 2 * pr + rows)));
     if (b1 != nullptr) {
         L.Wn    = b1;
-        L.Kn    = b1 + blk;
-        L.Un    = b1 + 2 * blk;
+        L.Kn    = b1 + p1;
+        L.Un    = b1 + 2 * p1;
         L.HbNdh = b1;
-        L.ANv2  = b1 + 2 * blk;
+        L.ANv2  = b1 + pa;
     }
     if (b2 != nullptr) {
-        L.KgA                    = b2;
-        L.Qn                     = b2 + blk;
-        L.Wb                     = b2 + 2 * blk;
-        L.dVn                    = b2 + 4 * blk;
-        L.dOT                    = b2 + 5 * blk;
-        const std::uint64_t rows = z.rows128() * 4;  // fp32 [T, H, 128] bytes, <= 2 blk
-        L.dq                     = b2;
-        L.dk                     = b2 + rows;
-        L.dg                     = b2 + 2 * rows;
+        L.KgA = b2;
+        L.Qn  = b2 + p2;
+        L.Wb  = b2 + 2 * p2;
+        L.dVn = b2 + 3 * p2;
+        L.dOT = b2 + 4 * p2;
+        L.dq  = b2;
+        L.dk  = b2 + pr;
+        L.dg  = b2 + 2 * pr;
     }
     L.dAout   = a.take(z.NT * 64 * z.H * 64 * 4);
     L.dwT     = a.take(z.CH * 128 * 64 * 2);
