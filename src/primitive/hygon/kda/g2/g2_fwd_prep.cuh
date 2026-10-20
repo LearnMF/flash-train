@@ -37,6 +37,7 @@ struct PrepAParams {
     int H, NT;
     int stop;                           // phase timing (G2_PREP_STOP): 0 = full
     int kp = 0;                         // kra P-61e: Kn lane-permuted + Gn natural-k (H <= KPERM_MAX_H)
+    short *qn_out = nullptr, *kn_out = nullptr;   // kra P-77b: non-null -> emit qn / kn row-major
 };
 
 struct PrepBParams {
@@ -233,6 +234,13 @@ __global__ void __launch_bounds__(256) g2_fwd_prep_a_kernel(PrepAParams p) {
             for (int u = 0; u < 8; ++u) {
                 qv[rb][u >> 2][u & 3] = bf_rne(bf2f(qv[rb][u >> 2][u & 3]) * rq);
                 kv[rb][u >> 2][u & 3] = bf_rne(bf2f(kv[rb][u >> 2][u & 3]) * rk);
+            }
+            if (p.qn_out != nullptr && g2_row_ok<M>(row, cl)) {   // kra P-77b: qn / kn for the backward
+                const size_t o2 = cta0 + (size_t)row * rs + cbase;
+                *reinterpret_cast<v4bh*>(p.qn_out + o2) = qv[rb][0];
+                *reinterpret_cast<v4bh*>(p.qn_out + o2 + 4) = qv[rb][1];
+                *reinterpret_cast<v4bh*>(p.kn_out + o2) = kv[rb][0];
+                *reinterpret_cast<v4bh*>(p.kn_out + o2 + 4) = kv[rb][1];
             }
         }
     }
@@ -623,7 +631,8 @@ extern "C" int g2_fwd_prep(const void* q, const void* k, const void* v, const vo
                            void* Wn, void* Kn, void* Un, void* QgA, void* AqkA, void* Aqk,
                            void* Akk, void* q_rstd, void* k_rstd, void* Gn, void* R, void* Kb,
                            double lower_bound, double gscale, int gate, double scale, int H,
-                           int NT, const int* ctok, const int* clen, hipStream_t s) {
+                           int NT, const int* ctok, const int* clen, void* qn_out, void* kn_out,
+                           hipStream_t s) {   // kra P-77b: qn_out / kn_out
     if ((ctok == nullptr) != (clen == nullptr) || NT <= 0) return -1;
     g2::r4::PrepAParams pa{(const short*)q, (const short*)k, (const short*)v, (short*)Wn,
                            (short*)Un, (short*)AqkA, (short*)Aqk, (short*)Akk, (float)scale,
@@ -633,6 +642,7 @@ extern "C" int g2_fwd_prep(const void* q, const void* k, const void* v, const vo
                            (float)gscale, H, NT, 0};
     if (const char* e = getenv("G2_PREP_STOP")) pa.stop = atoi(e);
     pa.kp = H <= g2::g2_env_long("KDA_G2_KPERM_MAX_H", 20);   // kra P-61e
+    pa.qn_out = (short*)qn_out; pa.kn_out = (short*)kn_out;    // kra P-77b
     const dim3 grid(NT, H), blk(256);
     if (gate) {
         if (ctok) hipLaunchKernelGGL((g2::r4::g2_fwd_prep_a_kernel<1, true>), grid, blk, 0, s, pa);

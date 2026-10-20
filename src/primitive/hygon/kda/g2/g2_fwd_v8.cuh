@@ -260,8 +260,8 @@ __global__ void __launch_bounds__(256) g2_fwd_h_v8o4_kernel(FwdOParams p) {
     const bool hasO  = MODE == 0 ? p.O != nullptr : false;
     const bool hasOb = MODE == 0 ? p.Ob != nullptr : (MODE != 3 && MODE != 4);
     const bool hasBN = MODE == 0 ? p.HbN != nullptr : MODE != 1;
-    const bool hasVn = MODE == 0 ? p.Vn != nullptr : MODE != 1;
-    const bool hasAN = MODE == 0 ? p.ANv != nullptr : (MODE != 1 && MODE != 4);
+    const bool hasVn = MODE == 0 ? p.Vn != nullptr : (MODE != 1 && MODE != 5);   // kra P-82: MODE 5 = Ob + HbN
+    const bool hasAN = MODE == 0 ? p.ANv != nullptr : (MODE != 1 && MODE != 4 && MODE != 5);
     __shared__ __align__(16) bf16 hB[kBV * kPadK];
     __shared__ __align__(16) bf16 vB[kBV * kPadT];
     __shared__ __align__(16) bf16 oStage[4][256];
@@ -596,8 +596,8 @@ __global__ void __launch_bounds__(256) g2_fwd_h_v8o4w_kernel(FwdOParams p) {
     const bool hasO  = MODE == 0 ? p.O != nullptr : false;
     const bool hasOb = MODE == 0 ? p.Ob != nullptr : (MODE != 3 && MODE != 4);
     const bool hasBN = MODE == 0 ? p.HbN != nullptr : MODE != 1;
-    const bool hasVn = MODE == 0 ? p.Vn != nullptr : MODE != 1;
-    const bool hasAN = MODE == 0 ? p.ANv != nullptr : (MODE != 1 && MODE != 4);
+    const bool hasVn = MODE == 0 ? p.Vn != nullptr : (MODE != 1 && MODE != 5);   // kra P-82: MODE 5 = Ob + HbN
+    const bool hasAN = MODE == 0 ? p.ANv != nullptr : (MODE != 1 && MODE != 4 && MODE != 5);
     constexpr int BVW = 16 * NVH;
     __shared__ __align__(16) bf16 hB[BVW * kPadK];
     __shared__ __align__(16) bf16 vB[BVW * kPadT];
@@ -897,6 +897,7 @@ extern "C" int g2_fwd_h_v8o(const void* Wn, const void* Kn, const void* Un, cons
     else if (O == nullptr && Ob != nullptr && Vn && HbN && ANv) mode = 2;
     else if (O == nullptr && Ob == nullptr && Vn && HbN && ANv) mode = 3;
     else if (O == nullptr && Ob == nullptr && Vn && HbN && !ANv) mode = 4;   // kra P-22
+    else if (O == nullptr && Ob != nullptr && !Vn && HbN && !ANv) mode = 5;   // kra P-82: forward saves h
     // kra P-24: at deep saturation cap v8o4 at 2 CTAs/CU (24 KB LDS per CTA) so the K-side
     // operands shared by a head's 4 V-slab CTAs stay in L2.
     const bool throttle = 4L * nseg * H >= g2_env_long("KDA_G2_V8O4_THROTTLE_MIN_CTAS", 224);
@@ -916,6 +917,10 @@ extern "C" int g2_fwd_h_v8o(const void* Wn, const void* Kn, const void* Un, cons
     auto v8o4 = [&](auto vl) {
         constexpr bool VL = decltype(vl)::value;
         switch (mode) {   // kra P-61e: KP instances whenever the producers emit the kp layouts
+            case 5: if (sg && kp) launch4(g2_fwd_h_v8o4_kernel<VL, 5, true, true, true, true, true, true>);   // kra P-82
+                    else if (kp) launch4(g2_fwd_h_v8o4_kernel<VL, 5, true, false, false, true, true, true>);
+                    else    launch4(g2_fwd_h_v8o4_kernel<VL, 5>);
+                    break;
             case 1: if (sg) { if (kp) launch4(g2_fwd_h_v8o4_kernel<VL, 1, true, true, true, true, true>);   // kra P-60
                               else    launch4(g2_fwd_h_v8o4_kernel<VL, 1, true, true, true>); }
                     else if (kp) launch4(g2_fwd_h_v8o4_kernel<VL, 1, true, false, false, true, true>);
@@ -952,6 +957,7 @@ extern "C" int g2_fwd_h_v8o(const void* Wn, const void* Kn, const void* Un, cons
                 case 2: hipLaunchKernelGGL((g2_fwd_h_v8o4w_kernel<VL, 2>), gridw, dim3(256), 0, s, p); break;
                 case 3: hipLaunchKernelGGL((g2_fwd_h_v8o4w_kernel<VL, 3>), gridw, dim3(256), 0, s, p); break;
                 case 4: hipLaunchKernelGGL((g2_fwd_h_v8o4w_kernel<VL, 4>), gridw, dim3(256), 0, s, p); break;
+                case 5: hipLaunchKernelGGL((g2_fwd_h_v8o4w_kernel<VL, 5>), gridw, dim3(256), 0, s, p); break;   // kra P-82
                 default: hipLaunchKernelGGL((g2_fwd_h_v8o4w_kernel<VL, 0>), gridw, dim3(256), 0, s, p); break;
             }
         };

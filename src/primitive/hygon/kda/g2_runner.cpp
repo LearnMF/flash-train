@@ -26,7 +26,8 @@ int g2_fwd_intra2_split(const void* qn, const void* kn, const void* v, const voi
 int g2_fwd_prep(const void* q, const void* k, const void* v, const void* g_raw, const void* A_log, const void* dt_bias,
                 const void* beta, void* Wn, void* Kn, void* Un, void* QgA, void* AqkA, void* Aqk, void* Akk,
                 void* q_rstd, void* k_rstd, void* Gn, void* R, void* Kb, double lower_bound, double gscale, int gate,
-                double scale, int H, int NT, const int* ctok, const int* clen, hipStream_t s);
+                double scale, int H, int NT, const int* ctok, const int* clen, void* qn_out, void* kn_out,
+                hipStream_t s);  // kra P-77b: + qn_out / kn_out
 int g2_fwd_h_v8o(const void* Wn, const void* Kn, const void* Un, const void* Gn, const void* QgA, const void* AqkA,
                  void* O, void* Ob, void* Vn, void* HbN, void* ANv, float scale, int B, int T, int H, const int* seg,
                  int nseg, const int* ctok, const int* clen, const void* GnRaw, hipStream_t s);
@@ -35,7 +36,7 @@ int g2_gn_kp(float* raw, float* gp, float* gnat, long n, hipStream_t s);        
 int g2_kp_relayout(void* kn, long kn_elems, float* gn, long gn_elems, void* un, hipStream_t s);   // kra P-61e, P-62
 int g2_wu(const void* k, const void* v, const void* q, const void* beta, const void* A, const void* g, void* Wn,
           void* Wb, void* Un, void* KgA, void* Kn, void* Qn, void* kgB, void* vB, int B, int T, int H, const int* ctok,
-          const int* clen, hipStream_t s);
+          const int* clen, const void* hbn, void* vn_out, hipStream_t s);  // kra P-82: + hbn / vn_out
 int g2_dav(const void* do_, const void* Vn, const void* A, void* dA, void* dVn, void* dOT, void* aNdo, double scale,
            int B, int T, int H, const int* ctok, const int* clen, hipStream_t s);
 int g2_dhu_v8b(const void* KgA, const void* Qg, const void* Wb, const void* dOT, const void* dv, const void* Gn,
@@ -182,9 +183,10 @@ BackwardLayout layoutBackward(const Shape& shape, void* base, std::uint64_t* use
     L.kgB                   = a.take(z.CH * 8192 * 2);
     // kra P-17/P-20/P-22a: no vB / aN_do / aN(v_new) copies (s4a reads v row-major, s4b reads dO
     // row-major and rebuilds aN(v_new) from Vn).  Vn lives OUTSIDE b2: s4b reads it while wy
-    // writes dq/dk/dg over b2.  Keep-state: Vn and HbN come from the forward.
+    // writes dq/dk/dg over b2.  Keep-state: Vn and HbN come from the forward; saved-h (kra P-82):
+    // HbN comes from the forward and wu writes Vn.
     L.Vn                    = shape.has_state ? nullptr : a.take(z.CH * 8192 * 2);
-    L.HbN                   = shape.has_state ? nullptr : a.take(z.CH * 16384 * 2);
+    L.HbN                   = (shape.has_state || shape.has_saved_h) ? nullptr : a.take(z.CH * 16384 * 2);
     char* b1                = static_cast<char*>(a.take(z.CH * 3 * 8192 * 2));
     char* b2                = static_cast<char*>(a.take(z.CH * 6 * 8192 * 2));
     const std::uint64_t blk = z.CH * 8192 * 2;  // one 8192-element bf16 native, bytes
@@ -240,10 +242,12 @@ void forward(const Shape& shape, const ForwardArgs& p, void* workspace, FTrainSt
               "tables");
     }
     if (shape.l2norm_qk) {  // R4: l2norm + gate + fwd_intra2 + to_gn in two kernels, bitwise the X1 chain
+        // kra P-77b: with p.qn / p.kn set, prep_a also writes the l2-normalized q / k for the backward.
         check(g2_fwd_prep(p.q, p.k, p.v, p.g, shape.gate_in_kernel ? p.a_log : nullptr,
                           shape.gate_in_kernel ? p.dt_bias : nullptr, p.beta, L.Wn, L.Kn, L.Un, L.QgA, L.AqkA, p.aqk,
                           p.akk, p.q_rstd, p.k_rstd, L.Gn, L.R, p.o, shape.gate_in_kernel ? p.lower_bound : 0.0,
-                          kRcpLn2, shape.gate_in_kernel ? 1 : 0, p.scale, H, NT, L.tab.ctok, L.tab.clen, stream),
+                          kRcpLn2, shape.gate_in_kernel ? 1 : 0, p.scale, H, NT, L.tab.ctok, L.tab.clen, p.qn, p.kn,
+                          stream),
               "fwd_prep");
     } else {
         check(
@@ -265,8 +269,10 @@ void forward(const Shape& shape, const ForwardArgs& p, void* workspace, FTrainSt
     }
     // R5 keep-state: with p.state_* set, the recurrence also emits the backward's B2 state
     // (bN(h), v_new native and A-natural) -- bit-identical to the backward's own recompute.
-    check(g2_fwd_h_v8o(L.Wn, L.Kn, L.Un, L.Gn, L.QgA, L.AqkA, nullptr, p.o, p.state_vn, p.state_hbn, p.state_anv,
-                       p.scale, 1, NT * 64, H, L.tab.seg, nseg, L.tab.ctok, L.tab.clen, nullptr, stream),
+    // kra P-82 saved-h: with p.saved_h set it emits bN(h) only (MODE 5 = o + h).
+    void* hbn = p.state_hbn != nullptr ? p.state_hbn : p.saved_h;
+    check(g2_fwd_h_v8o(L.Wn, L.Kn, L.Un, L.Gn, L.QgA, L.AqkA, nullptr, p.o, p.state_vn, hbn, p.state_anv, p.scale, 1,
+                       NT * 64, H, L.tab.seg, nseg, L.tab.ctok, L.tab.clen, nullptr, stream),
           "fwd_h_o");
 }
 
@@ -284,7 +290,10 @@ void backward(const Shape& shape, const BackwardArgs& p, void* workspace, FTrain
     void* dA       = p.dg;  // staged: fp32 [T, H, 64] fits g's-dtype [T, H, 128]; dead before the tail writes dg
     const void* qn = p.q;
     const void* kn = p.k;
-    if (shape.l2norm_qk) {  // V1: bf16(x * rstd) from the saved rstd == the forward's qn/kn bit for bit
+    if (p.qn != nullptr) {  // kra P-77b: the forward saved qn / kn -> no l2n_apply
+        qn = p.qn;
+        kn = p.kn;
+    } else if (shape.l2norm_qk) {  // V1: bf16(x * rstd) from the saved rstd == the forward's qn/kn bit for bit
         check(g2_l2n_apply(p.q, p.k, p.q_rstd, p.k_rstd, p.dq, p.dk, static_cast<long>(z.T * z.H), stream),
               "l2n_apply");  // staged in the dq / dk outputs (the tail overwrites them in place)
         qn = p.dq;
@@ -294,14 +303,17 @@ void backward(const Shape& shape, const BackwardArgs& p, void* workspace, FTrain
                        p.lower_bound, kRcpLn2, shape.gate_in_kernel ? 1 : 0, NT, H, ctok, clen, stream),
           "gate");
     // R5 keep-state: the forward handed over the B2 state -> wu skips Wn/Un/Kn (fwd_h_bn's inputs
-    // only) and the bN recompute does not run.
-    const bool kept = p.state_hbn != nullptr;  // == shape.has_state (the workspace was laid out for it)
-    const void* Vn  = kept ? p.state_vn : L.Vn;
-    const void* HbN = kept ? p.state_hbn : L.HbN;
-    const void* ANv = kept ? p.state_anv : nullptr;  // kra P-22a: s4b rebuilds aN(v_new) from Vn
-    check(g2_wu(kn, p.v, qn, p.beta, p.akk, L.g, kept ? nullptr : L.Wn, L.Wb, kept ? nullptr : L.Un, L.KgA,
-                kept ? nullptr : L.Kn, L.Qn, L.kgB, nullptr /* kra P-17: no vB */, 1, NT * 64, H, ctok, clen,
-                stream),
+    // only) and the bN recompute does not run.  kra P-82 saved-h: the forward handed over h only ->
+    // wu also skips Wn/Un/Kn and forms v_new = bf_rne(u - W h) into Vn; no recompute either.
+    const bool kept  = p.state_hbn != nullptr;  // == shape.has_state (the workspace was laid out for it)
+    const bool hsave = !kept && p.saved_h != nullptr;  // == shape.has_saved_h
+    const bool p1    = !kept && !hsave;                // wu emits the recompute's Wn/Un/Kn
+    const void* Vn   = kept ? p.state_vn : L.Vn;
+    const void* HbN  = kept ? p.state_hbn : (hsave ? p.saved_h : L.HbN);
+    const void* ANv  = kept ? p.state_anv : nullptr;  // kra P-22a: s4b rebuilds aN(v_new) from Vn
+    check(g2_wu(kn, p.v, qn, p.beta, p.akk, L.g, p1 ? L.Wn : nullptr, L.Wb, p1 ? L.Un : nullptr, L.KgA,
+                p1 ? L.Kn : nullptr, L.Qn, L.kgB, nullptr /* kra P-17: no vB */, 1, NT * 64, H, ctok, clen,
+                hsave ? p.saved_h : nullptr, hsave ? L.Vn : nullptr, stream),
           "wu");
     check(g2_kda_to_gn(static_cast<const float*>(L.g), ctok, clen, H, NT, static_cast<float*>(L.GnRaw), stream), "to_gn");
     const bool kp = g2KpLayout(H);
@@ -313,7 +325,7 @@ void backward(const Shape& shape, const BackwardArgs& p, void* workspace, FTrain
         check(g2_kda_to_gn(static_cast<const float*>(L.g), ctok, clen, H, NT, static_cast<float*>(L.Gn), stream), "to_gn");
         check(g2_exp2_inplace(static_cast<float*>(L.Gn), static_cast<long>(z.CH * 128), stream), "gn_exp2");  // kra P-52
     }
-    if (!kept) {
+    if (p1) {
         check(g2_fwd_h_v8o(L.Wn, L.Kn, L.Un, kp ? L.GnNat : L.Gn, nullptr, nullptr, nullptr, nullptr, L.Vn, L.HbN, nullptr, 1.f, 1,
                            NT * 64, H, L.tab.seg, nseg, nullptr, nullptr, L.GnRaw, stream),
               "fwd_h_bn");

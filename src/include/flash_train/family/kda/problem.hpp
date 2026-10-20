@@ -23,22 +23,33 @@ struct KdaShape {
     std::int64_t seqs;
 };
 
+// Chunks of the packed layout: T / 64 for one sequence of T % 64 == 0 rows, else ceil(T / 64) + N.
+inline std::int64_t kdaChunks(const KdaShape& s, bool has_cu) noexcept {
+    return (!has_cu && s.tokens % 64 == 0) ? s.tokens / 64 : (s.tokens + 63) / 64 + (has_cu ? s.seqs : 1);
+}
+
 // Elements of the optional state port (ftrainKdaStateElements of flash_train.h).
 inline std::int64_t kdaStateElements(const KdaShape& s, bool has_cu) noexcept {
-    const std::int64_t chunks =
-        (!has_cu && s.tokens % 64 == 0) ? s.tokens / 64 : (s.tokens + 63) / 64 + (has_cu ? s.seqs : 1);
-    return s.heads * chunks * 32768;
+    return s.heads * kdaChunks(s, has_cu) * 32768;
+}
+
+// Elements of the optional saved-h port (ftrainKdaSavedHElements of flash_train.h).
+inline std::int64_t kdaSavedHElements(const KdaShape& s, bool has_cu) noexcept {
+    return s.heads * kdaChunks(s, has_cu) * 16384;
 }
 
 // One KDA call's ports in packed THD layout, structurally validated by the constructors:
 // every port is rank-consistent with
 //   q, k [T, H, K]   v [T, H, V]   g [T, H, K]   beta [T, H]   a_log [H]   dt_bias [H, K] or [H*K]
 //   cu_seqlens [N + 1]   q_rstd, k_rstd [T, H]   aqk, akk [T, H, 64]   o / d_o [T, H, V]
-//   state [kdaStateElements(T, H, N, cu)] (optional, opaque recurrent state)
+//   qn, kn [T, H, K] (optional, l2norm_qk only: the l2-normalized q / k the forward saves)
+//   h [kdaSavedHElements(T, H, N, cu)] (optional, opaque saved recurrent state h)
+//   state [kdaStateElements(T, H, N, cu)] (optional, opaque recurrent state; exclusive with h)
 // and lives in device memory. Optional ports carry null memory when unused (their dims are
 // then ignored): a_log/dt_bias (and their gradients) without gate_in_kernel, cu_seqlens for one
-// sequence, q_rstd/k_rstd without l2norm_qk. Value support (types, dims the kernels handle,
-// device architecture) is the Primitives' isApplicable concern.
+// sequence, q_rstd/k_rstd without l2norm_qk, qn/kn/h/state when not exchanged, and in the
+// backward q/k when qn/kn are given. Value support (types, dims the kernels handle, device
+// architecture) is the Primitives' isApplicable concern.
 class KdaPortSet {
   public:
     const Tensor& get(std::size_t index) const noexcept { return tensors_[index]; }
@@ -72,6 +83,9 @@ class KdaForwardProblem final : public KdaPortSet {
         kKRstd,
         kAqk,
         kAkk,
+        kQn,
+        kKn,
+        kH,
         kState,
         kCount
     };
@@ -107,6 +121,8 @@ class KdaBackwardProblem final : public KdaPortSet {
         kKRstd,
         kAqk,
         kAkk,
+        kQn,
+        kKn,
         kDq,
         kDk,
         kDv,
@@ -114,6 +130,7 @@ class KdaBackwardProblem final : public KdaPortSet {
         kDBeta,
         kDALog,
         kDDtBias,
+        kH,
         kState,
         kCount
     };

@@ -67,7 +67,31 @@ o.sum().backward()                                      # 支持 autograd：q/k/
 - `use_qk_l2norm_in_kernel=True`（默认）表示在算子内部对 q/k 做 l2 归一化，eps 为 1e-6。
 - 当前实现为 gfx936 手写内核（`G2KdaForward`/`G2KdaBackward`），只支持 K = V = 128，其他配置抛 `RuntimeError`（`FTRAIN_STATUS_UNSUPPORTED`）。确定性：只用固定顺序归约，不用原子操作。
 - 精度：与 FP64 参考（`ft.kda_reference`）相比，相对 RMS 误差约 0.3–0.7%，判据为 o < 2e-2、dq/dk/dv < 4e-2、门控侧梯度 < 6e-2（与 PR #556 一致）。
-- 暂不支持初始状态、最终状态和 checkpoint。
+- 暂不支持初始状态和最终状态（训练从零状态开始，K3 不使用）。
+
+#### 前向为反向保存什么（全部逐位一致，只影响显存和速度）
+
+| 环境变量 | 默认 | 作用 |
+|---|---|---|
+| `FLASH_TRAIN_KDA_SAVE_QKN` | `1` | 前向保存 l2 归一化后的 qn/kn，代替 q/k（保存的字节不变），反向不再重建 |
+| `FLASH_TRAIN_KDA_SAVE_H` | `auto` | 前向保存递推状态 h（每 token·head 512 B），反向不再跑递推。`auto` 在 H ≤ 48 时开启（gfx936 实测更快），`1` 总是开启，`0` 关闭 |
+| `FLASH_TRAIN_KDA_KEEP_STATE` | `auto` | 前向交给反向完整状态（h 加 v_new，每 token·head 1024 B），只在 SAVE_H 未开启时生效。`auto` 只在可重入激活重算（Megatron 的 recompute、`torch.utils.checkpoint(use_reentrant=True)`）的重算前向里开启 |
+
+### 用 C API 接入 KDA（与 PyTorch 入口同一套端口）
+
+`flash_train.h` 的 `ftrainKdaForward` / `ftrainKdaBackward`（以及对应的 `...GetWorkspaceBytes`）接收 `FTrainKdaForwardTensors` / `FTrainKdaBackwardTensors`；`common.h` 的 `ftrainPatternAddKdaForward` / `ftrainPatternAddKdaBackward` 用同样的端口顺序建 Pattern，用于复用 Plan。
+
+| 端口 | 前向 | 反向 | 说明 |
+|---|---|---|---|
+| q, k, v, g, beta, a_log, dt_bias, cu_seqlens | 输入 | 输入 | 不用的端口传空内存（a_log/dt_bias 不在算子内算 gate 时；cu_seqlens 只有一条序列时） |
+| o / d_o | 输出 | 输入 | `[T, H, 128]` bf16 |
+| q_rstd, k_rstd, aqk, akk | 输出 | 输入 | 必须保存给反向 |
+| qn, kn | 可选输出 | 可选输入 | 只在 l2norm_qk 时；给出后反向的 q/k 可以传空内存 |
+| h | 可选输出 | 可选输入 | `ftrainKdaSavedHElements(T, H, N, has_cu)` 个 bf16，布局不公开 |
+| state | 可选输出 | 可选输入 | `ftrainKdaStateElements(T, H, N, has_cu)` 个 bf16，布局不公开；与 h 互斥 |
+| dq, dk, dv, dg, dbeta, da_log, ddt_bias | — | 输出 | dq/dk/dg 在调用期间兼作临时空间，不得与任何输入重叠 |
+
+可选端口都是“前向写了、反向就用；传空内存就重算”，结果逐位一致。执行是异步的：返回后，所有张量和 workspace 必须保持有效，直到流上的计算完成。
 
 ---
 

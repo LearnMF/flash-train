@@ -108,14 +108,17 @@ void runKda(Call call, const std::vector<KdaBridgeView>& views, KdaBridgeAttribu
     TORCH_CHECK(status == 0, name, " failed (status ", static_cast<unsigned int>(status), "): ", message);
 }
 
-// o, q_rstd, k_rstd, aqk, akk, state (q_rstd/k_rstd are empty without l2norm_qk; state is empty
-// unless keep_state: then the forward also writes its recurrent state for the backward).
+// o, q_rstd, k_rstd, aqk, akk, qn, kn, h, state. q_rstd/k_rstd are empty without l2norm_qk; the
+// optional outputs are empty unless requested: save_qkn (l2norm_qk only) -> qn, kn; save_h -> h
+// (the recurrent state h); keep_state -> state (h plus the backward's v_new operands). save_h and
+// keep_state are exclusive.
 std::vector<at::Tensor> kdaForward(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v, const at::Tensor& g,
                                    const at::Tensor& beta, const std::optional<at::Tensor>& a_log,
                                    const std::optional<at::Tensor>& dt_bias,
                                    const std::optional<at::Tensor>& cu_seqlens, double scale, double lower_bound,
-                                   bool gate_in_kernel, bool l2norm_qk, bool keep_state) {
+                                   bool gate_in_kernel, bool l2norm_qk, bool keep_state, bool save_qkn, bool save_h) {
     TORCH_CHECK(q.dim() == 3 && v.dim() == 3, "kda: q/k/v must be [T, H, D]");
+    TORCH_CHECK(!(keep_state && save_h), "kda: keep_state and save_h are exclusive");
     const int64_t T = q.size(0), H = q.size(1);
     at::Tensor o      = torch::empty_like(v);
     auto fopt         = q.options().dtype(at::kFloat);
@@ -123,43 +126,54 @@ std::vector<at::Tensor> kdaForward(const at::Tensor& q, const at::Tensor& k, con
     at::Tensor k_rstd = l2norm_qk ? torch::empty({T, H}, fopt) : torch::empty({0}, fopt);
     at::Tensor aqk    = torch::empty({T, H, 64}, q.options());
     at::Tensor akk    = torch::empty({T, H, 64}, q.options());
+    const bool qkn    = save_qkn && l2norm_qk;
+    at::Tensor qn     = qkn ? torch::empty_like(q) : torch::empty({0}, q.options());
+    at::Tensor kn     = qkn ? torch::empty_like(k) : torch::empty({0}, k.options());
     const bool has_cu = cu_seqlens.has_value() && cu_seqlens->defined();
     const int64_t N   = has_cu ? cu_seqlens->numel() - 1 : 1;
-    at::Tensor state  = torch::empty(
+    at::Tensor h      = torch::empty(
+        {save_h ? static_cast<int64_t>(flash_train_torch::kdaSavedHElements(T, H, N, has_cu)) : 0}, q.options());
+    at::Tensor state = torch::empty(
         {keep_state ? static_cast<int64_t>(flash_train_torch::kdaStateElements(T, H, N, has_cu)) : 0}, q.options());
-    const std::vector<KdaBridgeView> views = {kdaView(q),    kdaView(k),      kdaView(v),       kdaView(g),
-                                              kdaView(beta), kdaView(a_log),  kdaView(dt_bias), kdaView(cu_seqlens),
-                                              kdaView(o),    kdaView(q_rstd), kdaView(k_rstd),  kdaView(aqk),
-                                              kdaView(akk),  kdaView(state)};
+    const std::vector<KdaBridgeView> views = {
+        kdaView(q),   kdaView(k),      kdaView(v),      kdaView(g),   kdaView(beta), kdaView(a_log),
+        kdaView(dt_bias), kdaView(cu_seqlens), kdaView(o), kdaView(q_rstd), kdaView(k_rstd), kdaView(aqk),
+        kdaView(akk), kdaView(qn),     kdaView(kn),     kdaView(h),   kdaView(state)};
     runKda(flash_train_torch::callKdaForward, views,
            KdaBridgeAttributes{static_cast<float>(scale), static_cast<float>(lower_bound), gate_in_kernel ? 1 : 0,
                                l2norm_qk ? 1 : 0},
            q, "ftrainKdaForward");
-    return {o, q_rstd, k_rstd, aqk, akk, state};
+    return {o, q_rstd, k_rstd, aqk, akk, qn, kn, h, state};
 }
 
-// dq, dk, dv, dg, dbeta, da_log, ddt_bias (the last two are empty without gate_in_kernel).
-std::vector<at::Tensor> kdaBackward(const at::Tensor& d_o, const at::Tensor& q, const at::Tensor& k,
-                                    const at::Tensor& v, const at::Tensor& g, const at::Tensor& beta,
-                                    const std::optional<at::Tensor>& a_log, const std::optional<at::Tensor>& dt_bias,
+// dq, dk, dv, dg, dbeta, da_log, ddt_bias (the last two are empty without gate_in_kernel). q / k
+// may be None when the forward saved qn / kn; h / state are the forward's optional outputs.
+std::vector<at::Tensor> kdaBackward(const at::Tensor& d_o, const std::optional<at::Tensor>& q,
+                                    const std::optional<at::Tensor>& k, const at::Tensor& v, const at::Tensor& g,
+                                    const at::Tensor& beta, const std::optional<at::Tensor>& a_log,
+                                    const std::optional<at::Tensor>& dt_bias,
                                     const std::optional<at::Tensor>& cu_seqlens, const at::Tensor& q_rstd,
                                     const at::Tensor& k_rstd, const at::Tensor& aqk, const at::Tensor& akk,
-                                    const at::Tensor& state, double scale, double lower_bound, bool gate_in_kernel,
-                                    bool l2norm_qk) {
-    at::Tensor dq = torch::empty_like(q), dk = torch::empty_like(k), dv = torch::empty_like(v);
+                                    const std::optional<at::Tensor>& qn, const std::optional<at::Tensor>& kn,
+                                    const std::optional<at::Tensor>& h, const std::optional<at::Tensor>& state,
+                                    double scale, double lower_bound, bool gate_in_kernel, bool l2norm_qk) {
+    const bool has_qk = q.has_value() && q->defined() && q->numel() > 0;
+    TORCH_CHECK(has_qk || (qn.has_value() && qn->defined() && qn->numel() > 0), "kda: backward needs q/k or qn/kn");
+    const at::Tensor& qs = has_qk ? *q : *qn;  // the [T, H, K] shape and options of q / k
+    at::Tensor dq = torch::empty_like(qs), dk = torch::empty_like(qs), dv = torch::empty_like(v);
     at::Tensor dg = torch::empty_like(g), dbeta = torch::empty_like(beta);
-    auto fopt                              = q.options().dtype(at::kFloat);
+    auto fopt                              = qs.options().dtype(at::kFloat);
     at::Tensor da_log                      = gate_in_kernel ? torch::empty_like(*a_log) : torch::empty({0}, fopt);
     at::Tensor ddt_bias                    = gate_in_kernel ? torch::empty_like(*dt_bias) : torch::empty({0}, fopt);
     const std::vector<KdaBridgeView> views = {
-        kdaView(d_o),    kdaView(q),        kdaView(k),          kdaView(v),      kdaView(g),      kdaView(beta),
-        kdaView(a_log),  kdaView(dt_bias),  kdaView(cu_seqlens), kdaView(q_rstd), kdaView(k_rstd), kdaView(aqk),
-        kdaView(akk),    kdaView(dq),       kdaView(dk),         kdaView(dv),     kdaView(dg),     kdaView(dbeta),
-        kdaView(da_log), kdaView(ddt_bias), kdaView(state)};
+        kdaView(d_o),     kdaView(q),          kdaView(k),      kdaView(v),      kdaView(g),     kdaView(beta),
+        kdaView(a_log),   kdaView(dt_bias),    kdaView(cu_seqlens), kdaView(q_rstd), kdaView(k_rstd), kdaView(aqk),
+        kdaView(akk),     kdaView(qn),         kdaView(kn),     kdaView(dq),     kdaView(dk),    kdaView(dv),
+        kdaView(dg),      kdaView(dbeta),      kdaView(da_log), kdaView(ddt_bias), kdaView(h),   kdaView(state)};
     runKda(flash_train_torch::callKdaBackward, views,
            KdaBridgeAttributes{static_cast<float>(scale), static_cast<float>(lower_bound), gate_in_kernel ? 1 : 0,
                                l2norm_qk ? 1 : 0},
-           q, "ftrainKdaBackward");
+           qs, "ftrainKdaBackward");
     return {dq, dk, dv, dg, dbeta, da_log, ddt_bias};
 }
 
@@ -169,13 +183,15 @@ PYBIND11_MODULE(_flash_train_torch, m) {
     m.doc() = "flash-train PyTorch bindings";
     m.def("gemm", &gemm, "d = alpha * (a @ b) + beta * c on the current stream", py::arg("a"), py::arg("b"),
           py::arg("c") = std::nullopt, py::arg("alpha") = 1.0, py::arg("beta") = 0.0);
-    m.def("kda_forward", &kdaForward, "KDA forward on the current stream -> (o, q_rstd, k_rstd, aqk, akk, state)",
-          py::arg("q"), py::arg("k"), py::arg("v"), py::arg("g"), py::arg("beta"), py::arg("a_log"), py::arg("dt_bias"),
+    m.def("kda_forward", &kdaForward,
+          "KDA forward on the current stream -> (o, q_rstd, k_rstd, aqk, akk, qn, kn, h, state)", py::arg("q"),
+          py::arg("k"), py::arg("v"), py::arg("g"), py::arg("beta"), py::arg("a_log"), py::arg("dt_bias"),
           py::arg("cu_seqlens"), py::arg("scale"), py::arg("lower_bound"), py::arg("gate_in_kernel"),
-          py::arg("l2norm_qk"), py::arg("keep_state") = false);
+          py::arg("l2norm_qk"), py::arg("keep_state") = false, py::arg("save_qkn") = false, py::arg("save_h") = false);
     m.def("kda_backward", &kdaBackward,
           "KDA backward on the current stream -> (dq, dk, dv, dg, dbeta, da_log, ddt_bias)", py::arg("d_o"),
           py::arg("q"), py::arg("k"), py::arg("v"), py::arg("g"), py::arg("beta"), py::arg("a_log"), py::arg("dt_bias"),
-          py::arg("cu_seqlens"), py::arg("q_rstd"), py::arg("k_rstd"), py::arg("aqk"), py::arg("akk"), py::arg("state"),
-          py::arg("scale"), py::arg("lower_bound"), py::arg("gate_in_kernel"), py::arg("l2norm_qk"));
+          py::arg("cu_seqlens"), py::arg("q_rstd"), py::arg("k_rstd"), py::arg("aqk"), py::arg("akk"), py::arg("qn"),
+          py::arg("kn"), py::arg("h"), py::arg("state"), py::arg("scale"), py::arg("lower_bound"),
+          py::arg("gate_in_kernel"), py::arg("l2norm_qk"));
 }

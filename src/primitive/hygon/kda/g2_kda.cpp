@@ -103,6 +103,9 @@ Result G2KdaForward::isApplicable(const KdaForwardProblem& problem, const Constr
                            {P::kKRstd,     fp32                             },
                            {P::kAqk,       bf16                             },
                            {P::kAkk,       bf16                             },
+                           {P::kQn,        bf16                             },
+                           {P::kKn,        bf16                             },
+                           {P::kH,         bf16                             },
                            {P::kState,     bf16                             }
     });
 }
@@ -126,6 +129,9 @@ void G2KdaForward::configure(const KdaForwardProblem& problem) {
     args_.k_rstd                    = problem.getAddress(P::kKRstd);
     args_.aqk                       = problem.getAddress(P::kAqk);
     args_.akk                       = problem.getAddress(P::kAkk);
+    args_.qn                        = problem.getAddress(P::kQn);
+    args_.kn                        = problem.getAddress(P::kKn);
+    args_.saved_h                   = problem.getAddress(P::kH);
     splitState<void*>(problem.getAddress(P::kState), shape_, args_.state_hbn, args_.state_vn, args_.state_anv);
     args_.scale       = attributes.getScale();
     args_.lower_bound = attributes.getLowerBound();
@@ -160,6 +166,8 @@ Result G2KdaBackward::isApplicable(const KdaBackwardProblem& problem, const Cons
                            {P::kKRstd,     fp32                     },
                            {P::kAqk,       bf16                     },
                            {P::kAkk,       bf16                     },
+                           {P::kQn,        bf16                     },
+                           {P::kKn,        bf16                     },
                            {P::kDq,        bf16                     },
                            {P::kDk,        bf16                     },
                            {P::kDv,        bf16                     },
@@ -167,6 +175,7 @@ Result G2KdaBackward::isApplicable(const KdaBackwardProblem& problem, const Cons
                            {P::kDBeta,     fp32                     },
                            {P::kDALog,     fp32                     },
                            {P::kDDtBias,   fp32                     },
+                           {P::kH,         bf16                     },
                            {P::kState,     bf16                     }
     });
 }
@@ -180,6 +189,7 @@ void G2KdaBackward::configure(const KdaBackwardProblem& problem) {
     const KdaAttributes& attributes = problem.getAttributes();
     shape_                          = makeShape(problem.getShape(), attributes, problem.hasMemory(P::kCuSeqlens));
     shape_.has_state                = problem.hasMemory(P::kState);
+    shape_.has_saved_h              = problem.hasMemory(P::kH);
     args_.d_o                       = problem.getAddress(P::kDO);
     args_.q                         = problem.getAddress(P::kQ);
     args_.k                         = problem.getAddress(P::kK);
@@ -193,6 +203,8 @@ void G2KdaBackward::configure(const KdaBackwardProblem& problem) {
     args_.k_rstd                    = problem.getAddress(P::kKRstd);
     args_.aqk                       = problem.getAddress(P::kAqk);
     args_.akk                       = problem.getAddress(P::kAkk);
+    args_.qn                        = problem.getAddress(P::kQn);
+    args_.kn                        = problem.getAddress(P::kKn);
     args_.dq                        = problem.getAddress(P::kDq);
     args_.dk                        = problem.getAddress(P::kDk);
     args_.dv                        = problem.getAddress(P::kDv);
@@ -200,6 +212,7 @@ void G2KdaBackward::configure(const KdaBackwardProblem& problem) {
     args_.dbeta                     = problem.getAddress(P::kDBeta);
     args_.da_log                    = problem.getAddress(P::kDALog);
     args_.ddt_bias                  = problem.getAddress(P::kDDtBias);
+    args_.saved_h                   = problem.getAddress(P::kH);
     splitState<const void*>(problem.getAddress(P::kState), shape_, args_.state_hbn, args_.state_vn, args_.state_anv);
     args_.scale       = attributes.getScale();
     args_.lower_bound = attributes.getLowerBound();

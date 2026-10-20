@@ -128,31 +128,62 @@ def test_rejects_decay_below_bound():
         ft.kimi_delta_attention(x["q"], x["k"], x["v"], x["g"] - 10.0, x["beta"])
 
 
-def _with_keep(mode, fn):
-    old = os.environ.get("FLASH_TRAIN_KDA_KEEP_STATE")
-    os.environ["FLASH_TRAIN_KDA_KEEP_STATE"] = mode
+def _with_env(env, fn):
+    old = {k: os.environ.get(k) for k in env}
+    os.environ.update(env)
     try:
         return fn()
     finally:
-        if old is None:
-            os.environ.pop("FLASH_TRAIN_KDA_KEEP_STATE")
-        else:
-            os.environ["FLASH_TRAIN_KDA_KEEP_STATE"] = old
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k)
+            else:
+                os.environ[k] = v
 
 
+def _with_keep(mode, fn):
+    # keep-state only: saved-h (the default at H <= 48) would take its place
+    return _with_env({"FLASH_TRAIN_KDA_KEEP_STATE": mode, "FLASH_TRAIN_KDA_SAVE_H": "0"}, fn)
+
+
+# What the forward saves for the backward: recompute everything / keep-state / saved-h, each
+# with q, k or with the saved qn, kn. Every route is bit-identical to the full recompute.
+ROUTES = {
+    "keep": {"FLASH_TRAIN_KDA_KEEP_STATE": "1", "FLASH_TRAIN_KDA_SAVE_H": "0", "FLASH_TRAIN_KDA_SAVE_QKN": "0"},
+    "keep+qkn": {"FLASH_TRAIN_KDA_KEEP_STATE": "1", "FLASH_TRAIN_KDA_SAVE_H": "0", "FLASH_TRAIN_KDA_SAVE_QKN": "1"},
+    "h": {"FLASH_TRAIN_KDA_KEEP_STATE": "0", "FLASH_TRAIN_KDA_SAVE_H": "1", "FLASH_TRAIN_KDA_SAVE_QKN": "0"},
+    "h+qkn": {"FLASH_TRAIN_KDA_KEEP_STATE": "0", "FLASH_TRAIN_KDA_SAVE_H": "1", "FLASH_TRAIN_KDA_SAVE_QKN": "1"},
+    "qkn": {"FLASH_TRAIN_KDA_KEEP_STATE": "0", "FLASH_TRAIN_KDA_SAVE_H": "0", "FLASH_TRAIN_KDA_SAVE_QKN": "1"},
+}
+RECOMPUTE = {"FLASH_TRAIN_KDA_KEEP_STATE": "0", "FLASH_TRAIN_KDA_SAVE_H": "0", "FLASH_TRAIN_KDA_SAVE_QKN": "0"}
+
+
+@pytest.mark.parametrize("route", sorted(ROUTES))
 @pytest.mark.parametrize("gate_in_kernel", [True, False])
 @pytest.mark.parametrize("T,H,cu", CASES)
-def test_keep_state_is_bit_identical(T, H, cu, gate_in_kernel):
-    """The forward handing its recurrent state to the backward (instead of the backward
-    recomputing it) changes nothing: o and every gradient bit for bit."""
+def test_saved_routes_are_bit_identical(T, H, cu, gate_in_kernel, route):
+    """The forward handing qn / kn, h or its full recurrent state to the backward (instead of
+    the backward recomputing them) changes nothing: o and every gradient bit for bit."""
     x = make_inputs(T, H, gate_in_kernel, seed=2 * T + H)
     d_o = make_d_o(T, H, seed=2 * T + H + 1)
     cu_t = torch.tensor(cu, dtype=torch.int32, device="cuda") if cu is not None else None
-    a = _with_keep("0", lambda: run(ft.kimi_delta_attention, x, d_o, cu_seqlens=cu_t))
-    b = _with_keep("1", lambda: run(ft.kimi_delta_attention, x, d_o, cu_seqlens=cu_t))
+    a = _with_env(RECOMPUTE, lambda: run(ft.kimi_delta_attention, x, d_o, cu_seqlens=cu_t))
+    b = _with_env(ROUTES[route], lambda: run(ft.kimi_delta_attention, x, d_o, cu_seqlens=cu_t))
     assert torch.equal(a[0], b[0])
     for name in x:
         assert torch.equal(a[1][name], b[1][name]), name
+
+
+def test_saved_h_skips_the_backward_recurrence():
+    """Saved-h (the default at H <= 48): a plain training step launches the recurrence once
+    (forward only); with it off the backward recomputes it."""
+    T, H = 512, 4
+    x = make_inputs(T, H, True, seed=7)
+    d_o = make_d_o(T, H, seed=8)
+    step = lambda: run(ft.kimi_delta_attention, x, d_o)
+    assert _with_env({"FLASH_TRAIN_KDA_SAVE_H": "auto"}, lambda: _recurrence_launches(step)) == 1
+    assert _with_env({"FLASH_TRAIN_KDA_SAVE_H": "0", "FLASH_TRAIN_KDA_KEEP_STATE": "0"},
+                     lambda: _recurrence_launches(step)) == 2
 
 
 def _recurrence_launches(fn):

@@ -59,6 +59,8 @@ struct WuParams {
     int stop;      // T2 staged timing (G2_WU_STOP): 0 = full kernel; 1..9 return
                    // right after the named stage (uniform branch, no data effect)
     int kp = 0;    // kra P-61e: Kn lane-permuted (H <= KPERM_MAX_H)
+    const short* HbN = nullptr;   // kra P-82: saved bN(h) -> v_new = u - W h formed here (VnOut)
+    short* VnOut = nullptr;
 };
 
 // vB-layout quad base for source quad (row j, column vq..vq+3): A form with the
@@ -111,7 +113,7 @@ __device__ __forceinline__ void wu_emit16s(short* dst, const short* tile, int ti
 template <bool VL, bool KS = false, bool QS = false>   // kra P-84b: KS; P-84c: QS
 __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p_) {
     // kra P-35: field-wise copy, pointers stamped global (global_* ops, not flat)
-    const WuParams p{g2_glb(p_.k), g2_glb(p_.v), g2_glb(p_.q), g2_glb(p_.beta), g2_glb(p_.A), g2_glb(p_.g), g2_glb(p_.Wn), g2_glb(p_.Wb), g2_glb(p_.Un), g2_glb(p_.KgA), g2_glb(p_.Kn), g2_glb(p_.Qn), g2_glb(p_.kgB), g2_glb(p_.vB), p_.H, p_.NT, g2_glb(p_.ctok), g2_glb(p_.clen), p_.stop, p_.kp};
+    const WuParams p{g2_glb(p_.k), g2_glb(p_.v), g2_glb(p_.q), g2_glb(p_.beta), g2_glb(p_.A), g2_glb(p_.g), g2_glb(p_.Wn), g2_glb(p_.Wb), g2_glb(p_.Un), g2_glb(p_.KgA), g2_glb(p_.Kn), g2_glb(p_.Qn), g2_glb(p_.kgB), g2_glb(p_.vB), p_.H, p_.NT, g2_glb(p_.ctok), g2_glb(p_.clen), p_.stop, p_.kp, g2_glb(p_.HbN), g2_glb(p_.VnOut)};   // kra P-82
     const int i = blockIdx.x, hh = blockIdx.y, tid = threadIdx.x;
     const int wv = tid >> 6, l = tid & 63;
     __shared__ __align__(16) short slab[128 * kPadJ2];
@@ -153,6 +155,7 @@ __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p_) {
         // native columns: Wn (A form) is ONE aligned 8B quad store per lane and Wb
         // (B form) lands at native stride 4.  The u phase stages vbT with identity
         // rows and only uses the C-form emit (the C form IS the fragment layout).
+        v4bh wA[8];   // kra P-82: the w phase's A fragments (== fwd_h_bn's wf for this wave / lane)
         auto mmac_phase = [&](short* outA, short* outB, short* outC, int stop_acc) {
             __syncthreads();
             f4 acc[8];
@@ -174,6 +177,55 @@ __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p_) {
             for (int vt = 0; vt < 8; ++vt)
                 #pragma unroll
                 for (int e = 0; e < 4; ++e) we8[vt][e] = bf_rne(acc[vt][e]);
+            if (p.VnOut != nullptr && stop_acc == 2) {   // kra P-82: keep W for v_new
+                #pragma unroll
+                for (int vt = 0; vt < 8; ++vt) wA[vt] = we8[vt];
+            }
+            if (p.VnOut != nullptr && stop_acc == 5) {   // kra P-82: v_new = u - W h (fwd_h_bn's GEMM1 + rounding)
+                short* hb = slab;                        // 2 x [32 v][kPadK] hB tiles
+                const int m = l & 15, q4 = l >> 4;
+                #pragma unroll   // static we8 indices (R55: a runtime vs puts we8 in scratch)
+                for (int pr = 0; pr < 2; ++pr) {
+                    __syncthreads();                     // slab free: MMAC reads / previous pair's reads done
+                    #pragma unroll
+                    for (int it = 0; it < 8; ++it) {     // 2 slabs x 8 kb x 2 vt x 64 lanes v4bh / 256 threads
+                        const int jj = tid + 256 * it;
+                        const int ln = jj & 63, vt = (jj >> 6) & 1, kb = (jj >> 7) & 7, sp = jj >> 10;
+                        const int vs = 2 * pr + sp;
+                        const v4bh val = *reinterpret_cast<const v4bh*>(
+                            p.HbN + ((((size_t)i * p.H + hh) * 8 + kb) * 8 + (2 * vs + vt)) * 256 + ln * 4);
+                        const int qq = ln >> 4, mm = ln & 15;
+                        #pragma unroll
+                        for (int e = 0; e < 4; ++e)
+                            hb[sp * 32 * kPadK + (16 * vt + 4 * qq + e) * kPadK + 16 * kb + pi16(mm)] = val[e];
+                    }
+                    __syncthreads();
+                    #pragma unroll
+                    for (int sp = 0; sp < 2; ++sp) {
+                        const int vs = 2 * pr + sp;
+                        const short* hs = hb + sp * 32 * kPadK;
+                        f4 acc0 = f4{0.f, 0.f, 0.f, 0.f}, acc1 = f4{0.f, 0.f, 0.f, 0.f};
+                        #pragma unroll
+                        for (int kt = 0; kt < 8; ++kt) {
+                            const v4bh hbf0 = *reinterpret_cast<const v4bh*>(hs + (0 * 16 + m) * kPadK + 16 * kt + q4 * 4);
+                            const v4bh hbf1 = *reinterpret_cast<const v4bh*>(hs + (1 * 16 + m) * kPadK + 16 * kt + q4 * 4);
+                            acc0 = mmac(wA[kt], hbf0, acc0);
+                            acc1 = mmac(wA[kt], hbf1, acc1);
+                        }
+                        v4bh x0, x1;
+                        #pragma unroll
+                        for (int e = 0; e < 4; ++e) {
+                            const float u0 = __uint_as_float(((uint32_t)(unsigned short)we8[2 * vs][e]) << 16);
+                            const float u1 = __uint_as_float(((uint32_t)(unsigned short)we8[2 * vs + 1][e]) << 16);
+                            x0[e] = bf_rne(u0 - acc0[e]);
+                            x1[e] = bf_rne(u1 - acc1[e]);
+                        }
+                        *reinterpret_cast<v4bh*>(p.VnOut + nblk + (size_t)(8 * wv + 2 * vs + 0) * 256 + l * 4) = x0;
+                        *reinterpret_cast<v4bh*>(p.VnOut + nblk + (size_t)(8 * wv + 2 * vs + 1) * 256 + l * 4) = x1;
+                    }
+                }
+                __syncthreads();                         // slab reuse by the next phase
+            }
             // kra L16: C form (outC) and pi-staged A form (outA: 4(l&15) + 64(l>>4) == 4l) put
             // lane l's quad of sub-block vt + 8wv at slot l, so the vt pair (2j, 2j+1) is ONE
             // full 16 B store at nat16 position base(2j + 8wv) + 8l.
@@ -385,7 +437,8 @@ extern "C" int g2_wu(const void* k, const void* v, const void* q, const void* be
                      const void* A, const void* g,
                      void* Wn, void* Wb, void* Un, void* KgA, void* Kn, void* Qn,
                      void* kgB, void* vB,
-                     int B, int T, int H, const int* ctok, const int* clen, hipStream_t s) {
+                     int B, int T, int H, const int* ctok, const int* clen,
+                     const void* hbn, void* vn_out, hipStream_t s) {   // kra P-82
     // T = chunk-padded rows (NT = T/64); with ctok/clen the row inputs are packed.
     if (B != 1 || T % 64 || ((ctok == nullptr) != (clen == nullptr))) return -1;
     int stop = 0;
@@ -396,6 +449,7 @@ extern "C" int g2_wu(const void* k, const void* v, const void* q, const void* be
                    (short*)kgB, (short*)vB,
                    H, T / 64, ctok, clen, stop};
     p.kp = H <= g2::g2_env_long("KDA_G2_KPERM_MAX_H", 20);   // kra P-61e
+    p.HbN = (const short*)hbn; p.VnOut = (short*)vn_out;      // kra P-82
     const bool ks = g2::g2_env_long("KDA_G2_WU_KS", 1) != 0;   // kra P-84b (default on)
     const bool qs = g2::g2_env_long("KDA_G2_WU_QS", 1) != 0;   // kra P-84c (default on)
     if (ctok) {

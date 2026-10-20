@@ -56,35 +56,52 @@ FTRAIN_API FTrainStatus ftrainGemm(FTrainStorageView a, FTrainStorageView b, FTr
  * tensors q_rstd, k_rstd [T, H] fp32 (l2norm_qk only) and aqk, akk [T, H, 64] bf16 are
  * outputs the backward consumes. Unused ports take null memory.
  *
- * state (optional output, bf16 [ftrainKdaStateElements(T, H, N, has_cu_seqlens)], opaque layout):
- * when given, the forward also writes its recurrent state for the backward, which then skips
- * recomputing it. Meant for activation-checkpoint recompute (the forward runs right before the
- * backward, so the buffer is short-lived); results are bit-identical either way.
+ * Optional outputs the backward can consume instead of recomputing (all bit-identical to the
+ * recompute; each costs saved memory and gains backward time):
+ * - qn, kn (bf16 [T, H, 128], l2norm_qk only, both or neither): the l2-normalized q / k. The
+ *   backward then needs neither q nor k (they may take null memory there), so saving qn / kn
+ *   instead of q / k costs no extra memory when the caller does not keep q / k anyway.
+ * - h (bf16 [ftrainKdaSavedHElements(T, H, N, has_cu_seqlens)], opaque layout): the recurrent
+ *   state h, 512 B per token and head; the backward then runs no recurrence of its own.
+ *   Recommended whenever a backward follows and H <= 48 (measured faster on gfx936).
+ * - state (bf16 [ftrainKdaStateElements(T, H, N, has_cu_seqlens)], opaque layout): h plus the
+ *   backward's v_new operands, 1024 B per token and head. Meant for activation-checkpoint
+ *   recompute at H > 48 (the forward runs right before the backward, so the buffer is
+ *   short-lived). Exclusive with h.
  */
 typedef struct {
     FTrainStorageView q, k, v, g, beta, a_log, dt_bias, cu_seqlens;
     FTrainStorageView o, q_rstd, k_rstd, aqk, akk;
+    FTrainStorageView qn, kn, h;
     FTrainStorageView state;
 } FTrainKdaForwardTensors;
 
-/** @brief The Tensor ports of one KDA backward call (see ftrainPatternAddKdaBackward); state is
- * the forward's optional state output (null memory when the forward did not write one). The
- * outputs dq, dk, dg also serve as scratch during the call and must not alias any input. */
+/** @brief The Tensor ports of one KDA backward call (see ftrainPatternAddKdaBackward); qn, kn,
+ * h and state are the forward's optional outputs (null memory when the forward did not write
+ * them; with qn / kn given, q / k may take null memory). The outputs dq, dk, dg also serve as
+ * scratch during the call and must not alias any input. */
 typedef struct {
     FTrainStorageView d_o, q, k, v, g, beta, a_log, dt_bias, cu_seqlens, q_rstd, k_rstd, aqk, akk;
+    FTrainStorageView qn, kn;
     FTrainStorageView dq, dk, dv, dg, dbeta, da_log, ddt_bias;
+    FTrainStorageView h;
     FTrainStorageView state;
 } FTrainKdaBackwardTensors;
 
-/**
- * @brief Element count of the optional KDA state port for T packed tokens, H heads and N
- * sequences: H * C * 32768, with C = T / 64 for one sequence of T % 64 == 0 rows, else
- * ceil(T / 64) + N (the chunk capacity of the packed layout).
- */
+/** @brief Chunks of the packed layout for T tokens and N sequences: T / 64 for one sequence of
+ * T % 64 == 0 rows, else ceil(T / 64) + N. */
+static inline int64_t ftrainKdaChunks(int64_t tokens, int64_t seqs, int has_cu_seqlens) {
+    return (!has_cu_seqlens && tokens % 64 == 0) ? tokens / 64 : (tokens + 63) / 64 + (has_cu_seqlens ? seqs : 1);
+}
+
+/** @brief Element count of the optional KDA state port: H * ftrainKdaChunks(T, N) * 32768. */
 static inline uint64_t ftrainKdaStateElements(int64_t tokens, int64_t heads, int64_t seqs, int has_cu_seqlens) {
-    const int64_t chunks =
-        (!has_cu_seqlens && tokens % 64 == 0) ? tokens / 64 : (tokens + 63) / 64 + (has_cu_seqlens ? seqs : 1);
-    return (uint64_t)heads * (uint64_t)chunks * 32768u;
+    return (uint64_t)heads * (uint64_t)ftrainKdaChunks(tokens, seqs, has_cu_seqlens) * 32768u;
+}
+
+/** @brief Element count of the optional KDA h port: H * ftrainKdaChunks(T, N) * 16384. */
+static inline uint64_t ftrainKdaSavedHElements(int64_t tokens, int64_t heads, int64_t seqs, int has_cu_seqlens) {
+    return (uint64_t)heads * (uint64_t)ftrainKdaChunks(tokens, seqs, has_cu_seqlens) * 16384u;
 }
 
 /**

@@ -29,6 +29,12 @@ from ._flash_train_torch import kda_forward as _kda_forward
 # The chunk algorithm's safe-gate range: the per-token log decay must stay >= this.
 DECAY_LOWER_BOUND = -5.0
 
+# Saved-h (the forward saves the recurrent state h, 512 B per token and head, and the backward runs
+# no recurrence) is the default up to this many heads per call: measured faster than both the
+# backward recompute and the keep-state hand-over on gfx936 (H = 12 .. 48); at H = 96 the forward's
+# extra h store does not pay and the backward recomputes (or takes the keep-state hand-over).
+SAVE_H_MAX_HEADS = 48
+
 
 def _thd(x, name):
     if x.dim() == 4:
@@ -57,22 +63,46 @@ def _keep_state(ctx):
             and torch._C._autograd._top_saved_tensors_default_hooks(False) is None)
 
 
+def _save_h(ctx, heads):
+    """Should the forward save its recurrent state h (512 B per token and head) so the backward
+    runs no recurrence (bit-identical either way)?
+
+    FLASH_TRAIN_KDA_SAVE_H=auto (default): whenever a backward follows and heads <= SAVE_H_MAX_HEADS;
+    it then also replaces the keep-state hand-over. 1: whenever a backward follows; 0: never."""
+    mode = os.environ.get("FLASH_TRAIN_KDA_SAVE_H", "auto").strip()
+    if mode == "0" or not any(ctx.needs_input_grad):
+        return False
+    return mode == "1" or heads <= SAVE_H_MAX_HEADS
+
+
+def _save_qkn(ctx, l2norm):
+    """Should the forward save the l2-normalized qn / kn instead of q / k (the backward then skips
+    rebuilding them; same bytes saved)? FLASH_TRAIN_KDA_SAVE_QKN=1 (default) / 0."""
+    return (l2norm and any(ctx.needs_input_grad)
+            and os.environ.get("FLASH_TRAIN_KDA_SAVE_QKN", "1").strip() != "0")
+
+
 class _KdaFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, g, beta, a_log, dt_bias, cu_seqlens, scale, lower_bound, l2norm):
         gate = a_log is not None
-        o, q_rstd, k_rstd, aqk, akk, state = _kda_forward(q, k, v, g, beta, a_log, dt_bias, cu_seqlens, scale,
-                                                          lower_bound, gate, l2norm, _keep_state(ctx))
-        ctx.save_for_backward(q, k, v, g, beta, a_log, dt_bias, cu_seqlens, q_rstd, k_rstd, aqk, akk, state)
+        save_h = _save_h(ctx, q.shape[1])
+        save_qkn = _save_qkn(ctx, l2norm) and q.numel() > 0
+        keep = _keep_state(ctx) and not save_h
+        o, q_rstd, k_rstd, aqk, akk, qn, kn, h, state = _kda_forward(
+            q, k, v, g, beta, a_log, dt_bias, cu_seqlens, scale, lower_bound, gate, l2norm, keep, save_qkn, save_h)
+        q_sv, k_sv = (None, None) if save_qkn else (q, k)   # qn / kn replace q / k in the saved set
+        ctx.save_for_backward(q_sv, k_sv, v, g, beta, a_log, dt_bias, cu_seqlens, q_rstd, k_rstd, aqk, akk,
+                              qn, kn, h, state)
         ctx.scale, ctx.lower_bound, ctx.gate, ctx.l2norm = scale, lower_bound, gate, l2norm
         return o
 
     @staticmethod
     def backward(ctx, d_o):
-        q, k, v, g, beta, a_log, dt_bias, cu_seqlens, q_rstd, k_rstd, aqk, akk, state = ctx.saved_tensors
+        q, k, v, g, beta, a_log, dt_bias, cu_seqlens, q_rstd, k_rstd, aqk, akk, qn, kn, h, state = ctx.saved_tensors
         dq, dk, dv, dg, dbeta, da_log, ddt_bias = _kda_backward(
-            d_o.contiguous(), q, k, v, g, beta, a_log, dt_bias, cu_seqlens, q_rstd, k_rstd, aqk, akk, state,
-            ctx.scale, ctx.lower_bound, ctx.gate, ctx.l2norm)
+            d_o.contiguous(), q, k, v, g, beta, a_log, dt_bias, cu_seqlens, q_rstd, k_rstd, aqk, akk, qn, kn, h,
+            state, ctx.scale, ctx.lower_bound, ctx.gate, ctx.l2norm)
         if not ctx.gate:
             da_log = ddt_bias = None
         return dq, dk, dv, dg, dbeta, da_log, ddt_bias, None, None, None, None
