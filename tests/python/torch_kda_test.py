@@ -186,6 +186,41 @@ def test_saved_h_skips_the_backward_recurrence():
                      lambda: _recurrence_launches(step)) == 2
 
 
+def test_no_grad_forward_saves_nothing(monkeypatch):
+    """A forward under no_grad (inference, an activation checkpoint's first pass) writes none of
+    the optional backward outputs, although needs_input_grad stays True there."""
+    import flash_train.torch.kda as kda_mod
+    seen = []
+    real = kda_mod._kda_forward
+
+    def spy(*args):
+        seen.append(args[-3:])  # keep_state, save_qkn, save_h
+        return real(*args)
+    monkeypatch.setattr(kda_mod, "_kda_forward", spy)
+    x = {n: t.requires_grad_(True) for n, t in make_inputs(128, 2, True, seed=9).items()}
+    call = lambda: ft.kimi_delta_attention(x["q"], x["k"], x["v"], x["g"], x["beta"], A_log=x["A_log"],
+                                           dt_bias=x["dt_bias"])
+    with torch.no_grad():
+        a = call()
+    b = call()
+    assert seen == [(False, False, False), (False, True, True)]
+    assert torch.equal(a, b.detach())
+
+
+def test_dq_dk_buffer_hosts_the_gate_scratch():
+    """With qn / kn saved, dq | dk come back as one buffer that hosted the gate scratch; the
+    gradients equal the q / k route bit for bit."""
+    T, H = 256, 2
+    x = make_inputs(T, H, True, seed=10)
+    d_o = make_d_o(T, H, seed=11)
+    a = _with_env(ROUTES["qkn"], lambda: run(ft.kimi_delta_attention, x, d_o))
+    b = _with_env(RECOMPUTE, lambda: run(ft.kimi_delta_attention, x, d_o))
+    dq, dk = a[1]["q"], a[1]["k"]
+    assert dk.data_ptr() == dq.data_ptr() + dq.numel() * dq.element_size()
+    for name in x:
+        assert torch.equal(a[1][name], b[1][name]), name
+
+
 def _fla_inputs(B, T, H, seed):
     gen = torch.Generator(device="cuda").manual_seed(seed)
     r = lambda *s: torch.randn(*s, device="cuda", generator=gen)

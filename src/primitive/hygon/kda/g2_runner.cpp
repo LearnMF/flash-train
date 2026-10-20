@@ -176,7 +176,7 @@ BackwardLayout layoutBackward(const Shape& shape, void* base, std::uint64_t* use
     Arena a(base);
     BackwardLayout L{};
     L.tab                   = takeTables(a, shape, z);
-    L.g                     = a.take(z.rows128() * 4);
+    L.g                     = shape.g_in_dqdk ? nullptr : a.take(z.rows128() * 4);   // else staged in dq | dk
     L.Gn                    = a.take(z.CH * 128 * 4);
     L.GnRaw                 = a.take(z.CH * 128 * 4);   // kra P-52
     L.GnNat                 = g2KpLayout(static_cast<long>(z.H)) ? a.take(z.CH * 128 * 4) : nullptr;   // kra P-61e
@@ -279,7 +279,10 @@ void forward(const Shape& shape, const ForwardArgs& p, void* workspace, FTrainSt
 void backward(const Shape& shape, const BackwardArgs& p, void* workspace, FTrainStream stream) {
     const Sizes z(shape);
     if (z.T == 0 || z.H == 0) { return; }
-    const BackwardLayout L = layoutBackward(shape, workspace, nullptr);
+    BackwardLayout L = layoutBackward(shape, workspace, nullptr);
+    // fp32 g [T, H, 128] == the bytes of bf16 dq | dk: written by the gate, last read by wy, all
+    // before the tail writes dq / dk (whose qn / kn staging the saved qn / kn made unnecessary).
+    if (shape.g_in_dqdk) { L.g = p.dq; }
     const int T = static_cast<int>(z.T), H = static_cast<int>(z.H), NT = static_cast<int>(z.NT);
     const int nseg  = shape.isDense() ? 1 : static_cast<int>(z.N);
     const int *ctok = L.tab.ctok, *clen = L.tab.clen;

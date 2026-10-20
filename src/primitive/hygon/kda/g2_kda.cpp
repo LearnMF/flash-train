@@ -190,6 +190,11 @@ void G2KdaBackward::configure(const KdaBackwardProblem& problem) {
     shape_                          = makeShape(problem.getShape(), attributes, problem.hasMemory(P::kCuSeqlens));
     shape_.has_state                = problem.hasMemory(P::kState);
     shape_.has_saved_h              = problem.hasMemory(P::kH);
+    // dq | dk as one buffer (dk right after dq) host the gate scratch when qn / kn need no staging.
+    const auto row_bytes = static_cast<std::uintptr_t>(problem.getShape().tokens * problem.getShape().heads * 128 * 2);
+    shape_.g_in_dqdk     = problem.hasMemory(P::kQn) && problem.hasMemory(P::kDq) && problem.hasMemory(P::kDk) &&
+                       reinterpret_cast<std::uintptr_t>(problem.getAddress(P::kDk)) ==
+                           reinterpret_cast<std::uintptr_t>(problem.getAddress(P::kDq)) + row_bytes;
     args_.d_o                       = problem.getAddress(P::kDO);
     args_.q                         = problem.getAddress(P::kQ);
     args_.k                         = problem.getAddress(P::kK);

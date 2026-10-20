@@ -160,7 +160,12 @@ std::vector<at::Tensor> kdaBackward(const at::Tensor& d_o, const std::optional<a
     const bool has_qk = q.has_value() && q->defined() && q->numel() > 0;
     TORCH_CHECK(has_qk || (qn.has_value() && qn->defined() && qn->numel() > 0), "kda: backward needs q/k or qn/kn");
     const at::Tensor& qs = has_qk ? *q : *qn;  // the [T, H, K] shape and options of q / k
-    at::Tensor dq = torch::empty_like(qs), dk = torch::empty_like(qs), dv = torch::empty_like(v);
+    // dq | dk as one buffer: with qn / kn saved the backward stages its fp32 gate scratch there
+    // (it would otherwise sit in the workspace beside the two idle outputs).
+    std::vector<int64_t> dqk_shape = {2};
+    dqk_shape.insert(dqk_shape.end(), qs.sizes().begin(), qs.sizes().end());
+    at::Tensor dqk = torch::empty(dqk_shape, qs.options());
+    at::Tensor dq = dqk[0], dk = dqk[1], dv = torch::empty_like(v);
     at::Tensor dg = torch::empty_like(g), dbeta = torch::empty_like(beta);
     auto fopt                              = qs.options().dtype(at::kFloat);
     at::Tensor da_log                      = gate_in_kernel ? torch::empty_like(*a_log) : torch::empty({0}, fopt);

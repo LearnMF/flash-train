@@ -79,7 +79,9 @@ typedef struct {
 /** @brief The Tensor ports of one KDA backward call (see ftrainPatternAddKdaBackward); qn, kn,
  * h and state are the forward's optional outputs (null memory when the forward did not write
  * them; with qn / kn given, q / k may take null memory). The outputs dq, dk, dg also serve as
- * scratch during the call and must not alias any input. */
+ * scratch during the call and must not alias any input. With qn / kn given and dk directly
+ * following dq in memory (one [2, T, H, 128] buffer), the backward also stages its fp32 gate
+ * scratch there: the workspace shrinks by T * H * 512 bytes. */
 typedef struct {
     FTrainStorageView d_o, q, k, v, g, beta, a_log, dt_bias, cu_seqlens, q_rstd, k_rstd, aqk, akk;
     FTrainStorageView qn, kn;

@@ -25,6 +25,9 @@ struct Shape {
                                   //   (BackwardArgs::state_*), so the bN recompute buffers are not needed
     bool has_saved_h    = false;  // backward only: the forward saved h (BackwardArgs::saved_h); wu forms
                                   //   v_new from it, so neither the recompute nor its bN buffer runs
+    bool g_in_dqdk      = false;  // backward only: qn / kn are given and dk directly follows dq in
+                                  //   memory, so the fp32 gate scratch (T * H * 512 B) is staged in
+                                  //   dq | dk (idle until the tail) instead of the workspace
     bool gate_in_kernel = false;  // true: g is the raw K3 gate (bf16), activated in kernel as
                                   //   lower_bound * sigmoid(exp(A_log) * (g + dt_bias));
                                   // false: g is the per-token log decay (fp32), as given
