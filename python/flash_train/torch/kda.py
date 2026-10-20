@@ -142,6 +142,60 @@ def kimi_delta_attention(q, k, v, g, beta, *, cu_seqlens=None, scale=None, A_log
     return o
 
 
+def chunk_kda(q, k, v, g, beta, scale=None, initial_state=None, output_final_state=False,
+              use_qk_l2norm_in_kernel=False, use_gate_in_kernel=False, use_beta_sigmoid_in_kernel=False,
+              allow_neg_eigval=False, safe_gate=False, lower_bound=None, disable_recompute=False,
+              return_intermediate_states=False, state_v_first=False, cu_seqlens=None, cu_seqlens_cpu=None,
+              cp_context=None, chunk_size=64, A_log=None, dt_bias=None, transpose_state_layout=None):
+    """KDA with the signature of FLA's ``fla.ops.kda.chunk_kda``: a drop-in for the Megatron
+    (Megatron-Bridge Kimi K3) call site. Returns ``(o, None)`` with o bf16 [B, T, H, V].
+
+    A layout adapter over :func:`kimi_delta_attention`, bit-identical to calling it on the
+    packed THD tensors: [B, T, H, D] is flattened to [B*T, H, D] (B > 1 without cu_seqlens
+    becomes B packed sequences of T tokens). Gate contracts, as in FLA:
+
+    * ``use_gate_in_kernel=True`` with ``lower_bound`` (``safe_gate``): g is the raw gate,
+      activated in kernel as ``lower_bound * sigmoid(exp(A_log) * (g + dt_bias))`` (Kimi K3);
+    * ``use_gate_in_kernel=False``: g is the per-token log decay (>= -5).
+
+    ``use_beta_sigmoid_in_kernel`` applies ``sigmoid`` (x2 with ``allow_neg_eigval``) to beta
+    on the host. ``disable_recompute``, ``chunk_size`` and ``cu_seqlens_cpu`` are FLA tuning
+    knobs with no effect here (what the forward saves follows FLASH_TRAIN_KDA_SAVE_H /
+    _SAVE_QKN / _KEEP_STATE). Not supported (NotImplementedError): initial / final state,
+    intermediate states, context parallelism, FLA's softplus gate (no ``lower_bound``).
+    """
+    if transpose_state_layout is not None:  # FLA's deprecated name of state_v_first
+        if state_v_first:
+            raise ValueError("chunk_kda: cannot pass both state_v_first and transpose_state_layout")
+    if initial_state is not None or output_final_state or return_intermediate_states:
+        raise NotImplementedError("chunk_kda: initial / final / intermediate states are not supported")
+    if cp_context is not None:
+        raise NotImplementedError("chunk_kda: context parallelism is not supported")
+    if q.dim() != 4:
+        raise ValueError(f"chunk_kda: expected [B, T, H, D] inputs, got {tuple(q.shape)}")
+    B, T, H, K = q.shape
+    if cu_seqlens is not None and B != 1:
+        raise ValueError("chunk_kda: cu_seqlens requires B == 1 (packed sequences)")
+    if B > 1:
+        cu_seqlens = torch.arange(0, B * T + 1, T, dtype=torch.int32, device=q.device)
+    flat = lambda t: t.reshape(B * T, *t.shape[2:])
+    if use_beta_sigmoid_in_kernel:
+        beta = (2.0 if allow_neg_eigval else 1.0) * torch.sigmoid(beta.float())
+    if use_gate_in_kernel:
+        if A_log is None or dt_bias is None:
+            raise ValueError("chunk_kda: use_gate_in_kernel requires A_log and dt_bias")
+        if lower_bound is None:
+            raise NotImplementedError("chunk_kda: the gate needs lower_bound (FLA's safe_gate form)")
+        gate = {"A_log": A_log.reshape(H), "dt_bias": dt_bias.reshape(H * K), "lower_bound": float(lower_bound)}
+    elif A_log is not None or dt_bias is not None:
+        raise ValueError("chunk_kda: A_log / dt_bias require use_gate_in_kernel=True")
+    else:
+        gate = {}
+    o = kimi_delta_attention(flat(q), flat(k), flat(v), flat(g), flat(beta), cu_seqlens=cu_seqlens, scale=scale,
+                             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel, **gate)
+    return o.view(B, T, H, v.shape[-1]), None
+
+
 # ----------------------------------------------------------------------------- reference
 def kda_reference(q, k, v, g, beta, *, cu_seqlens=None, scale=None, A_log=None, dt_bias=None, lower_bound=-5.0,
                   use_qk_l2norm_in_kernel=True, dtype=torch.float64):

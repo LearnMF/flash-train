@@ -186,6 +186,61 @@ def test_saved_h_skips_the_backward_recurrence():
                      lambda: _recurrence_launches(step)) == 2
 
 
+def _fla_inputs(B, T, H, seed):
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    r = lambda *s: torch.randn(*s, device="cuda", generator=gen)
+    return {"q": (r(B, T, H, 128) * 0.3).bfloat16(), "k": (r(B, T, H, 128) * 0.3).bfloat16(),
+            "v": (r(B, T, H, 128) * 0.3).bfloat16(), "g": (r(B, T, H, 128) * 0.3).bfloat16(),
+            "beta": r(B, T, H).sigmoid(),
+            "A_log": torch.log(1.0 + 15.0 * torch.rand(H, device="cuda", generator=gen)),
+            "dt_bias": r(H * 128) * 0.1}
+
+
+def _k3_call(fn, x, d_o, **kw):
+    """Megatron-Bridge's Kimi K3 call (kimi_k3_ops.kda -> chunk_kda), arguments as it passes them."""
+    leaves = {n: t.detach().clone().requires_grad_(True) for n, t in x.items()}
+    o, final_state = fn(leaves["q"], leaves["k"], leaves["v"], leaves["g"], leaves["beta"],
+                        A_log=leaves["A_log"], dt_bias=leaves["dt_bias"], initial_state=None,
+                        output_final_state=False, use_qk_l2norm_in_kernel=True, use_gate_in_kernel=True,
+                        safe_gate=True, lower_bound=-5.0, transpose_state_layout=True, **kw)
+    assert final_state is None
+    grads = torch.autograd.grad(o, list(leaves.values()), d_o)
+    return o.detach(), dict(zip(leaves, grads))
+
+
+@pytest.mark.parametrize("B,T,H,cu", [(1, 512, 4, None), (2, 256, 4, None), (1, 384, 2, [0, 128, 192, 384])])
+def test_chunk_kda_matches_kimi_delta_attention(B, T, H, cu):
+    """flash_train.torch.chunk_kda (FLA's chunk_kda signature, [B, T, H, D]) is a pure layout
+    adapter: bit-identical to kimi_delta_attention on the packed THD tensors."""
+    x = _fla_inputs(B, T, H, seed=B * T + H)
+    d_o = make_d_o(B * T, H, seed=B * T + H + 1).view(B, T, H, 128)
+    cu_t = torch.tensor(cu, dtype=torch.int32, device="cuda") if cu is not None else None
+    o, g = _k3_call(ft.chunk_kda, x, d_o, cu_seqlens=cu_t)
+    assert o.shape == (B, T, H, 128)
+    if B > 1:
+        cu_t = torch.arange(0, B * T + 1, T, dtype=torch.int32, device="cuda")
+    thd = {n: (t.reshape(B * T, *t.shape[2:]) if n not in ("A_log", "dt_bias") else t) for n, t in x.items()}
+    ro, rg = run(ft.kimi_delta_attention, thd, d_o.reshape(B * T, H, 128), cu_seqlens=cu_t)
+    assert torch.equal(o.reshape(B * T, H, 128), ro)
+    for name in x:
+        assert torch.equal(g[name].reshape(rg[name].shape), rg[name]), name
+
+
+def test_chunk_kda_rejects_unsupported_arguments():
+    x = _fla_inputs(1, 64, 2, seed=1)
+    args = (x["q"], x["k"], x["v"], x["g"], x["beta"])
+    k3 = dict(A_log=x["A_log"], dt_bias=x["dt_bias"], use_qk_l2norm_in_kernel=True, use_gate_in_kernel=True,
+              safe_gate=True, lower_bound=-5.0)
+    with pytest.raises(NotImplementedError):
+        ft.chunk_kda(*args, output_final_state=True, **k3)
+    with pytest.raises(NotImplementedError):
+        ft.chunk_kda(*args, initial_state=torch.zeros(1, 2, 128, 128, device="cuda"), **k3)
+    with pytest.raises(NotImplementedError):  # FLA's softplus gate (no lower_bound)
+        ft.chunk_kda(*args, A_log=x["A_log"], dt_bias=x["dt_bias"], use_gate_in_kernel=True)
+    with pytest.raises(TypeError):
+        ft.chunk_kda(*args, not_an_fla_argument=1, **k3)
+
+
 def _recurrence_launches(fn):
     from torch.profiler import ProfilerActivity, profile
     with profile(activities=[ProfilerActivity.CUDA]) as p:

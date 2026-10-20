@@ -77,6 +77,27 @@ o.sum().backward()                                      # 支持 autograd：q/k/
 | `FLASH_TRAIN_KDA_SAVE_H` | `auto` | 前向保存递推状态 h（每 token·head 512 B），反向不再跑递推。`auto` 在 H ≤ 48 时开启（gfx936 实测更快），`1` 总是开启，`0` 关闭 |
 | `FLASH_TRAIN_KDA_KEEP_STATE` | `auto` | 前向交给反向完整状态（h 加 v_new，每 token·head 1024 B），只在 SAVE_H 未开启时生效。`auto` 只在可重入激活重算（Megatron 的 recompute、`torch.utils.checkpoint(use_reentrant=True)`）的重算前向里开启 |
 
+### 在 Megatron 等训练框架中接入（与 FLA 的 `chunk_kda` 对齐）
+
+`flash_train.torch.chunk_kda` 的签名与 FLA 的 `fla.ops.kda.chunk_kda` 相同，输入为 `[B, T, H, 128]`，返回 `(o, None)`。在训练框架里只需要换 import：
+
+```python
+# 原来：from fla.ops.kda import chunk_kda
+from flash_train.torch import chunk_kda
+
+# Megatron-Bridge Kimi K3（kimi_k3_ops.kda）现有的调用，参数不变：
+o, _ = chunk_kda(q, k, v, forget_gate, beta,              # q/k/v/forget_gate: bf16 [B, T, H, 128]; beta: fp32 [B, T, H]
+                 A_log=A_log, dt_bias=dt_bias, lower_bound=lower_bound,
+                 initial_state=None, output_final_state=False,
+                 use_qk_l2norm_in_kernel=True, use_gate_in_kernel=True, safe_gate=True,
+                 transpose_state_layout=True, cu_seqlens=cu_seqlens)
+```
+
+- 只做布局转换，与在打包 THD 张量上直接调用 `kimi_delta_attention` 逐位一致：`[B, T, H, D]` 展平成 `[B*T, H, D]`；`B > 1` 且不传 `cu_seqlens` 时按 B 条长度为 T 的序列处理；传 `cu_seqlens` 时要求 `B == 1`（与 FLA 相同）。
+- gate：`use_gate_in_kernel=True` 时要求给出 `A_log`、`dt_bias` 和 `lower_bound`（FLA 的 safe_gate 形式，即 K3 的用法）；`use_gate_in_kernel=False` 时 g 是逐 token log 衰减。`use_beta_sigmoid_in_kernel=True` 时在宿主侧对 beta 做 sigmoid（`allow_neg_eigval` 时乘 2）。
+- `disable_recompute`、`chunk_size`、`cu_seqlens_cpu` 是 FLA 的调优参数，这里接受但不起作用；保存策略见上表。
+- 不支持的参数直接抛异常，不会悄悄回退：`initial_state`、`output_final_state=True`、`return_intermediate_states`、`cp_context`、没有 `lower_bound` 的 softplus gate 抛 `NotImplementedError`；未知关键字抛 `TypeError`。
+
 ### 用 C API 接入 KDA（与 PyTorch 入口同一套端口）
 
 `flash_train.h` 的 `ftrainKdaForward` / `ftrainKdaBackward`（以及对应的 `...GetWorkspaceBytes`）接收 `FTrainKdaForwardTensors` / `FTrainKdaBackwardTensors`；`common.h` 的 `ftrainPatternAddKdaForward` / `ftrainPatternAddKdaBackward` 用同样的端口顺序建 Pattern，用于复用 Plan。
