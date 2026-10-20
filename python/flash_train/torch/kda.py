@@ -129,7 +129,9 @@ def kimi_delta_attention(q, k, v, g, beta, *, cu_seqlens=None, scale=None, A_log
     if scale is None:
         scale = 1.0 / math.sqrt(q.shape[-1])
     if cu_seqlens is not None:
-        cu_seqlens = cu_seqlens.to(device=q.device, dtype=torch.int32).contiguous()
+        # One sequence ([0, T]) is the dense layout: bit-identical, and the dense kernel instances
+        # are faster than the packed ones (no host read of cu_seqlens needed to tell).
+        cu_seqlens = None if cu_seqlens.numel() == 2 else cu_seqlens.to(device=q.device, dtype=torch.int32).contiguous()
     if A_log is not None:
         if dt_bias is None:
             raise ValueError("kimi_delta_attention: A_log requires dt_bias")
