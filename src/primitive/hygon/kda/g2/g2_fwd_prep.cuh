@@ -1,5 +1,5 @@
 // Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 //
 // Vendored from the hip_kda G2 kernels (csrc/g2); kept byte-aligned with upstream.
 // clang-format off

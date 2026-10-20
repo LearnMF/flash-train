@@ -1,5 +1,5 @@
 // Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 
 #ifndef FLASH_TRAIN_TORCH_KDA_BRIDGE_H_
 #define FLASH_TRAIN_TORCH_KDA_BRIDGE_H_

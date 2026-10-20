@@ -1,5 +1,5 @@
 # Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: Apache-2.0
 """KDA 基准：基线为 PyTorch 组合实现（flash_train.torch.kda.kda_chunked_reference，fp32 chunk 形式），
 被测为 flash_train.torch.kimi_delta_attention；两者都跑前向 + 反向（训练口径）。
 

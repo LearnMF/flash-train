@@ -1,5 +1,5 @@
 // Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 
 // Black-box tests of the KDA convenience C API, written against flash_train.h only: plan-time
 // behavior (status codes, workspace query) needs no device memory, so fake aligned addresses

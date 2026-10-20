@@ -1,5 +1,5 @@
 // Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 
 // The G2 KDA device translation unit: the handwritten gfx936 kernels (g2/) plus the two
 // device-side helpers the host runner needs so that no step synchronizes with the host:
