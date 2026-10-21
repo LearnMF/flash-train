@@ -93,11 +93,26 @@ o, _ = chunk_kda(q, k, v, g, beta, A_log=A_log, dt_bias=dt_bias, lower_bound=-5.
 
 `flash_train.torch.chunk_kda` 的签名与 FLA 的 `fla.ops.kda.chunk_kda` 相同，输入为 `[B, T, H, 128]`，返回 `(o, None)`。Megatron 侧只需要换 import，调用参数不变，**不需要设置任何 flash-train 的环境变量**。
 
-#### 1. 安装
+KDA 的 HIP kernel（G2）已经编译在 flash-train 里（`libflash_train.so`），**不需要另外安装 hip_kda**。
 
-在与训练镜像相同的 DTK 和 PyTorch 环境里构建 wheel（已验证：das 镜像 megatron 0.18.2、DTK 26.04、torch 2.10、Python 3.10）：
+**完整步骤速览**（每一步的细节见下面对应小节）：
+
+1. 在训练镜像里获取 flash-train 源码，编译并安装 wheel（约 3–4 分钟）；
+2. 把 `kimi_k3_ops.kda()` 里的 `from fla.ops.kda import chunk_kda` 换成 `from flash_train.torch import chunk_kda`，参数不动；
+3. 照原来的命令启动训练，用打印或 profiler 确认 KDA 走的是 flash-train。
+
+**环境要求**：BW1000 等 gfx936 卡；K = V = 128（K3 满足）。已验证的镜像为 das megatron 0.18.2（DTK 26.04、torch 2.10、Python 3.10）。
+
+#### 1. 获取源码、编译和安装
+
+在训练用的镜像（容器）里执行。wheel 绑定编译时的 DTK、torch 和 Python 版本，所以要在同一个镜像里编译；换了镜像要重新编译。
 
 ```bash
+git clone -b feat/kda https://github.com/LearnMF/flash-train.git
+cd flash-train
+git checkout <commit>                         # 如果拿到的是指定版本（例如 7aeab8c），先切到该提交
+git rev-parse --short HEAD                    # 记下实际使用的版本，反馈问题时附上
+
 export DTKROOT=/opt/dtk                       # CMake 靠它找到 roctx
 python3 -m pip install pybind11 scikit-build-core
 # 镜像缺 libc6-dev 的开发链接时，链接 torch 绑定会报 librt.so missing：
@@ -107,7 +122,9 @@ python3 -m pip install --no-deps --force-reinstall dist/flash_train-*.whl
 python3 -c "import flash_train.torch as ft; print(ft.__file__, ft.chunk_kda)"
 ```
 
-训练节点只需要安装 wheel，不需要上面的构建依赖。
+- 最后一行应打印出 `.../site-packages/flash_train/torch/__init__.py` 和 `chunk_kda` 函数。
+- 多节点训练时，在一个节点上编译出 `dist/flash_train-*.whl`，其他节点（同一镜像）只需要 `pip install --no-deps` 这个 wheel，不需要上面的编译依赖。
+- wheel 里只有 flash-train 自己：`libflash_train.so`（框架加 KDA kernel）、`_flash_train_torch*.so`（PyTorch 绑定）和 Python 代码。torch、DTK 运行时、FLA 都由镜像提供。
 
 #### 2. 修改调用点
 
@@ -135,6 +152,7 @@ def kda(q, k, v, g, beta, a_log, dt_bias, lower_bound, *, cu_seqlens=None):
 - 打印一次路由：在 `kda()` 里加 `print(chunk_kda.__module__)`，应输出 `flash_train.torch.kda`。
 - 看 profiler：flash-train 路线下 KDA 的 kernel 名都以 `g2::` 开头（如 `g2::p3_wy_s4b_kernel`、`g2::r4::g2_fwd_prep_a_kernel`），不应再出现 FLA 的 Triton kernel（`chunk_kda_*`、`chunk_gated_delta_rule_*`）。
 - 在非 gfx936 卡上（例如 gfx938）会直接抛 `RuntimeError`（`FTRAIN_STATUS_UNSUPPORTED`），不会回退到 FLA；需要回退时由 Megatron 侧捕获异常后改用 FLA。
+- 反馈问题时请附上：flash-train 版本（`git rev-parse --short HEAD`）、镜像、TP / 序列长度 / 是否 packed / 是否全层重算，以及完整报错。
 
 #### 4. 与 Megatron 的配合
 
