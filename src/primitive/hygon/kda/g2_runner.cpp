@@ -8,6 +8,7 @@
 
 #include <hip/hip_runtime.h>
 
+#include "flash_train/env.h"
 #include "flash_train/error.hpp"
 #include "flash_train/primitive/hygon/kda/g2_runner.hpp"
 
@@ -126,10 +127,15 @@ std::uint64_t spread(std::uint64_t spacing, std::uint64_t n) noexcept {
     return 0;
 }
 
-// kra P-61e: the kp layouts (Kn lane-permuted, natural-k recompute decays) -- same rule as the kernels' launchers
+// kra P-61e: the kp layouts (Kn lane-permuted, natural-k recompute decays) -- same rule as the
+// kernels' launchers, including their FTRAIN_KDA_DEV gate (g2_common.h g2_getenv)
 inline bool g2KpLayout(long H) {
-    const char* e = getenv("KDA_G2_KPERM_MAX_H");
-    return H <= (e ? atol(e) : 20);
+    static const bool dev = [] {
+        const char* e = std::getenv(FTRAIN_KDA_DEV);
+        return e != nullptr && *e != '\0' && std::strcmp(e, "0") != 0;
+    }();
+    const char* e = dev ? std::getenv("KDA_G2_KPERM_MAX_H") : nullptr;
+    return H <= (e ? std::atol(e) : 20);
 }
 
 struct Tables {

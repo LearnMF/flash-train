@@ -442,7 +442,7 @@ extern "C" int g2_wu(const void* k, const void* v, const void* q, const void* be
     // T = chunk-padded rows (NT = T/64); with ctok/clen the row inputs are packed.
     if (B != 1 || T % 64 || ((ctok == nullptr) != (clen == nullptr))) return -1;
     int stop = 0;
-    if (const char* e = getenv("G2_WU_STOP")) stop = atoi(e);
+    if (const char* e = g2::g2_getenv("G2_WU_STOP")) stop = atoi(e);
     g2::WuParams p{(const short*)k, (const short*)v, (const short*)q, (const float*)beta,
                    (const short*)A, (const float*)g,
                    (short*)Wn, (short*)Wb, (short*)Un, (short*)KgA, (short*)Kn, (short*)Qn,

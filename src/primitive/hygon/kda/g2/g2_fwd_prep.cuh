@@ -640,7 +640,7 @@ extern "C" int g2_fwd_prep(const void* q, const void* k, const void* v, const vo
                            (short*)QgA, (short*)Kn, (short*)Kb, (float*)R, (float*)q_rstd,
                            (float*)k_rstd, (float*)Gn, ctok, clen, (float)lower_bound,
                            (float)gscale, H, NT, 0};
-    if (const char* e = getenv("G2_PREP_STOP")) pa.stop = atoi(e);
+    if (const char* e = g2::g2_getenv("G2_PREP_STOP")) pa.stop = atoi(e);
     pa.kp = H <= g2::g2_env_long("KDA_G2_KPERM_MAX_H", 20);   // kra P-61e
     pa.qn_out = (short*)qn_out; pa.kn_out = (short*)kn_out;    // kra P-77b
     const dim3 grid(NT, H), blk(256);

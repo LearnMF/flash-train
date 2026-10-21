@@ -14,7 +14,11 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_bf16.h>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <type_traits>
+
+#include "flash_train/env.h"
 
 namespace g2 {
 
@@ -113,8 +117,19 @@ inline size_t g2_lds_topup(K kernel, size_t target_total) {
     if (hipFuncGetAttributes(&a, reinterpret_cast<const void*>(kernel)) != hipSuccess) return 0;
     return a.sharedSizeBytes < target_total ? target_total - a.sharedSizeBytes : 0;
 }
+// flash-train: the G2 tuning knobs (KDA_G2_*, G2_*_STOP) are hip_kda research switches; they are
+// read only under FTRAIN_KDA_DEV (flash_train/env.h), otherwise every knob takes its default, so a
+// training environment set up for hip_kda cannot steer flash-train's kernels.
+inline bool g2_dev() {
+    static const bool on = [] {
+        const char* e = getenv(FTRAIN_KDA_DEV);
+        return e != nullptr && *e != '\0' && strcmp(e, "0") != 0;
+    }();
+    return on;
+}
+inline const char* g2_getenv(const char* name) { return g2_dev() ? getenv(name) : nullptr; }
 inline long g2_env_long(const char* name, long dflt) {
-    const char* e = getenv(name);
+    const char* e = g2_getenv(name);
     return e ? atol(e) : dflt;
 }
 

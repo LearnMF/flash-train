@@ -143,19 +143,19 @@ def _with_env(env, fn):
 
 def _with_keep(mode, fn):
     # keep-state only: saved-h (the default at H <= 48) would take its place
-    return _with_env({"FLASH_TRAIN_KDA_KEEP_STATE": mode, "FLASH_TRAIN_KDA_SAVE_H": "0"}, fn)
+    return _with_env({"FTRAIN_KDA_KEEP_STATE": mode, "FTRAIN_KDA_SAVE_H": "0"}, fn)
 
 
 # What the forward saves for the backward: recompute everything / keep-state / saved-h, each
 # with q, k or with the saved qn, kn. Every route is bit-identical to the full recompute.
 ROUTES = {
-    "keep": {"FLASH_TRAIN_KDA_KEEP_STATE": "1", "FLASH_TRAIN_KDA_SAVE_H": "0", "FLASH_TRAIN_KDA_SAVE_QKN": "0"},
-    "keep+qkn": {"FLASH_TRAIN_KDA_KEEP_STATE": "1", "FLASH_TRAIN_KDA_SAVE_H": "0", "FLASH_TRAIN_KDA_SAVE_QKN": "1"},
-    "h": {"FLASH_TRAIN_KDA_KEEP_STATE": "0", "FLASH_TRAIN_KDA_SAVE_H": "1", "FLASH_TRAIN_KDA_SAVE_QKN": "0"},
-    "h+qkn": {"FLASH_TRAIN_KDA_KEEP_STATE": "0", "FLASH_TRAIN_KDA_SAVE_H": "1", "FLASH_TRAIN_KDA_SAVE_QKN": "1"},
-    "qkn": {"FLASH_TRAIN_KDA_KEEP_STATE": "0", "FLASH_TRAIN_KDA_SAVE_H": "0", "FLASH_TRAIN_KDA_SAVE_QKN": "1"},
+    "keep": {"FTRAIN_KDA_KEEP_STATE": "1", "FTRAIN_KDA_SAVE_H": "0", "FTRAIN_KDA_SAVE_QKN": "0"},
+    "keep+qkn": {"FTRAIN_KDA_KEEP_STATE": "1", "FTRAIN_KDA_SAVE_H": "0", "FTRAIN_KDA_SAVE_QKN": "1"},
+    "h": {"FTRAIN_KDA_KEEP_STATE": "0", "FTRAIN_KDA_SAVE_H": "1", "FTRAIN_KDA_SAVE_QKN": "0"},
+    "h+qkn": {"FTRAIN_KDA_KEEP_STATE": "0", "FTRAIN_KDA_SAVE_H": "1", "FTRAIN_KDA_SAVE_QKN": "1"},
+    "qkn": {"FTRAIN_KDA_KEEP_STATE": "0", "FTRAIN_KDA_SAVE_H": "0", "FTRAIN_KDA_SAVE_QKN": "1"},
 }
-RECOMPUTE = {"FLASH_TRAIN_KDA_KEEP_STATE": "0", "FLASH_TRAIN_KDA_SAVE_H": "0", "FLASH_TRAIN_KDA_SAVE_QKN": "0"}
+RECOMPUTE = {"FTRAIN_KDA_KEEP_STATE": "0", "FTRAIN_KDA_SAVE_H": "0", "FTRAIN_KDA_SAVE_QKN": "0"}
 
 
 @pytest.mark.parametrize("route", sorted(ROUTES))
@@ -181,8 +181,8 @@ def test_saved_h_skips_the_backward_recurrence():
     x = make_inputs(T, H, True, seed=7)
     d_o = make_d_o(T, H, seed=8)
     step = lambda: run(ft.kimi_delta_attention, x, d_o)
-    assert _with_env({"FLASH_TRAIN_KDA_SAVE_H": "auto"}, lambda: _recurrence_launches(step)) == 1
-    assert _with_env({"FLASH_TRAIN_KDA_SAVE_H": "0", "FLASH_TRAIN_KDA_KEEP_STATE": "0"},
+    assert _with_env({"FTRAIN_KDA_SAVE_H": "auto"}, lambda: _recurrence_launches(step)) == 1
+    assert _with_env({"FTRAIN_KDA_SAVE_H": "0", "FTRAIN_KDA_KEEP_STATE": "0"},
                      lambda: _recurrence_launches(step)) == 2
 
 
@@ -205,6 +205,82 @@ def test_no_grad_forward_saves_nothing(monkeypatch):
     b = call()
     assert seen == [(False, False, False), (False, True, True)]
     assert torch.equal(a, b.detach())
+
+
+def _spy_saves(monkeypatch):
+    import flash_train.torch.kda as kda_mod
+    seen = []
+    real = kda_mod._kda_forward
+
+    def spy(*args):
+        seen.append(args[-3:])  # keep_state, save_qkn, save_h
+        return real(*args)
+    monkeypatch.setattr(kda_mod, "_kda_forward", spy)
+    return seen
+
+
+@pytest.mark.parametrize("H,policy,want", [
+    (4, None, (False, True, True)),    # measured policy: save h at <= 48 heads
+    (4, True, (False, True, True)),
+    (4, False, (False, True, False)),  # minimal set: no h
+    (52, None, (False, True, False)),  # > 48 heads: no h outside a checkpoint recompute
+    (52, True, (False, True, True)),
+])
+def test_disable_recompute_selects_the_saved_set(monkeypatch, H, policy, want):
+    """chunk_kda's disable_recompute (FLA's meaning) picks what the forward keeps; the result is
+    bit-identical to the measured policy either way."""
+    seen = _spy_saves(monkeypatch)
+    x = _fla_inputs(1, 128, H, seed=H)
+    d_o = make_d_o(128, H, seed=H + 1).view(1, 128, H, 128)
+    o, g = _k3_call(ft.chunk_kda, x, d_o, disable_recompute=policy)
+    ro, rg = _k3_call(ft.chunk_kda, x, d_o)
+    assert seen[0] == want
+    assert torch.equal(o, ro)
+    for name in x:
+        assert torch.equal(g[name], rg[name]), name
+
+
+def test_explicit_policy_overrides_the_debug_variables(monkeypatch):
+    seen = _spy_saves(monkeypatch)
+    x = _fla_inputs(1, 128, 4, seed=3)
+    d_o = make_d_o(128, 4, seed=4).view(1, 128, 4, 128)
+    _with_env({"FTRAIN_KDA_SAVE_H": "0"}, lambda: _k3_call(ft.chunk_kda, x, d_o))
+    _with_env({"FTRAIN_KDA_SAVE_H": "0"}, lambda: _k3_call(ft.chunk_kda, x, d_o, disable_recompute=True))
+    assert [s[2] for s in seen] == [False, True]
+
+
+_KERNELS_SCRIPT = r"""
+import torch, flash_train.torch as ft
+from torch.profiler import ProfilerActivity, profile
+T, H = 256, 4
+x = [(torch.randn(T, H, 128, device="cuda") * .3).bfloat16().requires_grad_() for _ in range(4)]
+beta = torch.rand(T, H, device="cuda").requires_grad_()
+a, d = torch.zeros(H, device="cuda"), torch.zeros(H * 128, device="cuda")
+with profile(activities=[ProfilerActivity.CUDA]) as p:
+    ft.kimi_delta_attention(*x, beta, A_log=a, dt_bias=d).sum().backward()
+    torch.cuda.synchronize()
+print(sorted({e.key for e in p.key_averages() if "g2" in e.key}))
+"""
+
+
+def _kernel_names(**env):
+    import subprocess
+    import sys
+    clean = {k: v for k, v in os.environ.items() if not k.startswith(("KDA_G2_", "FTRAIN_KDA_DEV"))}
+    out = subprocess.run([sys.executable, "-c", _KERNELS_SCRIPT], env={**clean, **env},
+                         capture_output=True, text=True, check=True).stdout
+    return out.strip().splitlines()[-1]
+
+
+def test_kernel_knobs_need_ftrain_kda_dev():
+    """The G2 kernels' KDA_G2_* knobs (hip_kda research switches) are ignored unless FTRAIN_KDA_DEV
+    is set: a hip_kda environment cannot change flash-train's kernel choice (each process reads
+    the switch once, hence the subprocesses)."""
+    base = _kernel_names()
+    knob = {"KDA_G2_S4A_AFS_MAXH": "0"}  # H = 4 <= 12 takes the AFS s4a instance by default
+    assert _kernel_names(**knob) == base
+    assert _kernel_names(**knob, FTRAIN_KDA_DEV="0") == base
+    assert _kernel_names(**knob, FTRAIN_KDA_DEV="1") != base
 
 
 def test_dq_dk_buffer_hosts_the_gate_scratch():

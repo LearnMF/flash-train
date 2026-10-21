@@ -615,7 +615,7 @@ extern "C" int g2_dhu_v8b(const void* KgA, const void* Qg, const void* Wb, const
     const long ctas = 4L * nseg * H;
     // kra P-85: re-measured on P-82b -- the 8-wave form wins from 128 CTAs on (H=48: 1.05-1.15x)
     int dhu4 = (ctas >= 96 && ctas <= g2_env_long("KDA_G2_DHU4_MAX_CTAS", 127)) ? 1 : 0;
-    if (const char* e = getenv("KDA_G2_R1A_DHU")) dhu4 = atoi(e);
+    if (const char* e = g2::g2_getenv("KDA_G2_R1A_DHU")) dhu4 = atoi(e);
     // kra P-24: at deep saturation cap dhu at 1 CTA/CU (33 KB LDS per CTA): the operands shared
     // by a head's 4 V-slab CTAs then stay in L2.
     const bool dthrottle = ctas >= g2_env_long("KDA_G2_DHU_THROTTLE_MIN_CTAS", 192);
@@ -623,7 +623,7 @@ extern "C" int g2_dhu_v8b(const void* KgA, const void* Qg, const void* Wb, const
     // kra P-22d: linear aN(dv2) emit only in the latency-bound regime (few CTAs); at deep saturation
     // the scattered stores pace the loads (R21).  KDA_G2_DHU_LIN=0/1 forces it.
     bool lin = ctas <= 96;
-    if (const char* e = getenv("KDA_G2_DHU_LIN")) lin = atoi(e) != 0;
+    if (const char* e = g2::g2_getenv("KDA_G2_DHU_LIN")) lin = atoi(e) != 0;
     // kra P-10: the production output set gets the compile-time instance
     const bool prod = HbN != nullptr && ANv2 != nullptr && dv2 == nullptr;
     const bool prod2 = HbN != nullptr && ANv2 == nullptr && dv2 != nullptr;   // kra P-22

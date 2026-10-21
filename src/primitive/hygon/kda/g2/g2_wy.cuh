@@ -1445,7 +1445,7 @@ extern "C" int g2_wy_s4_split_r(const void* q_kgb, const void* k, const void* v_
                        ctok, clen, (const bf16*)dv2c};
         const dim3 s4grd = g2::g2_env_long("KDA_G2_S4_HF", 1) ? dim3(H, NT) : dim3(NT, H);   // kra P-88 (default on)
         int afs_maxh = 12;   // kra P-28c (H=24 measured mixed: 1.036x at 8K, 0.94-0.97x at 32K-64K)
-        if (const char* e = getenv("KDA_G2_S4A_AFS_MAXH")) afs_maxh = atoi(e);
+        if (const char* e = g2::g2_getenv("KDA_G2_S4A_AFS_MAXH")) afs_maxh = atoi(e);
         const bool afs = H <= afs_maxh;
         const bool pf = g2::g2_env_long("KDA_G2_S4A_PF", 1) != 0;   // kra P-83 (default on)
         if (ctok) {

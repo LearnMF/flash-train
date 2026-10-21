@@ -805,7 +805,7 @@ extern "C" int g2_fwd_intra2(const void* qn, const void* kn, const void* v, cons
     // T = chunk-padded rows (NT = T/64); with ctok/clen the row tensors are packed.
     if (B != 1 || T % 64 || ((ctok == nullptr) != (clen == nullptr))) return -1;
     int stop = 0;
-    if (const char* e = getenv("G2_FI_STOP")) stop = atoi(e);
+    if (const char* e = g2::g2_getenv("G2_FI_STOP")) stop = atoi(e);
     g2::FwdIParams p{(const short*)qn, (const short*)kn, (const short*)v, (const float*)g,
                      (const float*)beta, (short*)Wn, (short*)Kn, (short*)Un, (short*)QgA,
                      (short*)AqkA, (short*)Aqk, (short*)Akk, (float)scale, H, T / 64,

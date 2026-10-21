@@ -342,7 +342,7 @@ extern "C" int g2_fwd_intra(const void* qn, const void* kn, const void* v, const
                             int B, int T, int H, hipStream_t s) {
     if (B != 1 || T % 64) return -1;
     int stop = 0;
-    if (const char* e = getenv("G2_FI_STOP")) stop = atoi(e);
+    if (const char* e = g2::g2_getenv("G2_FI_STOP")) stop = atoi(e);
     g2::FwdIParams p{(const short*)qn, (const short*)kn, (const short*)v, (const float*)g,
                      (const float*)beta, (short*)Wn, (short*)Kn, (short*)Un, (short*)QgA,
                      (short*)AqkA, (short*)Aqk, (short*)Akk, (float)scale, H, T / 64,

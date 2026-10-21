@@ -48,13 +48,13 @@ def _keep_state(needs_bwd):
     """Should the forward hand its recurrent state to the backward (skipping the backward's
     recompute of it; bit-identical either way)?
 
-    FLASH_TRAIN_KDA_KEEP_STATE=auto (default): only when this forward runs inside a backward pass
+    FTRAIN_KDA_KEEP_STATE=auto (default): only when this forward runs inside a backward pass
     with no saved-tensor hooks active -- a reentrant activation-checkpoint recompute (Megatron's
     CheckpointFunction, torch.utils.checkpoint(use_reentrant=True)) -- so the state lives just
     for this layer's backward. A plain training forward, non-reentrant checkpoint (its backward
     uses the original forward's ctx) or activation offloading keep the minimal saved set.
     1: whenever a backward follows; 0: never."""
-    mode = os.environ.get("FLASH_TRAIN_KDA_KEEP_STATE", "auto").strip()
+    mode = os.environ.get("FTRAIN_KDA_KEEP_STATE", "auto").strip()
     if mode == "0" or not needs_bwd:
         return False
     if mode == "1":
@@ -67,9 +67,9 @@ def _save_h(needs_bwd, heads):
     """Should the forward save its recurrent state h (512 B per token and head) so the backward
     runs no recurrence (bit-identical either way)?
 
-    FLASH_TRAIN_KDA_SAVE_H=auto (default): whenever a backward follows and heads <= SAVE_H_MAX_HEADS;
+    FTRAIN_KDA_SAVE_H=auto (default): whenever a backward follows and heads <= SAVE_H_MAX_HEADS;
     it then also replaces the keep-state hand-over. 1: whenever a backward follows; 0: never."""
-    mode = os.environ.get("FLASH_TRAIN_KDA_SAVE_H", "auto").strip()
+    mode = os.environ.get("FTRAIN_KDA_SAVE_H", "auto").strip()
     if mode == "0" or not needs_bwd:
         return False
     return mode == "1" or heads <= SAVE_H_MAX_HEADS
@@ -77,21 +77,26 @@ def _save_h(needs_bwd, heads):
 
 def _save_qkn(needs_bwd, l2norm):
     """Should the forward save the l2-normalized qn / kn instead of q / k (the backward then skips
-    rebuilding them; same bytes saved)? FLASH_TRAIN_KDA_SAVE_QKN=1 (default) / 0."""
+    rebuilding them; same bytes saved)? FTRAIN_KDA_SAVE_QKN=1 (default) / 0."""
     return (l2norm and needs_bwd
-            and os.environ.get("FLASH_TRAIN_KDA_SAVE_QKN", "1").strip() != "0")
+            and os.environ.get("FTRAIN_KDA_SAVE_QKN", "1").strip() != "0")
 
 
 class _KdaFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, k, v, g, beta, a_log, dt_bias, cu_seqlens, scale, lower_bound, l2norm, grad_mode):
+    def forward(ctx, q, k, v, g, beta, a_log, dt_bias, cu_seqlens, scale, lower_bound, l2norm, grad_mode,
+                disable_recompute):
         # A backward follows only when the caller ran with grad mode on (inside forward it is always
         # off, and needs_input_grad stays True under no_grad, e.g. a checkpoint's first forward).
         needs_bwd = grad_mode and any(ctx.needs_input_grad)
         gate = a_log is not None
-        save_h = _save_h(needs_bwd, q.shape[1])
-        save_qkn = _save_qkn(needs_bwd, l2norm) and q.numel() > 0
-        keep = _keep_state(needs_bwd) and not save_h
+        if disable_recompute is None:   # the measured policy (FTRAIN_KDA_* in env.h override it)
+            save_h = _save_h(needs_bwd, q.shape[1])
+            save_qkn = _save_qkn(needs_bwd, l2norm)
+            keep = _keep_state(needs_bwd) and not save_h
+        else:   # the caller's choice: True saves h (no backward recurrence), False the minimal set
+            save_h, save_qkn, keep = needs_bwd and disable_recompute, needs_bwd and l2norm, False
+        save_qkn = save_qkn and q.numel() > 0
         o, q_rstd, k_rstd, aqk, akk, qn, kn, h, state = _kda_forward(
             q, k, v, g, beta, a_log, dt_bias, cu_seqlens, scale, lower_bound, gate, l2norm, keep, save_qkn, save_h)
         q_sv, k_sv = (None, None) if save_qkn else (q, k)   # qn / kn replace q / k in the saved set
@@ -108,11 +113,11 @@ class _KdaFunction(torch.autograd.Function):
             state, ctx.scale, ctx.lower_bound, ctx.gate, ctx.l2norm)
         if not ctx.gate:
             da_log = ddt_bias = None
-        return dq, dk, dv, dg, dbeta, da_log, ddt_bias, None, None, None, None, None
+        return dq, dk, dv, dg, dbeta, da_log, ddt_bias, None, None, None, None, None, None
 
 
 def kimi_delta_attention(q, k, v, g, beta, *, cu_seqlens=None, scale=None, A_log=None, dt_bias=None,
-                         lower_bound=-5.0, use_qk_l2norm_in_kernel=True, check_decay=True):
+                         lower_bound=-5.0, use_qk_l2norm_in_kernel=True, check_decay=True, disable_recompute=None):
     """KDA forward (differentiable) on the current stream; returns o [T, H, V] (bf16).
 
     q, k, v: bf16 [T, H, 128]; beta: post-activation [T, H] (computed in fp32);
@@ -120,6 +125,11 @@ def kimi_delta_attention(q, k, v, g, beta, *, cu_seqlens=None, scale=None, A_log
     else the per-token log decay (fp32). ``cu_seqlens``: int32 [N + 1] on the device.
     ``check_decay`` (precomputed-g contract only) verifies g >= -5, the range the chunk
     algorithm requires (one device reduction and a host read per call).
+    ``disable_recompute`` (FLA's meaning) chooses what the forward keeps for the backward; every
+    choice is bit-identical. None (default): the measured policy -- save the recurrent state h
+    (512 B per token and head) at <= 48 heads, hand the full state over inside a reentrant
+    activation-checkpoint recompute; True: always save h, the backward runs no recurrence;
+    False: the minimal set (FLA's default memory), the backward recomputes the recurrence.
     Raises RuntimeError (FTRAIN_STATUS_UNSUPPORTED) for configurations no flash-train
     implementation supports: the G2 kernels run on gfx936 with K = V = 128.
     """
@@ -137,19 +147,20 @@ def kimi_delta_attention(q, k, v, g, beta, *, cu_seqlens=None, scale=None, A_log
             raise ValueError("kimi_delta_attention: A_log requires dt_bias")
         a32, d32 = A_log.float().contiguous(), dt_bias.float().contiguous()
         o = _KdaFunction.apply(q, k, v, g.to(torch.bfloat16), beta32, a32, d32, cu_seqlens, float(scale),
-                               float(lower_bound), bool(use_qk_l2norm_in_kernel), torch.is_grad_enabled())
+                               float(lower_bound), bool(use_qk_l2norm_in_kernel), torch.is_grad_enabled(),
+                               disable_recompute)
     else:
         g32 = g.float()
         if check_decay and g32.numel() and float(g32.detach().amin()) < DECAY_LOWER_BOUND:
             raise ValueError("kimi_delta_attention: per-token log decay below -5 is outside the supported range")
         o = _KdaFunction.apply(q, k, v, g32, beta32, None, None, cu_seqlens, float(scale), 0.0,
-                               bool(use_qk_l2norm_in_kernel), torch.is_grad_enabled())
+                               bool(use_qk_l2norm_in_kernel), torch.is_grad_enabled(), disable_recompute)
     return o
 
 
 def chunk_kda(q, k, v, g, beta, scale=None, initial_state=None, output_final_state=False,
               use_qk_l2norm_in_kernel=False, use_gate_in_kernel=False, use_beta_sigmoid_in_kernel=False,
-              allow_neg_eigval=False, safe_gate=False, lower_bound=None, disable_recompute=False,
+              allow_neg_eigval=False, safe_gate=False, lower_bound=None, disable_recompute=None,
               return_intermediate_states=False, state_v_first=False, cu_seqlens=None, cu_seqlens_cpu=None,
               cp_context=None, chunk_size=64, A_log=None, dt_bias=None, transpose_state_layout=None):
     """KDA with the signature of FLA's ``fla.ops.kda.chunk_kda``: a drop-in for the Megatron
@@ -164,9 +175,9 @@ def chunk_kda(q, k, v, g, beta, scale=None, initial_state=None, output_final_sta
     * ``use_gate_in_kernel=False``: g is the per-token log decay (>= -5).
 
     ``use_beta_sigmoid_in_kernel`` applies ``sigmoid`` (x2 with ``allow_neg_eigval``) to beta
-    on the host. ``disable_recompute``, ``chunk_size`` and ``cu_seqlens_cpu`` are FLA tuning
-    knobs with no effect here (what the forward saves follows FLASH_TRAIN_KDA_SAVE_H /
-    _SAVE_QKN / _KEEP_STATE). Not supported (NotImplementedError): initial / final state,
+    on the host. ``disable_recompute`` keeps FLA's meaning (see :func:`kimi_delta_attention`;
+    not passing it selects the measured policy). ``chunk_size`` and ``cu_seqlens_cpu`` are FLA
+    tuning knobs with no effect here. Not supported (NotImplementedError): initial / final state,
     intermediate states, context parallelism, FLA's softplus gate (no ``lower_bound``).
     """
     if transpose_state_layout is not None:  # FLA's deprecated name of state_v_first
@@ -197,7 +208,8 @@ def chunk_kda(q, k, v, g, beta, scale=None, initial_state=None, output_final_sta
     else:
         gate = {}
     o = kimi_delta_attention(flat(q), flat(k), flat(v), flat(g), flat(beta), cu_seqlens=cu_seqlens, scale=scale,
-                             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel, **gate)
+                             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                             disable_recompute=disable_recompute, **gate)
     return o.view(B, T, H, v.shape[-1]), None
 
 

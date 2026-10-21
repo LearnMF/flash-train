@@ -884,7 +884,7 @@ extern "C" int g2_fwd_h_v8o(const void* Wn, const void* Kn, const void* Un, cons
                  (bf16*)HbN, (bf16*)ANv,
                  scale, H, T / kBT, seg, nseg, ctok, clen, (const float*)GnRaw};
     int r1a = 1;   // R1a: 4-wave dedup form (bitwise equal; 0 restores the 8-wave form)
-    if (const char* e = getenv("KDA_G2_R1A")) r1a = atoi(e);
+    if (const char* e = g2::g2_getenv("KDA_G2_R1A")) r1a = atoi(e);
     const bool kp = H <= g2_env_long("KDA_G2_KPERM_MAX_H", 20);   // kra P-61e: Kn lane-permuted / Gn natural-k producers
     if (kp) r1a = 1;
     const dim3 grid(kK / kBV, (unsigned)nseg * H);

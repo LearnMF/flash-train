@@ -69,69 +69,29 @@ o.sum().backward()                                      # 支持 autograd：q/k/
 - 精度：与 FP64 参考（`ft.kda_reference`）相比，相对 RMS 误差约 0.3–0.7%，判据为 o < 2e-2、dq/dk/dv < 4e-2、门控侧梯度 < 6e-2（与 PR #556 一致）。
 - 暂不支持初始状态和最终状态（训练从零状态开始，K3 不使用）。
 
-#### 前向为反向保存什么（全部逐位一致，只影响显存和速度）
+#### 前向为反向保存什么（`disable_recompute`，所有选项逐位一致）
 
-| 环境变量 | 默认 | 作用 |
-|---|---|---|
-| `FLASH_TRAIN_KDA_SAVE_QKN` | `1` | 前向保存 l2 归一化后的 qn/kn，代替 q/k（保存的字节不变），反向不再重建 |
-| `FLASH_TRAIN_KDA_SAVE_H` | `auto` | 前向保存递推状态 h（每 token·head 512 B），反向不再跑递推。`auto` 在 H ≤ 48 时开启（gfx936 实测更快），`1` 总是开启，`0` 关闭 |
-| `FLASH_TRAIN_KDA_KEEP_STATE` | `auto` | 前向交给反向完整状态（h 加 v_new，每 token·head 1024 B），只在 SAVE_H 未开启时生效。`auto` 只在可重入激活重算（Megatron 的 recompute、`torch.utils.checkpoint(use_reentrant=True)`）的重算前向里开启 |
+默认由算子自己选择最优策略，**调用方不需要设置任何东西**。只有想在显存和速度之间做取舍时，才传 `disable_recompute`；参数含义与 FLA 相同（"反向是否不重算"），`kimi_delta_attention` 和 `chunk_kda` 都接受：
 
-这三个变量**在每次前向调用时读取**，不需要在 import 前设置，也可以在训练过程中切换；它们只改变前向留给反向的内容，不改变任何输出和梯度的数值。在 no_grad 下（推理、checkpoint 的第一次前向）前向什么都不保存，与这三个变量无关。
+| `disable_recompute` | 前向留给反向的内容 | 新增显存（每 token·head，含 o） | 反向 |
+|---|---|---:|---|
+| 不传（`None`，默认） | H ≤ 48 时保存 h；H > 48 时不保存，但在可重入 checkpoint 的重算前向里交出完整状态（只活到这一层的反向结束） | H ≤ 48 约 1544 B；H > 48 约 1032 B | 速度最优（gfx936 实测） |
+| `True` | 总是保存 h | 约 1544 B | 不跑递推 |
+| `False` | 最小集合（与 FLA 默认的显存相同） | 约 1032 B | 重跑一次递推 |
 
-一次前向新分配、留到反向的显存（每 token·head；含输出 o，不含调用方本来就持有的 q/k/v/g/beta；H 是每卡 head 数，gfx936 实测）：
-
-| 场景 | 默认配置 | 与 FLA 默认（1032 B）相比 |
-|---|---:|---|
-| 不重算，H ≤ 48（K3 的 TP2/4/8） | 约 1544 B | 多 h 的 512 B，换反向少跑一次递推 |
-| 不重算，H > 48（K3 的 TP1），或 `SAVE_H=0` | 约 1032 B | 相同 |
-| Megatron 全层重算 | 第一次前向为 0；重算前向按上两行保存（H > 48 时改为 keep-state，多 1024 B），只在这一层的反向期间存在 | — |
-
-表中 qn/kn 按新分配计入（512 B）。在模型里 q/k 若只被 KDA 使用，保存 qn/kn 后 q/k 就会被释放，这一项实际不增加显存。
-
-用法示例：
-
-```bash
-# 1) 在启动脚本里设置（对整个进程生效；不设置就是默认值）
-export FLASH_TRAIN_KDA_SAVE_H=auto        # 默认：H <= 48 保存 h
-export FLASH_TRAIN_KDA_SAVE_QKN=1         # 默认
-export FLASH_TRAIN_KDA_KEEP_STATE=auto    # 默认
-torchrun --nproc_per_node 8 pretrain_gpt.py ...
-
-# 2) 显存紧张：不保存 h，保存量降到与 FLA 默认相同（反向多跑一次递推）
-FLASH_TRAIN_KDA_SAVE_H=0 torchrun --nproc_per_node 8 pretrain_gpt.py ...
-```
+- 统计口径：不含调用方本来就持有的 q/k/v/g/beta；qn/kn 按新分配计入（512 B）。模型里 q/k 如果只被 KDA 使用，保存 qn/kn 后 q/k 会被释放，这一项实际不增加显存。
+- 在 no_grad 下（推理、checkpoint 的第一次前向），前向什么都不保存，与参数无关。
+- 输出和所有梯度在三种选项下逐位相同。
 
 ```python
-# 3) 在 Python 里设置：下一次调用就生效
-import os
-os.environ["FLASH_TRAIN_KDA_SAVE_H"] = "0"
-
-# 4) 只对某一段代码生效（例如只在一部分层上省显存）
-import contextlib
-
-@contextlib.contextmanager
-def kda_env(**kv):
-    old = {k: os.environ.get(k) for k in kv}
-    os.environ.update(kv)
-    try:
-        yield
-    finally:
-        for k, v in old.items():
-            if v is None:
-                os.environ.pop(k)
-            else:
-                os.environ[k] = v
-
-with kda_env(FLASH_TRAIN_KDA_SAVE_H="0", FLASH_TRAIN_KDA_KEEP_STATE="0"):
-    o, _ = chunk_kda(q, k, v, g, beta, A_log=A_log, dt_bias=dt_bias, lower_bound=-5.0,
-                     use_qk_l2norm_in_kernel=True, use_gate_in_kernel=True, safe_gate=True)
-# 注意：设置在前向调用时读取；with 块退出后再做反向，用的仍是前向保存下来的内容。
+o, _ = chunk_kda(q, k, v, g, beta, A_log=A_log, dt_bias=dt_bias, lower_bound=-5.0,
+                 use_qk_l2norm_in_kernel=True, use_gate_in_kernel=True, safe_gate=True,
+                 disable_recompute=False)          # 例如显存紧张时：保存量与 FLA 默认相同
 ```
 
 ### 在 Megatron 中使用 KDA（与 FLA 的 `chunk_kda` 对齐）
 
-`flash_train.torch.chunk_kda` 的签名与 FLA 的 `fla.ops.kda.chunk_kda` 相同，输入为 `[B, T, H, 128]`，返回 `(o, None)`。Megatron 侧只需要换 import，调用参数不变。
+`flash_train.torch.chunk_kda` 的签名与 FLA 的 `fla.ops.kda.chunk_kda` 相同，输入为 `[B, T, H, 128]`，返回 `(o, None)`。Megatron 侧只需要换 import，调用参数不变，**不需要设置任何 flash-train 的环境变量**。
 
 #### 1. 安装
 
@@ -151,15 +111,11 @@ python3 -c "import flash_train.torch as ft; print(ft.__file__, ft.chunk_kda)"
 
 #### 2. 修改调用点
 
-Megatron-Bridge Kimi K3 的 KDA 调用在 `megatron/bridge/models/kimi/kimi_k3_ops.py` 的 `kda()` 里。灰度阶段建议用一个开关在 FLA 和 flash-train 之间切换（下面的 `KDA_BACKEND` 是 Megatron 侧自己定义的名字，不是 flash-train 的变量）：
+Megatron-Bridge Kimi K3 的 KDA 调用在 `megatron/bridge/models/kimi/kimi_k3_ops.py` 的 `kda()` 里，把 import 换成 flash-train 即可：
 
 ```python
 def kda(q, k, v, g, beta, a_log, dt_bias, lower_bound, *, cu_seqlens=None):
-    import os
-    if os.environ.get("KDA_BACKEND", "fla") == "flash_train":
-        from flash_train.torch import chunk_kda
-    else:
-        from fla.ops.kda import chunk_kda
+    from flash_train.torch import chunk_kda       # 原来：from fla.ops.kda import chunk_kda
     output, _ = chunk_kda(
         q=q, k=k, v=v, g=g, beta=beta,            # q/k/v/g: bf16 [B, T, H, 128]（g 是原始 gate）；beta: fp32 [B, T, H]，已过 sigmoid
         A_log=a_log, dt_bias=dt_bias,             # A_log: [H]，dt_bias: [H, 128] 或 [H*128]，任意浮点类型
@@ -172,12 +128,7 @@ def kda(q, k, v, g, beta, a_log, dt_bias, lower_bound, *, cu_seqlens=None):
     return output
 ```
 
-启动训练：
-
-```bash
-export KDA_BACKEND=flash_train
-torchrun --nproc_per_node 8 pretrain_gpt.py ...    # 其余参数与 FLA 路线相同
-```
+灰度阶段如果要在 FLA 和 flash-train 之间切换，由 Megatron 侧按自己的习惯加开关（配置项或环境变量都可以），flash-train 不规定这个开关。启动命令与 FLA 路线完全相同。
 
 #### 3. 确认走的是 flash-train
 
@@ -189,15 +140,36 @@ torchrun --nproc_per_node 8 pretrain_gpt.py ...    # 其余参数与 FLA 路线�
 
 - **TP**：KDA 的 head 按 TP 切分，每卡 H = 总 head 数 / TP（K3 为 96/TP），flash-train 不感知 TP，按传入的 H 计算。
 - **packed sequence**：传 `cu_seqlens_q` 即可，各序列互不影响，长度不必是 64 的倍数；`cu_seqlens = [0, T]`（只有一条序列）会自动走更快的 dense kernel。
-- **全层重算**（`--recompute-granularity full`）：Megatron 用可重入 checkpoint，第一次前向在 no_grad 下运行，flash-train 不保存任何东西；重算前向按上面的显存表保存，只活到这一层的反向结束。
+- **全层重算**（`--recompute-granularity full`）：Megatron 用可重入 checkpoint，第一次前向在 no_grad 下运行，flash-train 不保存任何东西；重算前向按上面的表保存，只活到这一层的反向结束。
 - **确定性**：固定顺序归约、不用原子操作，同样的输入多次运行结果逐位相同；与 hip_kda 的独立版本也逐位一致。
 
 #### 参数对照（与 FLA 的差别）
 
 - 只做布局转换，与在打包 THD 张量上直接调用 `kimi_delta_attention` 逐位一致：`[B, T, H, D]` 展平成 `[B*T, H, D]`；`B > 1` 且不传 `cu_seqlens` 时按 B 条长度为 T 的序列处理；传 `cu_seqlens` 时要求 `B == 1`（与 FLA 相同）。
 - gate：`use_gate_in_kernel=True` 时要求给出 `A_log`、`dt_bias` 和 `lower_bound`（FLA 的 safe_gate 形式，即 K3 的用法）；`use_gate_in_kernel=False` 时 g 是逐 token log 衰减。`use_beta_sigmoid_in_kernel=True` 时在宿主侧对 beta 做 sigmoid（`allow_neg_eigval` 时乘 2）。
-- `disable_recompute`、`chunk_size`、`cu_seqlens_cpu` 是 FLA 的调优参数，这里接受但不起作用；保存策略由上面的环境变量控制。
+- `disable_recompute` 与 FLA 含义相同，见上一节；不传时用算子自选的策略（FLA 的默认值是 `False`，这里是 `None`）。`chunk_size`、`cu_seqlens_cpu` 是 FLA 的调优参数，这里接受但不起作用。
 - 不支持的参数直接抛异常，不会悄悄回退：`initial_state`、`output_final_state=True`、`return_intermediate_states`、`cp_context`、没有 `lower_bound` 的 softplus gate 抛 `NotImplementedError`；未知关键字抛 `TypeError`。
+
+### KDA 调试开关（flash-train 开发用，训练不需要）
+
+这些变量登记在 `include/flash_train/env.h`，只用于 A/B 实验和调试，不改变任何结果的数值。训练脚本里不要设置。
+
+| 变量 | 默认 | 作用 |
+|---|---|---|
+| `FTRAIN_KDA_SAVE_QKN` | `1` | `0`：前向保存 q/k 而不是 qn/kn，反向重建 qn/kn |
+| `FTRAIN_KDA_SAVE_H` | `auto` | `1` 总是保存 h，`0` 从不保存，`auto` 在 H ≤ 48 时保存 |
+| `FTRAIN_KDA_KEEP_STATE` | `auto` | 不保存 h 时，`1` 总是交出完整状态，`0` 从不交出，`auto` 只在可重入 checkpoint 的重算前向里交出 |
+| `FTRAIN_KDA_DEV` | 不设置 | 设为非空且不为 `0` 时，G2 kernel 才读取从 hip_kda 继承的调参开关（`KDA_G2_*`、`G2_*_STOP`）；不设置时这些开关一律取默认值，训练环境里残留的 hip_kda 变量不会影响 flash-train |
+
+- 前三个只在调用方没有传 `disable_recompute` 时生效，每次前向调用时读取；`FTRAIN_KDA_DEV` 每个进程只在第一次使用时读取一次。
+
+```bash
+# 例：A/B 比较"保存 h"与"反向重算"的速度
+FTRAIN_KDA_SAVE_H=1 python3 bench.py
+FTRAIN_KDA_SAVE_H=0 python3 bench.py
+# 例：开发 kernel 时打开 hip_kda 的调参开关
+FTRAIN_KDA_DEV=1 KDA_G2_S4_HF=0 python3 bench.py
+```
 
 ### 用 C API 接入 KDA（与 PyTorch 入口同一套端口）
 
@@ -291,3 +263,4 @@ ftrainPlanDestroy(plan);  ftrainArgsDestroy(args);  ftrainOpsDestroy(ops);
 | `FTRAIN_ENABLED_PRIMITIVES` / `FTRAIN_DISABLED_PRIMITIVES` | 按名字允许/禁止实现 |
 | `FTRAIN_DISABLED_FINDERS` | 按名字禁用选择启发式 |
 | `FTRAIN_DISABLE_CACHE` | 关闭选择缓存（调试用） |
+| `FTRAIN_KDA_SAVE_QKN` / `FTRAIN_KDA_SAVE_H` / `FTRAIN_KDA_KEEP_STATE` / `FTRAIN_KDA_DEV` | KDA 调试开关，训练不需要，见第 1 节"KDA 调试开关" |
