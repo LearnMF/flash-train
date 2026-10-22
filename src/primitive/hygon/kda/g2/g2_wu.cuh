@@ -61,6 +61,7 @@ struct WuParams {
     int kp = 0;    // kra P-61e: Kn lane-permuted (H <= KPERM_MAX_H)
     const short* HbN = nullptr;   // kra P-82: saved bN(h) -> v_new = u - W h formed here (VnOut)
     short* VnOut = nullptr;
+    int order = 0;   // kra P-95: CTA visiting order (see g2_wu_kernel)
 };
 
 // vB-layout quad base for source quad (row j, column vq..vq+3): A form with the
@@ -113,8 +114,15 @@ __device__ __forceinline__ void wu_emit16s(short* dst, const short* tile, int ti
 template <bool VL, bool KS = false, bool QS = false>   // kra P-84b: KS; P-84c: QS
 __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p_) {
     // kra P-35: field-wise copy, pointers stamped global (global_* ops, not flat)
-    const WuParams p{g2_glb(p_.k), g2_glb(p_.v), g2_glb(p_.q), g2_glb(p_.beta), g2_glb(p_.A), g2_glb(p_.g), g2_glb(p_.Wn), g2_glb(p_.Wb), g2_glb(p_.Un), g2_glb(p_.KgA), g2_glb(p_.Kn), g2_glb(p_.Qn), g2_glb(p_.kgB), g2_glb(p_.vB), p_.H, p_.NT, g2_glb(p_.ctok), g2_glb(p_.clen), p_.stop, p_.kp, g2_glb(p_.HbN), g2_glb(p_.VnOut)};   // kra P-82
-    const int i = blockIdx.x, hh = blockIdx.y, tid = threadIdx.x;
+    const WuParams p{g2_glb(p_.k), g2_glb(p_.v), g2_glb(p_.q), g2_glb(p_.beta), g2_glb(p_.A), g2_glb(p_.g), g2_glb(p_.Wn), g2_glb(p_.Wb), g2_glb(p_.Un), g2_glb(p_.KgA), g2_glb(p_.Kn), g2_glb(p_.Qn), g2_glb(p_.kgB), g2_glb(p_.vB), p_.H, p_.NT, g2_glb(p_.ctok), g2_glb(p_.clen), p_.stop, p_.kp, g2_glb(p_.HbN), g2_glb(p_.VnOut), p_.order};   // kra P-82, P-95
+    // kra P-95: CTA visiting order (bitwise-neutral: every CTA is independent; launcher picks it).  0 = chunk-fastest
+    // (blockIdx.x = chunk); 1 = head-fastest; 2 = diagonal (i = (L/H + hh) % NT): co-resident CTAs
+    // then differ by one chunk AND one head, so neither the row streams (H*16 KiB per chunk) nor the
+    // natives (NT*16 KiB per head) advance in lock-step by a power of two when H / NT are.
+    const int L_ = blockIdx.y * gridDim.x + blockIdx.x;
+    const int hh = p_.order == 0 ? (int)blockIdx.y : L_ % p_.H;
+    const int i = p_.order == 0 ? (int)blockIdx.x : (p_.order == 1 ? L_ / p_.H : (L_ / p_.H + hh) % p_.NT);
+    const int tid = threadIdx.x;
     const int wv = tid >> 6, l = tid & 63;
     __shared__ __align__(16) short slab[128 * kPadJ2];
     __shared__ float sBeta[kBT];
@@ -450,6 +458,10 @@ extern "C" int g2_wu(const void* k, const void* v, const void* q, const void* be
                    H, T / 64, ctok, clen, stop};
     p.kp = H <= g2::g2_env_long("KDA_G2_KPERM_MAX_H", 20);   // kra P-61e
     p.HbN = (const short*)hbn; p.VnOut = (short*)vn_out;      // kra P-82
+    // kra P-95: the diagonal order whenever the chunk row stride H * 16 KiB is a multiple of 512 KiB
+    // (H % 32 == 0): chunk-fastest CTAs then step through k / v / q / g / kgB in lock-step on the same
+    // HBM channels (measured on gfx936: wu 1.1-1.5x at H = 64 / 32, 0.85-1.0x at H = 16 / 8).
+    p.order = (int)g2::g2_env_long("KDA_G2_WU_ORDER", H % 32 == 0 ? 2 : 0);
     const bool ks = g2::g2_env_long("KDA_G2_WU_KS", 1) != 0;   // kra P-84b (default on)
     const bool qs = g2::g2_env_long("KDA_G2_WU_QS", 1) != 0;   // kra P-84c (default on)
     if (ctok) {

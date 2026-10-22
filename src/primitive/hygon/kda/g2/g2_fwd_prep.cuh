@@ -147,7 +147,10 @@ __device__ __forceinline__ float2 gate_carry(const float2* sTot) {
 // <= 15 rows * 7.2135 = 108.2 (P1b eO).
 __device__ __forceinline__ float exp2_inrange(float x) { return __builtin_amdgcn_exp2f(x); }
 
-template <int GATE, bool VL>
+// L2N = false (kra P-94): q / k arrive already normalized (Megatron-LM-k3 runs FLA's l2norm before
+// the call, use_qk_l2norm_in_kernel=False): qn = q, kn = k bit for bit, so skipping the l2norm block
+// leaves every output equal to the X1 chain's (gate -> fwd_intra2_split -> to_gn) on the raw q / k.
+template <int GATE, bool VL, bool L2N = true>
 __global__ void __launch_bounds__(256) g2_fwd_prep_a_kernel(PrepAParams p) {
     using namespace fi2;
     // One 21 KB arena (3 CTAs/CU), phases alias it (floats):
@@ -195,6 +198,7 @@ __global__ void __launch_bounds__(256) g2_fwd_prep_a_kernel(PrepAParams p) {
     {
         float* Xq = lds + 4864;                       // [64 rows][4 waves] (REF slots 4-7: free
         float* Xk = lds + 5120;                       // until the round-0 barrier)
+        if constexpr (L2N) {
         #pragma unroll
         for (int rb = 0; rb < 4; ++rb) {
             float sq = 0.f, sk = 0.f;
@@ -214,8 +218,10 @@ __global__ void __launch_bounds__(256) g2_fwd_prep_a_kernel(PrepAParams p) {
                 Xk[(16 * rb + m) * 4 + wv] = sk;
             }
         }
+        }
         gate_scan<GATE, VL>(p, grw, graw, reinterpret_cast<float2*>(lds + 4352), hh, cl);
         __syncthreads();                              // X and sTot visible (one barrier for both)
+        if constexpr (L2N) {
         #pragma unroll
         for (int rb = 0; rb < 4; ++rb) {
             const int row = 16 * rb + m;
@@ -242,6 +248,7 @@ __global__ void __launch_bounds__(256) g2_fwd_prep_a_kernel(PrepAParams p) {
                 *reinterpret_cast<v4bh*>(p.kn_out + o2) = kv[rb][0];
                 *reinterpret_cast<v4bh*>(p.kn_out + o2 + 4) = kv[rb][1];
             }
+        }
         }
     }
 
@@ -626,14 +633,17 @@ __global__ void __launch_bounds__(256) g2_fwd_prep_b_kernel(PrepBParams p) {
 
 // q/k/v [1, T, H, 128] bf16 (packed rows with ctok/clen), g_raw bf16 (gate=1) or fp32 (gate=0),
 // beta fp32 [1, T, H]; T = 64*NT dense.  Outputs as fwd_intra2_split + rstd + Gn; R / Kb scratch.
-extern "C" int g2_fwd_prep(const void* q, const void* k, const void* v, const void* g_raw,
-                           const void* A_log, const void* dt_bias, const void* beta,
-                           void* Wn, void* Kn, void* Un, void* QgA, void* AqkA, void* Aqk,
-                           void* Akk, void* q_rstd, void* k_rstd, void* Gn, void* R, void* Kb,
-                           double lower_bound, double gscale, int gate, double scale, int H,
-                           int NT, const int* ctok, const int* clen, void* qn_out, void* kn_out,
-                           hipStream_t s) {   // kra P-77b: qn_out / kn_out
+// kra P-94: l2n = 0 skips the in-kernel l2norm (q / k already normalized; q_rstd / k_rstd /
+// qn_out / kn_out unused) -- the forward of use_qk_l2norm_in_kernel=False without the X1 chain.
+extern "C" int g2_fwd_prep_l2n(const void* q, const void* k, const void* v, const void* g_raw,
+                               const void* A_log, const void* dt_bias, const void* beta,
+                               void* Wn, void* Kn, void* Un, void* QgA, void* AqkA, void* Aqk,
+                               void* Akk, void* q_rstd, void* k_rstd, void* Gn, void* R, void* Kb,
+                               double lower_bound, double gscale, int gate, double scale, int H,
+                               int NT, const int* ctok, const int* clen, void* qn_out, void* kn_out,
+                               int l2n, hipStream_t s) {
     if ((ctok == nullptr) != (clen == nullptr) || NT <= 0) return -1;
+    if (l2n && (q_rstd == nullptr || k_rstd == nullptr)) return -1;
     g2::r4::PrepAParams pa{(const short*)q, (const short*)k, (const short*)v, (short*)Wn,
                            (short*)Un, (short*)AqkA, (short*)Aqk, (short*)Akk, (float)scale,
                            g_raw, (const float*)A_log, (const float*)dt_bias, (const float*)beta,
@@ -644,13 +654,16 @@ extern "C" int g2_fwd_prep(const void* q, const void* k, const void* v, const vo
     pa.kp = H <= g2::g2_env_long("KDA_G2_KPERM_MAX_H", 20);   // kra P-61e
     pa.qn_out = (short*)qn_out; pa.kn_out = (short*)kn_out;    // kra P-77b
     const dim3 grid(NT, H), blk(256);
-    if (gate) {
-        if (ctok) hipLaunchKernelGGL((g2::r4::g2_fwd_prep_a_kernel<1, true>), grid, blk, 0, s, pa);
-        else hipLaunchKernelGGL((g2::r4::g2_fwd_prep_a_kernel<1, false>), grid, blk, 0, s, pa);
+#define G2_PREP_A(GT, VLT, L2) hipLaunchKernelGGL((g2::r4::g2_fwd_prep_a_kernel<GT, VLT, L2>), grid, blk, 0, s, pa)
+    if (l2n) {
+        if (gate) { if (ctok) G2_PREP_A(1, true, true); else G2_PREP_A(1, false, true); }
+        else      { if (ctok) G2_PREP_A(0, true, true); else G2_PREP_A(0, false, true); }
     } else {
-        if (ctok) hipLaunchKernelGGL((g2::r4::g2_fwd_prep_a_kernel<0, true>), grid, blk, 0, s, pa);
-        else hipLaunchKernelGGL((g2::r4::g2_fwd_prep_a_kernel<0, false>), grid, blk, 0, s, pa);
+        pa.qn_out = pa.kn_out = nullptr;
+        if (gate) { if (ctok) G2_PREP_A(1, true, false); else G2_PREP_A(1, false, false); }
+        else      { if (ctok) G2_PREP_A(0, true, false); else G2_PREP_A(0, false, false); }
     }
+#undef G2_PREP_A
     int rc = (int)hipGetLastError();
     if (rc) return rc;
     g2::r4::PrepBParams pb{(const short*)Kb, (const short*)v, (const float*)beta, (const float*)R,
@@ -660,4 +673,16 @@ extern "C" int g2_fwd_prep(const void* q, const void* k, const void* v, const vo
     if (ctok) hipLaunchKernelGGL(g2::r4::g2_fwd_prep_b_kernel<true>, grid, blk, 0, s, pb);
     else hipLaunchKernelGGL(g2::r4::g2_fwd_prep_b_kernel<false>, grid, blk, 0, s, pb);
     return (int)hipGetLastError();
+}
+
+extern "C" int g2_fwd_prep(const void* q, const void* k, const void* v, const void* g_raw,
+                           const void* A_log, const void* dt_bias, const void* beta,
+                           void* Wn, void* Kn, void* Un, void* QgA, void* AqkA, void* Aqk,
+                           void* Akk, void* q_rstd, void* k_rstd, void* Gn, void* R, void* Kb,
+                           double lower_bound, double gscale, int gate, double scale, int H,
+                           int NT, const int* ctok, const int* clen, void* qn_out, void* kn_out,
+                           hipStream_t s) {   // kra P-77b: qn_out / kn_out
+    return g2_fwd_prep_l2n(q, k, v, g_raw, A_log, dt_bias, beta, Wn, Kn, Un, QgA, AqkA, Aqk, Akk, q_rstd,
+                           k_rstd, Gn, R, Kb, lower_bound, gscale, gate, scale, H, NT, ctok, clen, qn_out,
+                           kn_out, 1, s);
 }

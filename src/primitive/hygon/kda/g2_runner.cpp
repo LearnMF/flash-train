@@ -30,6 +30,11 @@ int g2_fwd_prep(const void* q, const void* k, const void* v, const void* g_raw, 
                 void* q_rstd, void* k_rstd, void* Gn, void* R, void* Kb, double lower_bound, double gscale, int gate,
                 double scale, int H, int NT, const int* ctok, const int* clen, void* qn_out, void* kn_out,
                 hipStream_t s);  // kra P-77b: + qn_out / kn_out
+int g2_fwd_prep_l2n(const void* q, const void* k, const void* v, const void* g_raw, const void* A_log,
+                    const void* dt_bias, const void* beta, void* Wn, void* Kn, void* Un, void* QgA, void* AqkA,
+                    void* Aqk, void* Akk, void* q_rstd, void* k_rstd, void* Gn, void* R, void* Kb, double lower_bound,
+                    double gscale, int gate, double scale, int H, int NT, const int* ctok, const int* clen,
+                    void* qn_out, void* kn_out, int l2n, hipStream_t s);  // kra P-94: l2n = 0 -> no l2norm
 int g2_fwd_h_v8o(const void* Wn, const void* Kn, const void* Un, const void* Gn, const void* QgA, const void* AqkA,
                  void* O, void* Ob, void* Vn, void* HbN, void* ANv, float scale, int B, int T, int H, const int* seg,
                  int nseg, const int* ctok, const int* clen, const void* GnRaw, hipStream_t s);
@@ -138,6 +143,19 @@ inline bool g2KpLayout(long H) {
     return H <= (e ? std::atol(e) : 20);
 }
 
+// kra P-94: the forward runs the R4 prep also without in-kernel l2norm (bitwise the X1 chain);
+// KDA_G2_PREP_NOL2=0 (FTRAIN_KDA_DEV only) keeps the X1 chain for A/B gates.
+inline bool g2UsePrep(const Shape& shape) {
+    if (shape.l2norm_qk) { return true; }
+    static const bool nol2 = [] {
+        const char* d = std::getenv(FTRAIN_KDA_DEV);
+        const bool dev = d != nullptr && *d != '\0' && std::strcmp(d, "0") != 0;
+        const char* e = dev ? std::getenv("KDA_G2_PREP_NOL2") : nullptr;
+        return e == nullptr || std::strcmp(e, "0") != 0;
+    }();
+    return nol2;
+}
+
 struct Tables {
     int* ctok = nullptr;
     int* clen = nullptr;
@@ -168,7 +186,7 @@ ForwardLayout layoutForward(const Shape& shape, void* base, std::uint64_t* used)
     Arena a(base);
     ForwardLayout L{};
     L.tab  = takeTables(a, shape, z);
-    L.g    = shape.l2norm_qk ? nullptr : a.take(z.rows128() * 4);
+    L.g    = g2UsePrep(shape) ? nullptr : a.take(z.rows128() * 4);
     // Wn | Kn | Un | QgA: the recurrence streams them together (spread over the channels, see spread())
     const std::uint64_t blk = z.CH * 8192 * 2, pw = blk + spread(blk, 4);
     char* w                 = static_cast<char*>(a.take(3 * pw + blk));
@@ -283,13 +301,16 @@ void forward(const Shape& shape, const ForwardArgs& p, void* workspace, FTrainSt
         check(g2_kda_tables(p.cu_seqlens, static_cast<int>(z.N), T, NT, L.tab.ctok, L.tab.clen, L.tab.seg, stream),
               "tables");
     }
-    if (shape.l2norm_qk) {  // R4: l2norm + gate + fwd_intra2 + to_gn in two kernels, bitwise the X1 chain
+    if (g2UsePrep(shape)) {  // R4: [l2norm +] gate + fwd_intra2 + to_gn in two kernels, bitwise the X1 chain
         // kra P-77b: with p.qn / p.kn set, prep_a also writes the l2-normalized q / k for the backward.
-        check(g2_fwd_prep(p.q, p.k, p.v, p.g, shape.gate_in_kernel ? p.a_log : nullptr,
-                          shape.gate_in_kernel ? p.dt_bias : nullptr, p.beta, L.Wn, L.Kn, L.Un, L.QgA, L.AqkA, p.aqk,
-                          p.akk, p.q_rstd, p.k_rstd, L.Gn, L.R, p.o, shape.gate_in_kernel ? p.lower_bound : 0.0,
-                          kRcpLn2, shape.gate_in_kernel ? 1 : 0, p.scale, H, NT, L.tab.ctok, L.tab.clen, p.qn, p.kn,
-                          stream),
+        // kra P-94: without in-kernel l2norm the prep reads the (already normalized) q / k as qn / kn.
+        const bool l2 = shape.l2norm_qk;
+        check(g2_fwd_prep_l2n(p.q, p.k, p.v, p.g, shape.gate_in_kernel ? p.a_log : nullptr,
+                              shape.gate_in_kernel ? p.dt_bias : nullptr, p.beta, L.Wn, L.Kn, L.Un, L.QgA, L.AqkA,
+                              p.aqk, p.akk, l2 ? p.q_rstd : nullptr, l2 ? p.k_rstd : nullptr, L.Gn, L.R, p.o,
+                              shape.gate_in_kernel ? p.lower_bound : 0.0, kRcpLn2, shape.gate_in_kernel ? 1 : 0,
+                              p.scale, H, NT, L.tab.ctok, L.tab.clen, l2 ? p.qn : nullptr, l2 ? p.kn : nullptr,
+                              l2 ? 1 : 0, stream),
               "fwd_prep");
     } else {
         check(

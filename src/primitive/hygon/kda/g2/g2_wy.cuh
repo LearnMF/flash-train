@@ -810,6 +810,7 @@ struct WyS4AParams {
     int T, H, NT;
     const int* ctok; const int* clen;   // varlen phase 2 (null = dense)
     const bf16* dv2c;                   // kra P-22: C-form dv2 (std order), read when dv is null
+    int hf = 0;                         // kra P-96: head-fastest grid (blockIdx.x = head), set by the launcher
 };
 
 struct WyS4BParams {
@@ -823,6 +824,7 @@ struct WyS4BParams {
     const int* ctok; const int* clen;   // varlen phase 2 (null = dense)
     const bf16* do_row;                 // kra P-20: row-major do, read when do_ (aN_do) is null
     const bf16* vnc;                    // kra P-22: C-form v_new (std order), read when v_new is null
+    int hf = 0;                         // kra P-96: head-fastest grid (blockIdx.x = head), set by the launcher
 };
 
 // VL (varlen phase 2): the row tensors (v_row, A, beta, dv2 here; q_row, k, g, dAqk, dq,
@@ -832,14 +834,15 @@ template <bool VL, bool AFS = false, int PF = 0>   // kra P-28c: AFS = stage the
 __global__ void __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(1, 3)))
 p3_wy_s4a_kernel(WyS4AParams p_) {
     // kra P-35: field-wise copy, pointers stamped global (global_* ops, not flat)
-    const WyS4AParams p{g2_glb(p_.kgb), g2_glb(p_.v_vb), g2_glb(p_.A), g2_glb(p_.h), g2_glb(p_.dv), g2_glb(p_.beta), g2_glb(p_.v_row), g2_glb(p_.dv2), g2_glb(p_.dwT), g2_glb(p_.dA), g2_glb(p_.db_part), p_.T, p_.H, p_.NT, g2_glb(p_.ctok), g2_glb(p_.clen), g2_glb(p_.dv2c)};
+    const WyS4AParams p{g2_glb(p_.kgb), g2_glb(p_.v_vb), g2_glb(p_.A), g2_glb(p_.h), g2_glb(p_.dv), g2_glb(p_.beta), g2_glb(p_.v_row), g2_glb(p_.dv2), g2_glb(p_.dwT), g2_glb(p_.dA), g2_glb(p_.db_part), p_.T, p_.H, p_.NT, g2_glb(p_.ctok), g2_glb(p_.clen), g2_glb(p_.dv2c), p_.hf};
     __shared__ __align__(16) bf16 S[kD * kPT];      // dvT -> dwT (same buffer reuse as the fused kernel)
     __shared__ __align__(16) bf16 XT[kBT * kPT];    // dA-stage XC staging (dAT staging dropped)
     __shared__ __align__(16) bf16 KGs[2][4 * 64 * 4];   // kra P-28: kgB tile of step kt (double buffer)
     __shared__ float BETAs[kBT];                        // kra P-28: masked beta of the chunk's rows
     const int tid = threadIdx.x, r = tid >> 6, l = tid & 63, m = l & 15, q = l >> 4, pm = pi16(m);
-    // kra P-88: head-fastest grid when launched as dim3(H, NT) (H == NT: both orders are the same bijection)
-    const bool hf_ = gridDim.x == (unsigned)p.H && gridDim.y != (unsigned)p.H;
+    // kra P-88: head-fastest grid when launched as dim3(H, NT).  kra P-96: the launcher says so explicitly --
+    // inferring it from gridDim fell back to chunk-fastest whenever H == NT (e.g. T 4096 / H 64).
+    const bool hf_ = p.hf != 0;
     const int i = hf_ ? (int)blockIdx.y : (int)blockIdx.x, hh = hf_ ? (int)blockIdx.x : (int)blockIdx.y, H = p.H;
     const int tr = 16 * r + m;
     const long tok0 = g2_row_tok<VL>(p.ctok, i);
@@ -1132,8 +1135,9 @@ __device__ __forceinline__ void s4b_tail(const WyS4BParams& p, S4BSmem& sm, cons
                                          float db, float beta_t, long tok0, int cl) {
     using namespace ipi;
     const int l = threadIdx.x & 63, m = l & 15, q = l >> 4, pm = pi16(m);
-    // kra P-88: head-fastest grid when launched as dim3(H, NT) (H == NT: both orders are the same bijection)
-    const bool hf_ = gridDim.x == (unsigned)p.H && gridDim.y != (unsigned)p.H;
+    // kra P-88: head-fastest grid when launched as dim3(H, NT).  kra P-96: the launcher says so explicitly --
+    // inferring it from gridDim fell back to chunk-fastest whenever H == NT (e.g. T 4096 / H 64).
+    const bool hf_ = p.hf != 0;
     const int i = hf_ ? (int)blockIdx.y : (int)blockIdx.x, hh = hf_ ? (int)blockIdx.x : (int)blockIdx.y, H = p.H;
     const int R = H * kD, RA = H * kBT;
     const size_t cb = g2_rm_tok(tok0, hh, H, kD), cbA = g2_rm_tok(tok0, hh, H, kBT);
@@ -1379,8 +1383,9 @@ __global__ void __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(1, 3))
 p3_wy_s4b_kernel(WyS4BParams p) {
     __shared__ __align__(16) S4BSmem sm;
     const int tid = threadIdx.x, r = tid >> 6, l = tid & 63, m = l & 15, q = l >> 4;
-    // kra P-88: head-fastest grid when launched as dim3(H, NT) (H == NT: both orders are the same bijection)
-    const bool hf_ = gridDim.x == (unsigned)p.H && gridDim.y != (unsigned)p.H;
+    // kra P-88: head-fastest grid when launched as dim3(H, NT).  kra P-96: the launcher says so explicitly --
+    // inferring it from gridDim fell back to chunk-fastest whenever H == NT (e.g. T 4096 / H 64).
+    const bool hf_ = p.hf != 0;
     const int i = hf_ ? (int)blockIdx.y : (int)blockIdx.x, hh = hf_ ? (int)blockIdx.x : (int)blockIdx.y, H = p.H;
     const int tr = 16 * r + m;
     const long tok0 = g2_row_tok<VL>(p.ctok, i);
@@ -1444,6 +1449,7 @@ extern "C" int g2_wy_s4_split_r(const void* q_kgb, const void* k, const void* v_
                        (bf16*)dv2, (bf16*)dwT, (float*)dA, (float*)db_part, T, H, NT,
                        ctok, clen, (const bf16*)dv2c};
         const dim3 s4grd = g2::g2_env_long("KDA_G2_S4_HF", 1) ? dim3(H, NT) : dim3(NT, H);   // kra P-88 (default on)
+        pa.hf = g2::g2_env_long("KDA_G2_S4_HF", 1) != 0;   // kra P-96
         int afs_maxh = 12;   // kra P-28c (H=24 measured mixed: 1.036x at 8K, 0.94-0.97x at 32K-64K)
         if (const char* e = g2::g2_getenv("KDA_G2_S4A_AFS_MAXH")) afs_maxh = atoi(e);
         const bool afs = H <= afs_maxh;
@@ -1471,6 +1477,7 @@ extern "C" int g2_wy_s4_split_r(const void* q_kgb, const void* k, const void* v_
                        (float*)dq, (float*)dk, (float*)dg, (float*)db, scale, T, H, NT,
                        ctok, clen, (const bf16*)do_row, (const bf16*)vnc};
         const dim3 s4grd = g2::g2_env_long("KDA_G2_S4_HF", 1) ? dim3(H, NT) : dim3(NT, H);   // kra P-88 (default on)
+        pb.hf = g2::g2_env_long("KDA_G2_S4_HF", 1) != 0;   // kra P-96
         if (ctok) hipLaunchKernelGGL(p3_wy_s4b_kernel<true>, s4grd, dim3(256), 0, s, pb);
         else hipLaunchKernelGGL(p3_wy_s4b_kernel<false>, s4grd, dim3(256), 0, s, pb);
         return (int)hipGetLastError();
