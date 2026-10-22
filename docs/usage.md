@@ -103,6 +103,28 @@ KDA 的 HIP kernel（G2）已经编译在 flash-train 里（`libflash_train.so`�
 
 **环境要求**：BW1000 等 gfx936 卡；K = V = 128（K3 满足）。已验证的镜像为 das megatron 0.18.2（DTK 26.04、torch 2.10、Python 3.10）。
 
+#### 输入形状：B / T / H 的含义
+
+`[B, T, H, 128]` 沿用 FLA `chunk_kda` 的约定，和“T = 总 token 数”的常见写法不完全一样：
+
+| 记号 | 含义 |
+|---|---|
+| B | 张量的 batch 维 |
+| T | 每条样本的序列长度，不包含 B |
+| H | 本卡上的 KDA head 数，即总 head 数 / TP（K3 为 96/TP，TP8 时 H = 12） |
+| 128 | head_dim（K = V = 128） |
+
+q / k / v / g 都是 `[B, T, H, 128]`，beta 是 `[B, T, H]`，A_log 是 `[H]`，dt_bias 是 `[H*128]`（或 `[H, 128]`），所以 B / T / H 确定后所有输入的形状都确定了。
+
+两种输入方式：
+
+- **定长（不传 `cu_seqlens`）**：B = micro batch size（`--micro-batch-size`），T = seq_len，每卡总 token 数 = B × T。例如 micro batch size 1、seq_len 32768、TP8 时，每卡输入为 `[1, 32768, 12, 128]`。
+- **变长序列（packed / THD，传 `cu_seqlens`）**：一个 micro batch 里长度不同的多条序列首尾拼成一条，B 必须为 1，T = 拼起来的总 token 数（约 micro batch size × seq_len），`cu_seqlens`（int32 `[N+1]`）标出每条序列的边界，例如 `[0, 1000, 4000, 8192]`。所以在变长序列这种输入方式下，T 就是“总 token 数”。
+
+预训练里如果只是把多篇文档直接拼接、没有传 `cu_seqlens`，对 KDA 来说仍是一条定长序列，属于第一种方式。
+
+需要我们按实际训练配置测性能时，提供以下几项即可：TP（或每卡 head 数）、micro batch size、seq_len、是否传 `cu_seqlens`（是的话附大致的文档长度分布或一份典型的 `cu_seqlens`）、是否开全层重算。CP（context parallel）目前不支持。
+
 #### 1. 获取源码、编译和安装
 
 在训练用的镜像（容器）里执行。wheel 绑定编译时的 DTK、torch 和 Python 版本，所以要在同一个镜像里编译；换了镜像要重新编译。
