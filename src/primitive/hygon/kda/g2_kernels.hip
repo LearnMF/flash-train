@@ -79,6 +79,28 @@ __global__ void __launch_bounds__(128)
     gn[(((size_t)h * NT + i) * 8 + a) * 16 + c * 4 + b] = g[((size_t)row * H + h) * 128 + d];
 }
 
+// kra P-99: the backward's Gn producers in one pass (was to_gn + to_gn + exp2, or to_gn + gn_kp):
+// raw = the to_gn value, gn = exp2f(raw) in the to_gn order; kp: raw / gnat = raw / exp2f(raw) at the
+// natural-k slot j (as g2_gn_kp).  Same values, same exp2f -> bit-identical.
+__global__ void __launch_bounds__(128)
+    kda_gn_all_kernel(const float* __restrict__ g, const int* __restrict__ ctok, const int* __restrict__ clen, int H,
+                      int NT, float* __restrict__ raw, float* __restrict__ gn, float* __restrict__ gnat, int kp) {
+    const int i = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
+    const long row = ctok ? (long)ctok[i] + clen[i] - 1 : (long)i * 64 + 63;
+    const int a = d >> 4, b = (d >> 2) & 3, c = d & 3;
+    const size_t o = (((size_t)h * NT + i) * 8 + a) * 16 + c * 4 + b;
+    const float x = g[((size_t)row * H + h) * 128 + d];
+    const float v = exp2f(x);
+    gn[o] = v;
+    if (kp) {
+        const size_t j = (o & ~(size_t)15) | (size_t)pi16((int)(o & 15));
+        gnat[j] = v;
+        raw[j] = x;
+    } else {
+        raw[o] = x;
+    }
+}
+
 }  // namespace
 }  // namespace g2
 
@@ -90,5 +112,13 @@ extern "C" int g2_kda_tables(const int* cu, int N, int T, int NT, int* ctok, int
 extern "C" int g2_kda_to_gn(const float* g, const int* ctok, const int* clen, int H, int NT, float* gn, hipStream_t s) {
     if (NT <= 0 || H <= 0) return 0;
     hipLaunchKernelGGL(g2::kda_to_gn_kernel, dim3(NT, H), dim3(128), 0, s, g, ctok, clen, H, NT, gn);
+    return (int)hipGetLastError();
+}
+
+extern "C" int g2_kda_gn_all(const float* g, const int* ctok, const int* clen, int H, int NT, float* raw, float* gn,
+                             float* gnat, int kp, hipStream_t s) {   // kra P-99
+    if (NT <= 0 || H <= 0) return 0;
+    if (kp && gnat == nullptr) return -1;
+    hipLaunchKernelGGL(g2::kda_gn_all_kernel, dim3(NT, H), dim3(128), 0, s, g, ctok, clen, H, NT, raw, gn, gnat, kp);
     return (int)hipGetLastError();
 }

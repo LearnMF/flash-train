@@ -39,6 +39,8 @@ int g2_fwd_h_v8o(const void* Wn, const void* Kn, const void* Un, const void* Gn,
                  void* O, void* Ob, void* Vn, void* HbN, void* ANv, float scale, int B, int T, int H, const int* seg,
                  int nseg, const int* ctok, const int* clen, const void* GnRaw, hipStream_t s);
 int g2_exp2_inplace(float* x, long n, hipStream_t s);  // kra P-52: Gn -> exp2f(Gn) decays
+int g2_kda_gn_all(const float* g, const int* ctok, const int* clen, int H, int NT, float* raw, float* gn, float* gnat,
+                  int kp, hipStream_t s);  // kra P-99: to_gn (+ to_gn + exp2 | + gn_kp) in one pass
 int g2_gn_kp(float* raw, float* gp, float* gnat, long n, hipStream_t s);                  // kra P-61e
 int g2_kp_relayout(void* kn, long kn_elems, float* gn, long gn_elems, void* un, hipStream_t s);   // kra P-61e, P-62
 int g2_wu(const void* k, const void* v, const void* q, const void* beta, const void* A, const void* g, void* Wn,
@@ -381,16 +383,11 @@ void backward(const Shape& shape, const BackwardArgs& p, void* workspace, FTrain
                 p1 ? L.Kn : nullptr, L.Qn, L.kgB, nullptr /* kra P-17: no vB */, 1, NT * 64, H, ctok, clen,
                 hsave ? p.saved_h : nullptr, hsave ? L.Vn : nullptr, stream),
           "wu");
-    check(g2_kda_to_gn(static_cast<const float*>(L.g), ctok, clen, H, NT, static_cast<float*>(L.GnRaw), stream), "to_gn");
+    // kra P-99: GnRaw + Gn (exp2f, P-52) [+ GnNat and natural-k GnRaw for the kp layouts, P-61e] in one pass
     const bool kp = g2KpLayout(H);
-    if (kp) {  // kra P-61e: permuted Gn (dhu) + natural-k GnNat (recompute); GnRaw -> natural k in place
-        check(g2_gn_kp(static_cast<float*>(L.GnRaw), static_cast<float*>(L.Gn), static_cast<float*>(L.GnNat),
-                       static_cast<long>(z.CH * 128), stream),
-              "gn_kp");
-    } else {
-        check(g2_kda_to_gn(static_cast<const float*>(L.g), ctok, clen, H, NT, static_cast<float*>(L.Gn), stream), "to_gn");
-        check(g2_exp2_inplace(static_cast<float*>(L.Gn), static_cast<long>(z.CH * 128), stream), "gn_exp2");  // kra P-52
-    }
+    check(g2_kda_gn_all(static_cast<const float*>(L.g), ctok, clen, H, NT, static_cast<float*>(L.GnRaw),
+                        static_cast<float*>(L.Gn), kp ? static_cast<float*>(L.GnNat) : nullptr, kp ? 1 : 0, stream),
+          "gn_all");
     if (p1) {
         check(g2_fwd_h_v8o(L.Wn, L.Kn, L.Un, kp ? L.GnNat : L.Gn, nullptr, nullptr, nullptr, nullptr, L.Vn, L.HbN, nullptr, 1.f, 1,
                            NT * 64, H, L.tab.seg, nseg, nullptr, nullptr, L.GnRaw, stream),
