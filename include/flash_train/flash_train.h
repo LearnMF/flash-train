@@ -63,10 +63,10 @@ FTRAIN_API FTrainStatus ftrainGemm(FTrainStorageView a, FTrainStorageView b, FTr
  *   instead of q / k costs no extra memory when the caller does not keep q / k anyway.
  * - h (bf16 [ftrainKdaSavedHElements(T, H, N, has_cu_seqlens)], opaque layout): the recurrent
  *   state h, 512 B per token and head; the backward then runs no recurrence of its own.
- *   Recommended whenever a backward follows and H <= 48 (measured faster on gfx936).
+ *   Recommended whenever a backward follows and H <= 64 (measured faster on gfx936).
  * - state (bf16 [ftrainKdaStateElements(T, H, N, has_cu_seqlens)], opaque layout): h plus the
  *   backward's v_new operands, 1024 B per token and head. Meant for activation-checkpoint
- *   recompute at H > 48 (the forward runs right before the backward, so the buffer is
+ *   recompute at H > 64 (the forward runs right before the backward, so the buffer is
  *   short-lived). Exclusive with h.
  */
 typedef struct {

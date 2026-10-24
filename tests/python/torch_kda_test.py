@@ -142,7 +142,7 @@ def _with_env(env, fn):
 
 
 def _with_keep(mode, fn):
-    # keep-state only: saved-h (the default at H <= 48) would take its place
+    # keep-state only: saved-h (the default at H <= 64) would take its place
     return _with_env({"FTRAIN_KDA_KEEP_STATE": mode, "FTRAIN_KDA_SAVE_H": "0"}, fn)
 
 
@@ -175,7 +175,7 @@ def test_saved_routes_are_bit_identical(T, H, cu, gate_in_kernel, route):
 
 
 def test_saved_h_skips_the_backward_recurrence():
-    """Saved-h (the default at H <= 48): a plain training step launches the recurrence once
+    """Saved-h (the default at H <= 64): a plain training step launches the recurrence once
     (forward only); with it off the backward recomputes it."""
     T, H = 512, 4
     x = make_inputs(T, H, True, seed=7)
@@ -220,11 +220,12 @@ def _spy_saves(monkeypatch):
 
 
 @pytest.mark.parametrize("H,policy,want", [
-    (4, None, (False, True, True)),    # measured policy: save h at <= 48 heads
+    (4, None, (False, True, True)),    # measured policy: save h at <= 64 heads
     (4, True, (False, True, True)),
     (4, False, (False, True, False)),  # minimal set: no h
-    (52, None, (False, True, False)),  # > 48 heads: no h outside a checkpoint recompute
-    (52, True, (False, True, True)),
+    (64, None, (False, True, True)),
+    (68, None, (False, True, False)),  # > 64 heads: no h outside a checkpoint recompute
+    (68, True, (False, True, True)),
 ])
 def test_disable_recompute_selects_the_saved_set(monkeypatch, H, policy, want):
     """chunk_kda's disable_recompute (FLA's meaning) picks what the forward keeps; the result is

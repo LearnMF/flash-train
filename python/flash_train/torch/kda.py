@@ -31,9 +31,10 @@ DECAY_LOWER_BOUND = -5.0
 
 # Saved-h (the forward saves the recurrent state h, 512 B per token and head, and the backward runs
 # no recurrence) is the default up to this many heads per call: measured faster than both the
-# backward recompute and the keep-state hand-over on gfx936 (H = 12 .. 48); at H = 96 the forward's
-# extra h store does not pay and the backward recomputes (or takes the keep-state hand-over).
-SAVE_H_MAX_HEADS = 48
+# backward recompute and the keep-state hand-over on gfx936 (H = 8 .. 64; at H = 64, Megatron-LM-k3
+# TP1, 1.03-1.08x over T 1K-32K); at H = 96 the forward's extra h store does not pay and the backward
+# recomputes (or takes the keep-state hand-over).
+SAVE_H_MAX_HEADS = 64
 
 
 def _thd(x, name):
@@ -127,7 +128,7 @@ def kimi_delta_attention(q, k, v, g, beta, *, cu_seqlens=None, scale=None, A_log
     algorithm requires (one device reduction and a host read per call).
     ``disable_recompute`` (FLA's meaning) chooses what the forward keeps for the backward; every
     choice is bit-identical. None (default): the measured policy -- save the recurrent state h
-    (512 B per token and head) at <= 48 heads, hand the full state over inside a reentrant
+    (512 B per token and head) at <= 64 heads, hand the full state over inside a reentrant
     activation-checkpoint recompute; True: always save h, the backward runs no recurrence;
     False: the minimal set (FLA's default memory), the backward recomputes the recurrence.
     Raises RuntimeError (FTRAIN_STATUS_UNSUPPORTED) for configurations no flash-train

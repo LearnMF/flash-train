@@ -62,7 +62,7 @@
 
 /**
  * @brief KDA (flash_train.torch): the forward saves the recurrent state h so the backward runs no
- * recurrence: "auto" (default, at most 48 heads per call), "1" (always) or "0" (never). Read at
+ * recurrence: "auto" (default, at most 64 heads per call), "1" (always) or "0" (never). Read at
  * every forward call.
  */
 #define FTRAIN_KDA_SAVE_H "FTRAIN_KDA_SAVE_H"

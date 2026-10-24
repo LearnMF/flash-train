@@ -75,7 +75,7 @@ o.sum().backward()                                      # 支持 autograd：q/k/
 
 | `disable_recompute` | 前向留给反向的内容 | 新增显存（每 token·head，含 o） | 反向 |
 |---|---|---:|---|
-| 不传（`None`，默认） | H ≤ 48 时保存 h；H > 48 时不保存，但在可重入 checkpoint 的重算前向里交出完整状态（只活到这一层的反向结束） | H ≤ 48 约 1544 B；H > 48 约 1032 B | 速度最优（gfx936 实测） |
+| 不传（`None`，默认） | H ≤ 64 时保存 h；H > 64 时不保存，但在可重入 checkpoint 的重算前向里交出完整状态（只活到这一层的反向结束） | H ≤ 64 约 1544 B；H > 64 约 1032 B | 速度最优（gfx936 实测） |
 | `True` | 总是保存 h | 约 1544 B | 不跑递推 |
 | `False` | 最小集合（与 FLA 默认的显存相同） | 约 1032 B | 重跑一次递推 |
 
@@ -197,7 +197,7 @@ def kda(q, k, v, g, beta, a_log, dt_bias, lower_bound, *, cu_seqlens=None):
 | 变量 | 默认 | 作用 |
 |---|---|---|
 | `FTRAIN_KDA_SAVE_QKN` | `1` | `0`：前向保存 q/k 而不是 qn/kn，反向重建 qn/kn |
-| `FTRAIN_KDA_SAVE_H` | `auto` | `1` 总是保存 h，`0` 从不保存，`auto` 在 H ≤ 48 时保存 |
+| `FTRAIN_KDA_SAVE_H` | `auto` | `1` 总是保存 h，`0` 从不保存，`auto` 在 H ≤ 64 时保存 |
 | `FTRAIN_KDA_KEEP_STATE` | `auto` | 不保存 h 时，`1` 总是交出完整状态，`0` 从不交出，`auto` 只在可重入 checkpoint 的重算前向里交出 |
 | `FTRAIN_KDA_DEV` | 不设置 | 设为非空且不为 `0` 时，G2 kernel 才读取从 hip_kda 继承的调参开关（`KDA_G2_*`、`G2_*_STOP`）；不设置时这些开关一律取默认值，训练环境里残留的 hip_kda 变量不会影响 flash-train |
 
