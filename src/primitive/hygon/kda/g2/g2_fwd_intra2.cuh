@@ -39,6 +39,10 @@ typedef float f2 __attribute__((ext_vector_type(2)));
 __device__ __forceinline__ f4 mmac32(f2 a, f2 b, f4 c) {
 #if !defined(__HIP_DEVICE_COMPILE__) || defined(__gfx936__)
     return __builtin_amdgcn_mmac_f32_16x16x8f32(a, b, c);
+#elif defined(__gfx938__) && __has_builtin(__builtin_hcu_mmac_16x16x8_f32_lit_lts)
+    // gfx938's native MMAC builtin with lit = lts = false: the same operation as gfx936's
+    // v_mmac (bit-identical); the generic amdgcn builtin lowers with lit / lts set on gfx938.
+    return __builtin_hcu_mmac_16x16x8_f32_lit_lts(a, b, c, false, false);
 #else
     __builtin_trap();  // gfx936-only matrix instruction: the KDA Primitives reject other archs
     return c;

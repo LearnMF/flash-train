@@ -122,3 +122,25 @@ extern "C" int g2_kda_gn_all(const float* g, const int* ctok, const int* clen, i
     hipLaunchKernelGGL(g2::kda_gn_all_kernel, dim3(NT, H), dim3(128), 0, s, g, ctok, clen, H, NT, raw, gn, gnat, kp);
     return (int)hipGetLastError();
 }
+
+// flash-train: the gfx938 KDA code is real only when the compiler provides gfx938's native MMAC
+// builtins (__builtin_hcu_mmac_*_lit_lts, e.g. the dtk2610 images); an older DTK compiles trap bodies
+// for gfx938. The runtime asks the device's code object once before advertising gfx938.
+__global__ void g2_arch_probe_kernel(int* out) {
+#if defined(__gfx938__) && !(__has_builtin(__builtin_hcu_mmac_f32_16x16x16_bf16_lit_lts) && \
+                             __has_builtin(__builtin_hcu_mmac_16x16x8_f32_lit_lts))
+    *out = 0;
+#else
+    *out = 1;
+#endif
+}
+
+extern "C" int g2_kernels_usable() {   // on the current device; synchronous
+    int* d = nullptr;
+    int h  = 0;
+    if (hipMalloc(&d, sizeof(int)) != hipSuccess) return 0;
+    hipLaunchKernelGGL(g2_arch_probe_kernel, dim3(1), dim3(1), 0, 0, d);
+    const bool ok = hipGetLastError() == hipSuccess && hipMemcpy(&h, d, sizeof(int), hipMemcpyDeviceToHost) == hipSuccess;
+    (void)hipFree(d);
+    return ok && h == 1;
+}

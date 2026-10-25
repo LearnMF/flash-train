@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -15,6 +17,7 @@
 // Launchers defined in g2_kernels.hip (and the g2/ headers it includes).
 extern "C" {
 int g2_kda_tables(const int* cu, int N, int T, int NT, int* ctok, int* clen, int* seg, hipStream_t s);
+int g2_kernels_usable();
 int g2_kda_to_gn(const float* g, const int* ctok, const int* clen, int H, int NT, float* gn, hipStream_t s);
 int g2_head_l2n2(const void* q, const void* k, void* qn, void* kn, void* q_rstd, void* k_rstd, long rows,
                  hipStream_t s);
@@ -415,7 +418,20 @@ void backward(const Shape& shape, const BackwardArgs& p, void* workspace, FTrain
 bool deviceSupported(FTrainDeviceId device) noexcept {
     hipDeviceProp_t prop;
     if (hipGetDeviceProperties(&prop, device) != hipSuccess) { return false; }
-    return std::strncmp(prop.gcnArchName, "gfx936", 6) == 0;
+    if (std::strncmp(prop.gcnArchName, "gfx936", 6) == 0) { return true; }
+    if (std::strncmp(prop.gcnArchName, "gfx938", 6) != 0) { return false; }
+    // gfx938 (BW1102) runs the same kernels bit-identically through its native MMAC builtins, which
+    // only newer DTKs provide: ask this build's gfx938 code object once per device.
+    static std::array<std::atomic<int>, 64> known{};   // 0 unknown, 1 usable, 2 not
+    if (device >= 0 && device < static_cast<int>(known.size()) && known[device].load() != 0) {
+        return known[device].load() == 1;
+    }
+    int current = 0;
+    if (hipGetDevice(&current) != hipSuccess || hipSetDevice(device) != hipSuccess) { return false; }
+    const bool usable = g2_kernels_usable() != 0;
+    (void)hipSetDevice(current);
+    if (device >= 0 && device < static_cast<int>(known.size())) { known[device].store(usable ? 1 : 2); }
+    return usable;
 }
 
 }  // namespace kda_g2

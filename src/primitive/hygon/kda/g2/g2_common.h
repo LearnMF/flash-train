@@ -34,6 +34,10 @@ __device__ __forceinline__ int c_col(int l, int e) { return (l >> 4) + 4 * e; }
 __device__ __forceinline__ f4 mmac(v4bh a, v4bh b, f4 c) {
 #if !defined(__HIP_DEVICE_COMPILE__) || defined(__gfx936__)
     return __builtin_amdgcn_mmac_f32_16x16x16bf16(a, b, c);
+#elif defined(__gfx938__) && __has_builtin(__builtin_hcu_mmac_f32_16x16x16_bf16_lit_lts)
+    // gfx938's native MMAC builtin with lit = lts = false: the same operation as gfx936's
+    // v_mmac (bit-identical); the generic amdgcn builtin lowers with lit / lts set on gfx938.
+    return __builtin_hcu_mmac_f32_16x16x16_bf16_lit_lts(a, b, c, false, false);
 #else
     __builtin_trap();  // gfx936-only matrix instruction: the KDA Primitives reject other archs
     return c;

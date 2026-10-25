@@ -132,7 +132,7 @@ def kimi_delta_attention(q, k, v, g, beta, *, cu_seqlens=None, scale=None, A_log
     activation-checkpoint recompute; True: always save h, the backward runs no recurrence;
     False: the minimal set (FLA's default memory), the backward recomputes the recurrence.
     Raises RuntimeError (FTRAIN_STATUS_UNSUPPORTED) for configurations no flash-train
-    implementation supports: the G2 kernels run on gfx936 with K = V = 128.
+    implementation supports: the G2 kernels run on gfx936 / gfx938 with K = V = 128.
     """
     q, k, v, g = (_thd(t, n) for t, n in ((q, "q"), (k, "k"), (v, "v"), (g, "g")))
     beta_in = _thd(beta.unsqueeze(-1), "beta").squeeze(-1) if beta.dim() == 3 else beta.contiguous()

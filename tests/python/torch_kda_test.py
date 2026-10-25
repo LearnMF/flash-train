@@ -19,10 +19,10 @@ import flash_train.torch as ft
 def _gfx936():
     if not torch.cuda.is_available():
         return False
-    return getattr(torch.cuda.get_device_properties(0), "gcnArchName", "").startswith("gfx936")
+    return getattr(torch.cuda.get_device_properties(0), "gcnArchName", "").startswith(("gfx936", "gfx938"))
 
 
-pytestmark = pytest.mark.skipif(not _gfx936(), reason="the G2 KDA kernels target gfx936")
+pytestmark = pytest.mark.skipif(not _gfx936(), reason="the G2 KDA kernels target gfx936 / gfx938")
 
 TOL = {"o": 2e-2, "q": 4e-2, "k": 4e-2, "v": 4e-2, "g": 6e-2, "beta": 6e-2, "A_log": 6e-2, "dt_bias": 6e-2}
 
