@@ -101,12 +101,29 @@ __global__ void __launch_bounds__(256) g2_gate_kernel(GateParams p) {
     // the row index (FLA's tl.cumsum tree is O(log n)); the compensation rides along into
     // the carry so every prefix is the correctly-rounded-ish sum of its gates.
     float2 run = float2{0.f, 0.f}, cmp = float2{0.f, 0.f};
+#if G2_SIGFAST
+    bool fast = false;                                  // kra P-938sg (gfx938): range-free sigmoid when proven
+    if constexpr (GATE == 1) {
+        float mx = 0.f, sx = 0.f;
+        #pragma unroll
+        for (int u = 0; u < 16; ++u) { g2_sig_acc(A * v[u].x, mx, sx); g2_sig_acc(A * v[u].y, mx, sx); }
+        fast = g2_sig_fast(mx, sx);
+    }
+#endif
     #pragma unroll
     for (int u = 0; u < 16; ++u) {
         float2 gt = v[u];
         if constexpr (GATE == 1) {
+#if G2_SIGFAST
+            if (fast) {
+                gt.x = p.lower_bound * rcp1(1.f + expf_core(-(A * gt.x)));
+                gt.y = p.lower_bound * rcp1(1.f + expf_core(-(A * gt.y)));
+            } else
+#endif
+            {
             gt.x = p.lower_bound * (1.f / (1.f + expf(-(A * gt.x))));
             gt.y = p.lower_bound * (1.f / (1.f + expf(-(A * gt.y))));
+            }
         }
         if (VL && r0 + u >= cl) gt = float2{0.f, 0.f};  // rows past the end add nothing
         {

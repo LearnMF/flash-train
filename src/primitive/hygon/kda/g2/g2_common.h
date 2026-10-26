@@ -58,6 +58,33 @@ __device__ __forceinline__ v4bh ld8(const bf16* p) {  // 4 consecutive bf16 (8-b
 }
 __device__ __forceinline__ f4 ld16f(const float* p) { return *reinterpret_cast<const f4*>(p); }
 
+#if defined(__gfx938__)
+#define G2_SIGFAST 1
+// kra P-938sg: the sigmoid's expf and divide without their range handling, valid where proven exhaustively on gfx938
+// (rcp_exh.hip / exp_exh.hip): expf_core == expf for every fp32 |x| <= 87 and every NaN (the ocml sequence of the
+// prep_a ISA minus the overflow / underflow selects); rcp1 == 1.f / d for every fp32 d in [1, 2^126) (the divide
+// sequence with numerator 1, no scale / fixup; NaN payloads differ, so NaN takes the reference path).
+__device__ __forceinline__ float expf_core(float x) {
+    #pragma clang fp contract(off)
+    const float ph = x * __uint_as_float(0x3fb8aa3bu);
+    float pl = __builtin_fmaf(x, __uint_as_float(0x3fb8aa3bu), -ph);
+    const float e = __builtin_rintf(ph);
+    pl = __builtin_fmaf(x, __uint_as_float(0x32a5705fu), pl);
+    const float t = (ph - e) + pl;
+    return __builtin_amdgcn_ldexpf(__builtin_amdgcn_exp2f(t), (int)e);
+}
+__device__ __forceinline__ float rcp1(float d) {
+    #pragma clang fp contract(off)
+    const float r0 = __builtin_amdgcn_rcpf(d);
+    const float r1 = __builtin_fmaf(__builtin_fmaf(-d, r0, 1.f), r0, r0);
+    const float q1 = __builtin_fmaf(__builtin_fmaf(-d, r1, 1.f), r1, r1);
+    return __builtin_fmaf(__builtin_fmaf(-d, q1, 1.f), r1, q1);
+}
+// wave-uniform selector: every argument |x| <= 87 and none NaN (a NaN anywhere makes the running sum NaN)
+__device__ __forceinline__ void g2_sig_acc(float x, float& mx, float& sx) { mx = fmaxf(mx, fabsf(x)); sx += x; }
+__device__ __forceinline__ bool g2_sig_fast(float mx, float sx) { return __all(mx <= 87.f && sx == sx); }
+#endif
+
 // kra P-938t: gfx938 MLS as a tile copier: one wave instruction moves 32 rows x 64 B (row stride stride_b16 2-byte
 // elements) from memory into 2 KB of contiguous LDS, no VGPRs, 0.29x the TA work per byte of per-lane loads
 // (ta_forms.hip).  Tracked by vmcnt.

@@ -47,6 +47,8 @@ struct PrepBParams {
     float scale;
     int H, NT;
     int kp = 0;   // kra P-62: Un with the pm column order (as Wn) when H <= KPERM_MAX_H
+    int stop = 0; // phase timing (G2_PREPB_STOP, dev only): 1 after the R loads, 2 after Aqk / AqkA, 3 after the
+                  // solve + Akk, 4 after pass 0 (Wn); 0 = full
 };
 
 
@@ -83,28 +85,6 @@ __device__ __forceinline__ void gate_load(const PrepAParams& p, GRaw<GATE>& gr, 
 // G half tile: 32 rows x 128 fp32 (quarters 2h, 2h+1), columns XOR-swizzled by row.
 __device__ __forceinline__ int gsw(int r, int c) { return r * 128 + (c ^ ((r & 7) << 2)); }
 
-#if defined(__gfx938__)
-// kra P-938sg: the sigmoid's expf and divide without their range handling, valid where proven exhaustively on gfx938
-// (rcp_exh.hip / exp_exh.hip): expf_core == expf for every fp32 |x| <= 87 and every NaN (the ocml sequence of the
-// prep_a ISA minus the overflow / underflow selects); rcp1 == 1.f / d for every fp32 d in [1, 2^126) (the divide
-// sequence with numerator 1, no scale / fixup; NaN payloads differ, so NaN takes the reference path).
-__device__ __forceinline__ float expf_core(float x) {
-    #pragma clang fp contract(off)
-    const float ph = x * __uint_as_float(0x3fb8aa3bu);
-    float pl = __builtin_fmaf(x, __uint_as_float(0x3fb8aa3bu), -ph);
-    const float e = __builtin_rintf(ph);
-    pl = __builtin_fmaf(x, __uint_as_float(0x32a5705fu), pl);
-    const float t = (ph - e) + pl;
-    return __builtin_amdgcn_ldexpf(__builtin_amdgcn_exp2f(t), (int)e);
-}
-__device__ __forceinline__ float rcp1(float d) {
-    #pragma clang fp contract(off)
-    const float r0 = __builtin_amdgcn_rcpf(d);
-    const float r1 = __builtin_fmaf(__builtin_fmaf(-d, r0, 1.f), r0, r0);
-    const float q1 = __builtin_fmaf(__builtin_fmaf(-d, r1, 1.f), r1, r1);
-    return __builtin_fmaf(__builtin_fmaf(-d, q1, 1.f), r1, q1);
-}
-#endif
 
 // g2_gate_kernel's scan + carry, every lane once (lane c: columns 2c, 2c+1; wave w: quarter w).
 // v holds the raw (bf16 + dt_bias / fp32) gate on entry and the in-quarter prefix on exit.
@@ -564,6 +544,7 @@ __device__ __forceinline__ void b_post(const PrepBParams& p, float* smem, const 
     }
 #endif
     lds_barrier();
+    if (p.stop == 1) return;
 
     const int t = 16 * I + m;
     const bool tok_ = g2_row_ok<M>(t, cl);
@@ -584,6 +565,7 @@ __device__ __forceinline__ void b_post(const PrepBParams& p, float* smem, const 
             *reinterpret_cast<v4bh*>(p.AqkA + nat16(nblk64 + (size_t)(cb + 4 * I) * 256 + 4 * l)) = b;
         }
     }
+    if (p.stop == 2) return;
     f4 Ai[4];
     {
         f4 raw;
@@ -658,10 +640,12 @@ __device__ __forceinline__ void b_post(const PrepBParams& p, float* smem, const 
         }
     }
 
+    if (p.stop == 3) return;
     short* T2 = reinterpret_cast<short*>(smem);
     lds_barrier();
     #pragma unroll
     for (int pass = 0; pass < 2; ++pass) {
+        if (pass == 1 && p.stop == 4) return;
         #pragma unroll
         for (int it = 0; it < 4; ++it) {
             const int tid = 64 * I + l;
@@ -771,6 +755,7 @@ extern "C" int g2_fwd_prep_l2n(const void* q, const void* k, const void* v, cons
                            (short*)Wn, (short*)Un, (short*)AqkA, (short*)Aqk, (short*)Akk,
                            ctok, clen, (float)scale, H, NT};
     pb.kp = pa.kp;   // kra P-62
+    if (const char* e = g2::g2_getenv("G2_PREPB_STOP")) pb.stop = atoi(e);
     if (ctok) hipLaunchKernelGGL(g2::r4::g2_fwd_prep_b_kernel<true>, grid, blk, 0, s, pb);
     else hipLaunchKernelGGL(g2::r4::g2_fwd_prep_b_kernel<false>, grid, blk, 0, s, pb);
     return (int)hipGetLastError();
