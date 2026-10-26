@@ -443,6 +443,9 @@ __global__ void __launch_bounds__(256) g2_fwd_prep_a_kernel(PrepAParams p) {
     });   // g2_vl_dispatch
 }
 
+#ifndef KDA_P938B2
+#define KDA_P938B2 1
+#endif
 // kra P-938w: prep_b's T2 index.  gfx938: unpadded [128][64] (the union fits 16 KB -> 4 CTAs per CU) with the
 // token's bits 2..5 XORed by the dim's low 4 bits instead of the +4 padding (4-token vectors stay contiguous, the
 // 16-dim operand reads stay conflict-free).  Layout only.
@@ -469,6 +472,37 @@ __device__ __forceinline__ void b_post(const PrepBParams& p, float* smem, const 
         return f4{r[0], r[64], r[128], r[192]};
     };
 
+#if G2_MLS938
+    // kra P-938b (gfx938): R blocks I..I+1 and 4+I..5+I (2 KB contiguous each) by MLS into a wave-private 4 KB LDS
+    // slot (smem is free until the first barrier; 4 slots = 16 KB) -- 2 tile loads instead of 8 x 4 B gathers per lane
+    float* rl = smem + I * 1024;
+    g2_mls_tile(Rg + I * 256, 32, rl);
+    g2_mls_tile(Rg + (4 + I) * 256, 32, rl + 512);
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    auto R4l = [&](int slot) { const float* r = rl + slot * 256 + 4 * m + q4; return f4{r[0], r[64], r[128], r[192]}; };
+    f4 Aqkd = R4l(0), Ld = R4l(2);
+    f4 Aqko[NA], Akko[NA];
+#if KDA_P938B2
+    // P-938b2: the wave's off-diagonal runs (I blocks from 8 + pidx(I, 0), I blocks from 14 + pidx(I, 0)) in two more
+    // rounds through the same slot, 2 KB tiles aligned to even blocks (all inside the CTA's 20 blocks)
+    auto run = [&](f4* dst, int b0) {
+        const int bb = b0 & ~1;
+        asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");    // previous LDS reads of the slot have returned
+        #pragma unroll
+        for (int t = 0; t < 2; ++t) if (bb + 2 * t <= b0 + I - 1) g2_mls_tile(Rg + (bb + 2 * t) * 256, 32, rl + 512 * t);
+        asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+        #pragma unroll
+        for (int cb = 0; cb < I; ++cb) dst[cb] = R4l(b0 + cb - bb);
+    };
+    if constexpr (I > 0) { run(Aqko, 8 + pidx(I, 0)); run(Akko, 14 + pidx(I, 0)); }
+#else
+    #pragma unroll
+    for (int cb = 0; cb < I; ++cb) {
+        Aqko[cb] = R4(8 + pidx(I, cb));
+        Akko[cb] = R4(14 + pidx(I, cb));
+    }
+#endif
+#else
     f4 Aqkd = R4(I), Ld = R4(4 + I);
     f4 Aqko[NA], Akko[NA];
     #pragma unroll
@@ -476,6 +510,7 @@ __device__ __forceinline__ void b_post(const PrepBParams& p, float* smem, const 
         Aqko[cb] = R4(8 + pidx(I, cb));
         Akko[cb] = R4(14 + pidx(I, cb));
     }
+#endif
     lds_barrier();
 
     const int t = 16 * I + m;
