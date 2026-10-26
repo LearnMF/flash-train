@@ -75,6 +75,42 @@ __device__ __forceinline__ size_t wu_vb_quad(int j, int vq, size_t nblk3) {
 constexpr int kPadJ2 = 68;
 constexpr int kPadA = 68;   // sA row stride (shorts): 136 B rows spread the MMAC A-fragment reads over all banks
 
+// kra P-938m (ds_read_m; semantics identical on gfx936 / gfx938, dsm16.hip): ds_read_m32x16_b16 -- in every 16-lane group, lane j receives element j % 8 of the
+// 16 B rows addressed by the group's source lanes (j / 8) + {0, 4, 8, 12, 2, 6, 10, 14} (verified on BW1102 with
+// random addresses).  The u phase stages vb in its natural [j][v] layout (one 8 B store per thread instead of
+// four transposed b16 stores) and reads each pair of MMAC B fragments (js = 2jp, 2jp + 1) with one instruction:
+// the same register values, the same per-accumulator MMAC order.
+// gfx938 only: on gfx936 the same layouts measured neutral (wu 144 vs 145 us), so its production path stays as is
+#if defined(__gfx938__) && __has_builtin(__builtin_hcu_ds_read_m32x16_bf16)
+#define G2_WU_MLS 1
+#else
+#define G2_WU_MLS 0
+#endif
+// kra P-938r (gfx938 only): A fragments in VGPRs (each wave reads only its own 16 rows of A; no sA: LDS 26880 ->
+// 18176 B) and no exp2f(g) / kg carried from phase 1 to phase 3 (phase 3 re-reads k / g, the same expressions).
+// Bandwidth for registers: wu 1.06-1.10x on gfx938, 0.86-0.95x on gfx936 (5 interleaved reps each), so gfx938 only.
+// A VGPR cap of 168 (3 CTAs per CU) spills and loses on both (0.82-0.90x).
+#if defined(__gfx938__)
+#define G2_WU_LEAN 1
+#else
+#define G2_WU_LEAN 0
+#endif
+constexpr int kPadN = 136;   // natural vb row stride (shorts, 272 B): 64 x 136 = the slab's 128 x 68
+// The j row lane l addresses as an MLS source for B-fragment pair jp: source offset o (even part) feeds
+// output element ie = position of o in {0, 4, 8, 12, 2, 6, 10, 14}; ie < 4 -> js = 2jp, else js = 2jp + 1.
+__device__ __forceinline__ int wu_mls_row(int l, int jp) {
+    const int o = l & 14, g = l >> 4;
+    const int ie = (o & 2) ? 4 + (o >> 2) : (o >> 2);
+    return 16 * (2 * jp + (ie >> 2)) + 4 * g + (ie & 3);
+}
+// kra P-938m2: v_new's saved-h B tiles in the natural [k][v] layout (2 slabs x 128 k x 32 v = the slab's 8192 shorts),
+// written as one 8 B quad per HbN lane (4 consecutive v of one k) and read back with ds_read_m32x16 as B-fragment pairs
+// (kt = 2jp, 2jp + 1).  The 16 B granule index (v >> 3) is XOR-ed with 2 ((k >> 1) & 1) so that a read instruction's
+// 64 granules (32 k rows x 2 granules) fall evenly on the 8 bank slots.
+__device__ __forceinline__ int wu_hbn_idx(int sp, int k, int v) {
+    return sp * 4096 + k * 32 + ((((v >> 3) ^ (((k >> 1) & 1) << 1))) << 3) + (v & 7);
+}
+
 // V1 (kra P-1): bank-conflict-free LDS layouts.  Pure address remaps -- every value is
 // computed exactly as before, so all outputs stay bitwise identical.
 //  slab: the 8 B column granule (j >> 2) of row r is XOR-ed with (r >> 3) & 15, which
@@ -133,7 +169,9 @@ __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p_) {
     __shared__ __align__(16) short slab[128 * kPadJ2];
     __shared__ float sBeta[kBT];
     __shared__ __align__(16) float sGl[kK];   // chunk-last g row: kg = k * 2^(gl-g)
+#if !G2_WU_LEAN
     __shared__ __align__(16) short sA[kBT * kPadA];
+#endif
     const int cl = g2_row_len<VL>(p.clen, i);
     // varlen: ONE uniform branch per CTA -- full chunks run the unmasked body (M=1)
     g2_vl_dispatch<VL>(cl, [&](auto mode_) {
@@ -152,6 +190,17 @@ __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p_) {
         if (tid < 32)                  // 128 floats = 32 f4 quads
             reinterpret_cast<f4*>(sGl)[tid] =
                 ld16f(p.g + sbase + g2_row_g<M>(63, cl) * rstride + 4 * tid);
+#if G2_WU_LEAN
+        v4bh aF[4];   // kra P-938r: this wave's A fragments (row 16 wv + (l & 15), columns 16 js + 4 (l >> 4))
+        {
+            const int r = 16 * wv + (l & 15);
+            #pragma unroll
+            for (int js = 0; js < 4; ++js)
+                aF[js] = g2_row_ok<M>(r, cl) ? *reinterpret_cast<const v4bh*>(
+                    p.A + g2_rm_tok(g2_row_tok<VL>(p.ctok, i) + r, hh, p.H, kBT) + 16 * js + (l >> 4) * 4)
+                    : v4bh{0, 0, 0, 0};
+        }
+#else
         #pragma unroll   // kra P-34: all loads in flight before the first wait
         for (int it_ = 0; it_ < 4; ++it_) {
             const int t = tid + 256 * it_;          // sA: 64x64 bf16 row-major
@@ -161,6 +210,7 @@ __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p_) {
                       p.A + g2_rm_tok(g2_row_tok<VL>(p.ctok, i) + r, hh, p.H, kBT) + c4)
                 : v4bh{0, 0, 0, 0};
         }
+#endif
         __syncthreads();   // sBeta/sGl/sA must land before the phase-1 fill reads them
 
         // ---- MMAC phase: A @ (B-side staged transposed in slab) -> emit from C frags.
@@ -175,9 +225,34 @@ __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p_) {
             f4 acc[8];
             #pragma unroll
             for (int vt = 0; vt < 8; ++vt) acc[vt] = f4{0.f, 0.f, 0.f, 0.f};
+#if G2_WU_MLS
+            if (stop_acc == 5) {   // kra P-938m: u phase, natural vb rows read by MLS
+                for (int jp = 0; jp < 2; ++jp) {
+#if G2_WU_LEAN
+                    const v4bh af0 = aF[2 * jp], af1 = aF[2 * jp + 1];
+#else
+                    const v4bh af0 = *reinterpret_cast<const v4bh*>(
+                        sA + (size_t)(16 * wv + (l & 15)) * kPadA + 32 * jp + (l >> 4) * 4);
+                    const v4bh af1 = *reinterpret_cast<const v4bh*>(
+                        sA + (size_t)(16 * wv + (l & 15)) * kPadA + 32 * jp + 16 + (l >> 4) * 4);
+#endif
+                    short* src = slab + (size_t)wu_mls_row(l, jp) * kPadN + 8 * (l & 1);
+                    #pragma unroll
+                    for (int vt = 0; vt < 8; ++vt) {
+                        const v8bh_l16 r = __builtin_hcu_ds_read_m32x16_bf16(src + 16 * vt);
+                        acc[vt] = mmac(af0, __builtin_shufflevector(r, r, 0, 1, 2, 3), acc[vt]);
+                        acc[vt] = mmac(af1, __builtin_shufflevector(r, r, 4, 5, 6, 7), acc[vt]);
+                    }
+                }
+            } else
+#endif
             for (int js = 0; js < 4; ++js) {
+#if G2_WU_LEAN
+                const v4bh af = aF[js];
+#else
                 const v4bh af = *reinterpret_cast<const v4bh*>(
                     sA + (size_t)(16 * wv + (l & 15)) * kPadA + 16 * js + (l >> 4) * 4);
+#endif
                 #pragma unroll
                 for (int vt = 0; vt < 8; ++vt) {
                     const int br = 16 * vt + (l & 15);
@@ -209,16 +284,32 @@ __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p_) {
                         const v4bh val = *reinterpret_cast<const v4bh*>(
                             p.HbN + ((((size_t)i * p.H + hh) * 8 + kb) * 8 + (2 * vs + vt)) * 256 + ln * 4);
                         const int qq = ln >> 4, mm = ln & 15;
+#if G2_WU_MLS
+                        *reinterpret_cast<v4bh*>(hb + wu_hbn_idx(sp, 16 * kb + pi16(mm), 16 * vt + 4 * qq)) = val;
+#else
                         #pragma unroll
                         for (int e = 0; e < 4; ++e)
                             hb[sp * 32 * kPadK + (16 * vt + 4 * qq + e) * kPadK + 16 * kb + pi16(mm)] = val[e];
+#endif
                     }
                     __syncthreads();
                     #pragma unroll
                     for (int sp = 0; sp < 2; ++sp) {
                         const int vs = 2 * pr + sp;
-                        const short* hs = hb + sp * 32 * kPadK;
                         f4 acc0 = f4{0.f, 0.f, 0.f, 0.f}, acc1 = f4{0.f, 0.f, 0.f, 0.f};
+#if G2_WU_MLS
+                        #pragma unroll
+                        for (int jp = 0; jp < 4; ++jp) {   // per accumulator: kt = 2jp then 2jp + 1, as before
+                            const int kr = wu_mls_row(l, jp);
+                            const v8bh_l16 r0 = __builtin_hcu_ds_read_m32x16_bf16(hb + wu_hbn_idx(sp, kr, 8 * (l & 1)));
+                            const v8bh_l16 r1 = __builtin_hcu_ds_read_m32x16_bf16(hb + wu_hbn_idx(sp, kr, 16 + 8 * (l & 1)));
+                            acc0 = mmac(wA[2 * jp], __builtin_shufflevector(r0, r0, 0, 1, 2, 3), acc0);
+                            acc1 = mmac(wA[2 * jp], __builtin_shufflevector(r1, r1, 0, 1, 2, 3), acc1);
+                            acc0 = mmac(wA[2 * jp + 1], __builtin_shufflevector(r0, r0, 4, 5, 6, 7), acc0);
+                            acc1 = mmac(wA[2 * jp + 1], __builtin_shufflevector(r1, r1, 4, 5, 6, 7), acc1);
+                        }
+#else
+                        const short* hs = hb + sp * 32 * kPadK;
                         #pragma unroll
                         for (int kt = 0; kt < 8; ++kt) {
                             const v4bh hbf0 = *reinterpret_cast<const v4bh*>(hs + (0 * 16 + m) * kPadK + 16 * kt + q4 * 4);
@@ -226,6 +317,7 @@ __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p_) {
                             acc0 = mmac(wA[kt], hbf0, acc0);
                             acc1 = mmac(wA[kt], hbf1, acc1);
                         }
+#endif
                         v4bh x0, x1;
                         #pragma unroll
                         for (int e = 0; e < 4; ++e) {
@@ -318,8 +410,10 @@ __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p_) {
                 gv[dv] = bf_rne(bf2f(kv[dv]) * eg[dv]);
                 gkv[dv] = bf_rne(bf2f(kv[dv]) * __builtin_amdgcn_exp2f(gl[dv] - gf[dv]));
             }
+#if !G2_WU_LEAN
             kgr[it] = *reinterpret_cast<const v4bh*>(gkv);
             egr[it] = eg;
+#endif
             *reinterpret_cast<v4bh*>(p.kgB + wu_vb_quad(j, vq, nblk3)) =
                 *reinterpret_cast<const v4bh*>(gv);
             // KgA: A form, plain row nibble, P1/P2 block order
@@ -343,9 +437,16 @@ __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p_) {
             const v4bh vv = g2_row_ok<M>(j, cl) ? *reinterpret_cast<const v4bh*>(p.v + so)
                                                  : v4bh{0, 0, 0, 0};
             const float b = sBeta[j];
+#if G2_WU_MLS
+            short xb[4];   // kra P-938m: natural [j][v] row, one 8 B store
+            #pragma unroll
+            for (int dv = 0; dv < 4; ++dv) xb[dv] = bf_rne(bf2f(vv[dv]) * b);
+            *reinterpret_cast<v4bh*>(slab + (size_t)j * kPadN + vq) = *reinterpret_cast<const v4bh*>(xb);
+#else
             #pragma unroll
             for (int dv = 0; dv < 4; ++dv)
                 slab[(size_t)(vq + dv) * kPadJ2 + wu_slab_col(vq + dv, j)] = bf_rne(bf2f(vv[dv]) * b);
+#endif
         }
         } else {
         #pragma unroll   // kra P-34: all loads in flight before the first wait
@@ -356,9 +457,16 @@ __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p_) {
             const v4bh vv = g2_row_ok<M>(j, cl) ? *reinterpret_cast<const v4bh*>(p.v + so)
                                                  : v4bh{0, 0, 0, 0};
             const float b = sBeta[j];
+#if G2_WU_MLS
+            short xb[4];   // kra P-938m: natural [j][v] row, one 8 B store
+            #pragma unroll
+            for (int dv = 0; dv < 4; ++dv) xb[dv] = bf_rne(bf2f(vv[dv]) * b);
+            *reinterpret_cast<v4bh*>(slab + (size_t)j * kPadN + vq) = *reinterpret_cast<const v4bh*>(xb);
+#else
             #pragma unroll
             for (int dv = 0; dv < 4; ++dv)
                 slab[(size_t)(vq + dv) * kPadJ2 + wu_slab_col(vq + dv, j)] = bf_rne(bf2f(vv[dv]) * b);
+#endif
             if (p.vB != nullptr)   // kra P-17: production route reads v row-major in s4a instead
                 *reinterpret_cast<v4bh*>(p.vB + wu_vb_quad(j, vq, nblk3)) = vv;
         }
@@ -401,11 +509,23 @@ __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p_) {
                     const v4bh qv = g2_row_ok<M>(j, cl)
                         ? *reinterpret_cast<const v4bh*>(p.q + sbase + (size_t)j * rstride + vq)
                         : v4bh{0, 0, 0, 0};
+#if G2_WU_LEAN
+                    const size_t so = sbase + (size_t)j * rstride + vq;
+                    const v4bh kv = g2_row_ok<M>(j, cl) ? *reinterpret_cast<const v4bh*>(p.k + so) : v4bh{0, 0, 0, 0};
+                    const f4 gf = ld16f(p.g + sbase + (size_t)g2_row_g<M>(j, cl) * rstride + vq);
+                    const f4 gl = *reinterpret_cast<const f4*>(sGl + vq);
+                    #pragma unroll
+                    for (int dv = 0; dv < 4; ++dv) qst[it][dv] = bf_rne(bf2f(qv[dv]) * __builtin_amdgcn_exp2f(gf[dv]));
+                    #pragma unroll
+                    for (int dv = 0; dv < 4; ++dv)
+                        tile[wu_tile_idx(ibn_of(tt) + 4 * dv)] = bf_rne(bf2f(kv[dv]) * __builtin_amdgcn_exp2f(gl[dv] - gf[dv]));
+#else
                     #pragma unroll
                     for (int dv = 0; dv < 4; ++dv) qst[it][dv] = bf_rne(bf2f(qv[dv]) * egr[it][dv]);
                     #pragma unroll
                     for (int dv = 0; dv < 4; ++dv)
                         tile[wu_tile_idx(ibn_of(tt) + 4 * dv)] = kgr[it][dv];
+#endif
                 }
                 __syncthreads();
                 if (p.kp) wu_emit16s(p.Kn + nblk, tile, tid);   // kra P-61e
@@ -417,19 +537,29 @@ __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p_) {
                     for (int dv = 0; dv < 4; ++dv) tile[wu_tile_idx(ibn_of(tid + 256 * it) + 4 * dv)] = qst[it][dv];
             } else if constexpr (QS) {   // kra P-84c: carried exp2f(g) (the Kn branch's expression), q quads first
                 v4bh qvs[8];
+#if G2_WU_LEAN
+                f4 gfs[8];
+#endif
                 #pragma unroll
                 for (int it = 0; it < 8; ++it) {
                     const int tt = tid + 256 * it;
                     const int j = tt >> 5, vq = (tt & 31) << 2;
                     qvs[it] = g2_row_ok<M>(j, cl)
                         ? *reinterpret_cast<const v4bh*>(p.q + sbase + (size_t)j * rstride + vq) : v4bh{0, 0, 0, 0};
+#if G2_WU_LEAN
+                    gfs[it] = ld16f(p.g + sbase + (size_t)g2_row_g<M>(j, cl) * rstride + vq);
+#endif
                 }
                 __syncthreads();                            // every wave's u-MMAC slab reads done
                 #pragma unroll
                 for (int it = 0; it < 8; ++it)
                     #pragma unroll
                     for (int dv = 0; dv < 4; ++dv)
+#if G2_WU_LEAN
+                        tile[wu_tile_idx(ibn_of(tid + 256 * it) + 4 * dv)] = bf_rne(bf2f(qvs[it][dv]) * __builtin_amdgcn_exp2f(gfs[it][dv]));
+#else
                         tile[wu_tile_idx(ibn_of(tid + 256 * it) + 4 * dv)] = bf_rne(bf2f(qvs[it][dv]) * egr[it][dv]);
+#endif
             } else {
                 for (int t = tid; t < 2048; t += 256) {
                     short qgv[4];
