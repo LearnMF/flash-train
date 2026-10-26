@@ -83,6 +83,29 @@ __device__ __forceinline__ void gate_load(const PrepAParams& p, GRaw<GATE>& gr, 
 // G half tile: 32 rows x 128 fp32 (quarters 2h, 2h+1), columns XOR-swizzled by row.
 __device__ __forceinline__ int gsw(int r, int c) { return r * 128 + (c ^ ((r & 7) << 2)); }
 
+#if defined(__gfx938__)
+// kra P-938sg: the sigmoid's expf and divide without their range handling, valid where proven exhaustively on gfx938
+// (rcp_exh.hip / exp_exh.hip): expf_core == expf for every fp32 |x| <= 87 and every NaN (the ocml sequence of the
+// prep_a ISA minus the overflow / underflow selects); rcp1 == 1.f / d for every fp32 d in [1, 2^126) (the divide
+// sequence with numerator 1, no scale / fixup; NaN payloads differ, so NaN takes the reference path).
+__device__ __forceinline__ float expf_core(float x) {
+    #pragma clang fp contract(off)
+    const float ph = x * __uint_as_float(0x3fb8aa3bu);
+    float pl = __builtin_fmaf(x, __uint_as_float(0x3fb8aa3bu), -ph);
+    const float e = __builtin_rintf(ph);
+    pl = __builtin_fmaf(x, __uint_as_float(0x32a5705fu), pl);
+    const float t = (ph - e) + pl;
+    return __builtin_amdgcn_ldexpf(__builtin_amdgcn_exp2f(t), (int)e);
+}
+__device__ __forceinline__ float rcp1(float d) {
+    #pragma clang fp contract(off)
+    const float r0 = __builtin_amdgcn_rcpf(d);
+    const float r1 = __builtin_fmaf(__builtin_fmaf(-d, r0, 1.f), r0, r0);
+    const float q1 = __builtin_fmaf(__builtin_fmaf(-d, r1, 1.f), r1, r1);
+    return __builtin_fmaf(__builtin_fmaf(-d, q1, 1.f), r1, q1);
+}
+#endif
+
 // g2_gate_kernel's scan + carry, every lane once (lane c: columns 2c, 2c+1; wave w: quarter w).
 // v holds the raw (bf16 + dt_bias / fp32) gate on entry and the in-quarter prefix on exit.
 template <int GATE, bool VL>
@@ -98,6 +121,21 @@ __device__ __forceinline__ void gate_scan(const PrepAParams& p, const GRaw<GATE>
         dt0 = d2.x; dt1 = d2.y;
     }
     float2 run = float2{0.f, 0.f}, cmp = float2{0.f, 0.f};
+#if defined(__gfx938__)
+    // P-938sg: one wave-uniform test (all |x| <= 87 and no NaN) selects the range-free expf / divide
+    bool fast = false;
+    if constexpr (GATE == 1) {
+        float mx = 0.f, sx = 0.f, sy = 0.f;
+        #pragma unroll
+        for (int u = 0; u < 16; ++u) {
+            const float gx = bf2f((short)(gr.v[u] & 0xffffu)) + dt0, gy = bf2f((short)(gr.v[u] >> 16)) + dt1;
+            const float xx = -(A * gx), xy = -(A * gy);
+            mx = fmaxf(mx, fmaxf(fabsf(xx), fabsf(xy)));
+            sx += xx; sy += xy;                              // NaN anywhere -> NaN
+        }
+        fast = __all(mx <= 87.f && sx == sx && sy == sy);
+    }
+#endif
     #pragma unroll
     for (int u = 0; u < 16; ++u) {
         float2 gt;
@@ -109,8 +147,16 @@ __device__ __forceinline__ void gate_scan(const PrepAParams& p, const GRaw<GATE>
             gt = gr.v[u];
         }
         if constexpr (GATE == 1) {
+#if defined(__gfx938__)
+            if (fast) {
+                gt.x = p.lower_bound * rcp1(1.f + expf_core(-(A * gt.x)));
+                gt.y = p.lower_bound * rcp1(1.f + expf_core(-(A * gt.y)));
+            } else
+#endif
+            {
             gt.x = p.lower_bound * (1.f / (1.f + expf(-(A * gt.x))));
             gt.y = p.lower_bound * (1.f / (1.f + expf(-(A * gt.y))));
+            }
         }
         if (VL && r0 + u >= cl) gt = float2{0.f, 0.f};
         {
@@ -372,8 +418,14 @@ __global__ void __launch_bounds__(256) g2_fwd_prep_a_kernel(PrepAParams p) {
             #pragma unroll
             for (int kt = 0; kt < 4; ++kt) {
                 const int s0 = 2 * kt, s1 = 2 * kt + 1;
+#if defined(__gfx938__)   // kra P-938ng: gm - G == -(G - gm) in IEEE (non-NaN); the negation folds into v_exp
+                const float d0 = G_(rb, s0) - gm[s0], d1 = G_(rb, s1) - gm[s1];
+                const f2 eA = f2{exp2_inrange(d0), exp2_inrange(d1)};
+                const f2 eB = f2{exp2_inrange(-d0), exp2_inrange(-d1)};
+#else
                 const f2 eA = f2{exp2_inrange(G_(rb, s0) - gm[s0]), exp2_inrange(G_(rb, s1) - gm[s1])};
                 const f2 eB = f2{exp2_inrange(gm[s0] - G_(rb, s0)), exp2_inrange(gm[s1] - G_(rb, s1))};
+#endif
                 const f2 Bd = f2{K(rb, s0), K(rb, s1)} * eB;
                 acc[rb] = mmac32(f2{Q(rb, s0), Q(rb, s1)} * eA, Bd, acc[rb]);
                 acc[4 + rb] = mmac32(f2{K(rb, s0), K(rb, s1)} * eA, Bd, acc[4 + rb]);
