@@ -148,7 +148,9 @@ __device__ __forceinline__ void wu_emit16s(short* dst, const short* tile, int ti
     }
 }
 
-template <bool VL, bool KS = false, bool QS = false>   // kra P-84b: KS; P-84c: QS
+// kra P-938k: KN = 0 compiles the phase-3 Kn branch out (only launched with Kn == nullptr, the saved-h / keep-state
+// routes): its unrolled k / g / q loads set the kernel's VGPR peak (197 -> 173 on gfx938), although those routes never run it.
+template <bool VL, bool KS = false, bool QS = false, int KN = 2>   // kra P-84b: KS; P-84c: QS
 __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p_) {
     // kra P-35: field-wise copy, pointers stamped global (global_* ops, not flat)
     const WuParams p{g2_glb(p_.k), g2_glb(p_.v), g2_glb(p_.q), g2_glb(p_.beta), g2_glb(p_.A), g2_glb(p_.g), g2_glb(p_.Wn), g2_glb(p_.Wb), g2_glb(p_.Un), g2_glb(p_.KgA), g2_glb(p_.Kn), g2_glb(p_.Qn), g2_glb(p_.kgB), g2_glb(p_.vB), p_.H, p_.NT, g2_glb(p_.ctok), g2_glb(p_.clen), p_.stop, p_.kp, g2_glb(p_.HbN), g2_glb(p_.VnOut), p_.order, p_.order_m};   // kra P-82, P-95
@@ -496,7 +498,7 @@ __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p_) {
                 const int j = t >> 5, vq = (t & 31) << 2;
                 return (j & 3) + 4 * (vq & 15) + 64 * ((j >> 2) & 3) + 256 * (j >> 4) + 1024 * (vq >> 4);
             };
-            if (p.Kn != nullptr) {                          // null: keep-state backward
+            if (KN != 0 && p.Kn != nullptr) {               // null: keep-state backward
                 // kra L16: one pass over k / q / g -- kg (phase 1's exact expression, same
                 // inputs) -> tile -> linear 16 B pair emit to Kn; qg waits in registers.
                 short qst[8][4];
@@ -536,28 +538,44 @@ __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p_) {
                     #pragma unroll
                     for (int dv = 0; dv < 4; ++dv) tile[wu_tile_idx(ibn_of(tid + 256 * it) + 4 * dv)] = qst[it][dv];
             } else if constexpr (QS) {   // kra P-84c: carried exp2f(g) (the Kn branch's expression), q quads first
-                v4bh qvs[8];
 #if G2_WU_LEAN
-                f4 gfs[8];
-#endif
+                // kra P-938k: two halves of 4 q / g quads;
+                // the same values land in the same tile slots, so the Qn emit is unchanged
+                #pragma unroll 1   // kra P-938k: NOT unrolled -- the full unroll hoists all of phase 3's addresses /
+                                   // loads and was the kernel's VGPR peak (175 -> 128, no scratch: 3 CTAs per CU)
+                for (int h = 0; h < 2; ++h) {
+                    v4bh qvs[4];
+                    f4 gfs[4];
+                    #pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        const int tt = tid + 256 * (4 * h + i);
+                        const int j = tt >> 5, vq = (tt & 31) << 2;
+                        qvs[i] = g2_row_ok<M>(j, cl)
+                            ? *reinterpret_cast<const v4bh*>(p.q + sbase + (size_t)j * rstride + vq) : v4bh{0, 0, 0, 0};
+                        gfs[i] = ld16f(p.g + sbase + (size_t)g2_row_g<M>(j, cl) * rstride + vq);
+                    }
+                    if (h == 0) __syncthreads();            // every wave's u-MMAC slab reads done
+                    #pragma unroll
+                    for (int i = 0; i < 4; ++i)
+                        #pragma unroll
+                        for (int dv = 0; dv < 4; ++dv)
+                            tile[wu_tile_idx(ibn_of(tid + 256 * (4 * h + i)) + 4 * dv)] =
+                                bf_rne(bf2f(qvs[i][dv]) * __builtin_amdgcn_exp2f(gfs[i][dv]));
+                }
+#else
+                v4bh qvs[8];
                 #pragma unroll
                 for (int it = 0; it < 8; ++it) {
                     const int tt = tid + 256 * it;
                     const int j = tt >> 5, vq = (tt & 31) << 2;
                     qvs[it] = g2_row_ok<M>(j, cl)
                         ? *reinterpret_cast<const v4bh*>(p.q + sbase + (size_t)j * rstride + vq) : v4bh{0, 0, 0, 0};
-#if G2_WU_LEAN
-                    gfs[it] = ld16f(p.g + sbase + (size_t)g2_row_g<M>(j, cl) * rstride + vq);
-#endif
                 }
                 __syncthreads();                            // every wave's u-MMAC slab reads done
                 #pragma unroll
                 for (int it = 0; it < 8; ++it)
                     #pragma unroll
                     for (int dv = 0; dv < 4; ++dv)
-#if G2_WU_LEAN
-                        tile[wu_tile_idx(ibn_of(tid + 256 * it) + 4 * dv)] = bf_rne(bf2f(qvs[it][dv]) * __builtin_amdgcn_exp2f(gfs[it][dv]));
-#else
                         tile[wu_tile_idx(ibn_of(tid + 256 * it) + 4 * dv)] = bf_rne(bf2f(qvs[it][dv]) * egr[it][dv]);
 #endif
             } else {
@@ -605,11 +623,15 @@ extern "C" int g2_wu(const void* k, const void* v, const void* q, const void* be
     const bool ks = g2::g2_env_long("KDA_G2_WU_KS", 1) != 0;   // kra P-84b (default on)
     const bool qs = g2::g2_env_long("KDA_G2_WU_QS", 1) != 0;   // kra P-84c (default on)
     if (ctok) {
-        if (ks && qs) hipLaunchKernelGGL((g2::g2_wu_kernel<true, true, true>), dim3(T / 64, H), dim3(256), 0, s, p);
+        if (ks && qs && Kn == nullptr && g2::g2_cur_gfx938())   // kra P-938k
+                      hipLaunchKernelGGL((g2::g2_wu_kernel<true, true, true, 0>), dim3(T / 64, H), dim3(256), 0, s, p);
+        else if (ks && qs) hipLaunchKernelGGL((g2::g2_wu_kernel<true, true, true>), dim3(T / 64, H), dim3(256), 0, s, p);
         else if (ks)  hipLaunchKernelGGL((g2::g2_wu_kernel<true, true>), dim3(T / 64, H), dim3(256), 0, s, p);
         else          hipLaunchKernelGGL(g2::g2_wu_kernel<true>, dim3(T / 64, H), dim3(256), 0, s, p);
     } else {
-        if (ks && qs) hipLaunchKernelGGL((g2::g2_wu_kernel<false, true, true>), dim3(T / 64, H), dim3(256), 0, s, p);
+        if (ks && qs && Kn == nullptr && g2::g2_cur_gfx938())   // kra P-938k
+                      hipLaunchKernelGGL((g2::g2_wu_kernel<false, true, true, 0>), dim3(T / 64, H), dim3(256), 0, s, p);
+        else if (ks && qs) hipLaunchKernelGGL((g2::g2_wu_kernel<false, true, true>), dim3(T / 64, H), dim3(256), 0, s, p);
         else if (ks)  hipLaunchKernelGGL((g2::g2_wu_kernel<false, true>), dim3(T / 64, H), dim3(256), 0, s, p);
         else          hipLaunchKernelGGL(g2::g2_wu_kernel<false>, dim3(T / 64, H), dim3(256), 0, s, p);
     }
