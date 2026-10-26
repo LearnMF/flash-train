@@ -827,6 +827,11 @@ struct WyS4BParams {
     int hf = 0;                         // kra P-96: head-fastest grid (blockIdx.x = head), set by the launcher
 };
 
+#if defined(__gfx938__)
+#define G2_S4A_LEAN 1   // kra P-938a
+#else
+#define G2_S4A_LEAN 0
+#endif
 // VL (varlen phase 2): the row tensors (v_row, A, beta, dv2 here; q_row, k, g, dAqk, dq,
 // dk, dg, db in B) are PACKED -- rows r >= clen read as 0 (g: clamped row) and are never
 // written.  The dA (dak) handoff between A and B is internal and stays chunk-padded.
@@ -836,8 +841,17 @@ p3_wy_s4a_kernel(WyS4AParams p_) {
     // kra P-35: field-wise copy, pointers stamped global (global_* ops, not flat)
     const WyS4AParams p{g2_glb(p_.kgb), g2_glb(p_.v_vb), g2_glb(p_.A), g2_glb(p_.h), g2_glb(p_.dv), g2_glb(p_.beta), g2_glb(p_.v_row), g2_glb(p_.dv2), g2_glb(p_.dwT), g2_glb(p_.dA), g2_glb(p_.db_part), p_.T, p_.H, p_.NT, g2_glb(p_.ctok), g2_glb(p_.clen), g2_glb(p_.dv2c), p_.hf};
     __shared__ __align__(16) bf16 S[kD * kPT];      // dvT -> dwT (same buffer reuse as the fused kernel)
+#if G2_S4A_LEAN
+    // kra P-938a (gfx938): dwT goes straight to HBM from pass W (no S staging), so S is free from pass W on and also
+    // hosts the h double buffer + kgB tiles (pass W) and the dA-stage XC / A staging: LDS 30464 -> 17664 B
+    bf16* const XT = S;                                 // XC / AFS A staging; h double buffer in pass W
+    bf16* const KGB = S + 4096;                         // kgB tiles of steps kt (2 x 1024 shorts), pass W only
+#define G2_S4A_KG(slot) (KGB + (slot) * 1024)
+#else
     __shared__ __align__(16) bf16 XT[kBT * kPT];    // dA-stage XC staging (dAT staging dropped)
     __shared__ __align__(16) bf16 KGs[2][4 * 64 * 4];   // kra P-28: kgB tile of step kt (double buffer)
+#define G2_S4A_KG(slot) (&KGs[slot][0])                 // the original expression (gfx936 codegen unchanged)
+#endif
     __shared__ float BETAs[kBT];                        // kra P-28: masked beta of the chunk's rows
     const int tid = threadIdx.x, r = tid >> 6, l = tid & 63, m = l & 15, q = l >> 4, pm = pi16(m);
     // kra P-88: head-fastest grid when launched as dim3(H, NT).  kra P-96: the launcher says so explicitly --
@@ -977,6 +991,9 @@ p3_wy_s4a_kernel(WyS4AParams p_) {
         lds_barrier();                                                      // dvT/v tile dead -> dwT
 
         const v4bh (&af)[8] = dva;   // V4 (kra P-3): dvN fragments are already in dva -- no reload
+#if G2_S4A_LEAN
+        bf16* dwTg = p.dwT + g2_nat_blk(i, hh, H, 0, true, kD * kBT);
+#endif
         {   // pass W: -dw -> dwT (S), dA += (-dw) kg^T   [verbatim from the .inc]
             auto body = [&](int kt, const v4bh* bf) {
                 f4 a4[4];
@@ -990,17 +1007,21 @@ p3_wy_s4a_kernel(WyS4AParams p_) {
                 #pragma unroll
                 for (int e = 0; e < 4; ++e) {
                     dwn[e] = bfr(-acc[e]);
+#if G2_S4A_LEAN
+                    reinterpret_cast<short*>(dwTg)[(kc + 4 * q + e) * kBT + tr] = dwn[e];   // [col][tr], pitch kBT
+#else
                     reinterpret_cast<short*>(S)[(kc + 4 * q + e) * kPT + tr] = dwn[e];
+#endif
                 }
                 #pragma unroll
                 for (int st = 0; st < 4; ++st) {
-                    const v4bh kgb = ld8(&KGs[kt & 1][0] + (st * 64 + l) * 4);   // kra P-28
+                    const v4bh kgb = ld8(G2_S4A_KG(kt & 1) + (st * 64 + l) * 4);   // kra P-28
                     dA[st] = mmac(dwn, kgb, dA[st]);
                 }
             };
             if constexpr (PF) {   // kra P-83: blocks / tiles already in registers; pass W fully unrolled
                 short* hs = reinterpret_cast<short*>(XT);
-                *reinterpret_cast<v4bh*>(&KGs[0][0] + 4 * tid) = pkg[0];
+                *reinterpret_cast<v4bh*>(G2_S4A_KG(0) + 4 * tid) = pkg[0];
                 *reinterpret_cast<f4*>(hs + 8 * tid) = phb[0];
                 lds_barrier();                                                  // block 0 visible
                 #pragma unroll
@@ -1011,7 +1032,7 @@ p3_wy_s4a_kernel(WyS4AParams p_) {
                     for (int vt = 0; vt < 8; ++vt) bf[vt] = ld8(hk + vt * 256);
                     if (kt < 7) {
                         *reinterpret_cast<f4*>(hs + ((kt + 1) & 1) * 2048 + 8 * tid) = phb[kt + 1];
-                        *reinterpret_cast<v4bh*>(&KGs[(kt + 1) & 1][0] + 4 * tid) = pkg[kt + 1];
+                        *reinterpret_cast<v4bh*>(G2_S4A_KG((kt + 1) & 1) + 4 * tid) = pkg[kt + 1];
                     }
                     body(kt, bf);
                     lds_barrier();      // block kt+1 visible; reads of block kt done before reuse
@@ -1019,7 +1040,7 @@ p3_wy_s4a_kernel(WyS4AParams p_) {
             } else {
             // kra P-28: thread tid carries fragment (st = tid>>6, lane = tid&63) of the kgB tile
             const bf16* kgsrc = kgB + (((tid >> 6) * 8) * 64 + (tid & 63)) * 4;
-            *reinterpret_cast<v4bh*>(&KGs[0][0] + 4 * tid) = ld8(kgsrc);            // tile 0
+            *reinterpret_cast<v4bh*>(G2_S4A_KG(0) + 4 * tid) = ld8(kgsrc);            // tile 0
             v4bh kgreg = ld8(kgsrc + 1 * 256);                                      // tile 1
             // V5 (kra P-4): the h block of step kt (8 vt fragments x 64 lanes x 8 B = 4 KB) does
             // not depend on the wave, so the 4 waves used to fetch it 4 times with 8 B loads.
@@ -1041,7 +1062,7 @@ p3_wy_s4a_kernel(WyS4AParams p_) {
                 if (kt < 7) {
                     // buffer (kt+1)&1 was last read in step kt-1, before the barrier ending kt-1
                     *reinterpret_cast<f4*>(hs + ((kt + 1) & 1) * 2048 + 8 * tid) = hreg;
-                    *reinterpret_cast<v4bh*>(&KGs[(kt + 1) & 1][0] + 4 * tid) = kgreg;   // kra P-28
+                    *reinterpret_cast<v4bh*>(G2_S4A_KG((kt + 1) & 1) + 4 * tid) = kgreg;   // kra P-28
                     if (kt < 6) {
                         hreg = *reinterpret_cast<const f4*>(hsrc + (kt + 2) * 2048);
                         kgreg = ld8(kgsrc + (kt + 2) * 256);
@@ -1110,15 +1131,18 @@ p3_wy_s4a_kernel(WyS4AParams p_) {
         }
         // dwT: bulk copy S -> global [col][tr], pitch kBT.  The XT barrier above orders every
         // lane's pass-W S writes before these cross-lane reads.
+#if !G2_S4A_LEAN
         bf16* dwTg = p.dwT + g2_nat_blk(i, hh, H, 0, true, kD * kBT);
         for (int j = tid; j < kD * (kBT / 4); j += 256) {
             const int col = j >> 4, tq = j & 15;
             *reinterpret_cast<v4bh*>(dwTg + col * kBT + 4 * tq) = ld8(S + col * kPT + 4 * tq);
         }
+#endif
         p.db_part[g2_nat_blk(i, hh, H, 0, true, 256) + tid] = db;
     });
 }
 
+#undef G2_S4A_KG
 // segment B: s4_tail<ST=4> verbatim except dwT read from global (pitch kBT), dak/akB
 // from the global dA, db from db_part, single-buffered intra tables (the WAR closed by
 // a second end-of-iteration barrier instead of the second table buffer).
