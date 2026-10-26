@@ -269,8 +269,8 @@ __global__ void __launch_bounds__(256) g2_bwd_tail_kernel(TailParams p) {
                         for (int off = 1; off < 64; off <<= 1)
                             dot += __shfl_xor(dot, off, 64);    // fixed-order tree
                         short2 o;
-                        o.x = bf_rne(dyv[w2][u].x * r4[w2][u] - dot * y0 * r4[w2][u]);
-                        o.y = bf_rne(dyv[w2][u].y * r4[w2][u] - dot * y1 * r4[w2][u]);
+                        o.x = bf_rne_int(dyv[w2][u].x * r4[w2][u] - dot * y0 * r4[w2][u]);
+                        o.y = bf_rne_int(dyv[w2][u].y * r4[w2][u] - dot * y1 * r4[w2][u]);
                         if (g2_row_ok<M>(r0 + u, cl))
                             *reinterpret_cast<short2*>(out + so + u * (p.H * kK) + c2) = o;
                     }

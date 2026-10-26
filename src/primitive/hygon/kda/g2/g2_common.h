@@ -57,6 +57,26 @@ __device__ __forceinline__ v4bh ld8(const bf16* p) {  // 4 consecutive bf16 (8-b
     return *reinterpret_cast<const v4bh*>(p);
 }
 __device__ __forceinline__ f4 ld16f(const float* p) { return *reinterpret_cast<const f4*>(p); }
+
+// kra P-938t: gfx938 MLS as a tile copier: one wave instruction moves 32 rows x 64 B (row stride stride_b16 2-byte
+// elements) from memory into 2 KB of contiguous LDS, no VGPRs, 0.29x the TA work per byte of per-lane loads
+// (ta_forms.hip).  Tracked by vmcnt.
+#if defined(__gfx938__) && __has_builtin(__builtin_hcu_matrix_load_32x32_b16)
+#define G2_MLS938 1
+__device__ __forceinline__ void g2_mls_tile(const void* g, int stride_b16, void* lds) {
+    typedef int v4i_t __attribute__((ext_vector_type(4)));
+    const uint64_t a = reinterpret_cast<uint64_t>(g) & 0xffffffffffffull;
+    v4i_t r;
+    r[0] = __builtin_amdgcn_readfirstlane((int)(uint32_t)a);
+    r[1] = __builtin_amdgcn_readfirstlane((int)(uint32_t)(a >> 32));
+    r[2] = __builtin_amdgcn_readfirstlane(stride_b16);
+    r[3] = 0;
+    const int so = __builtin_amdgcn_readfirstlane((int)(size_t)lds);
+    __builtin_hcu_matrix_load_32x32_b16(r, (__attribute__((address_space(3))) short*)(so), 0, 0, 0, 0, 0);
+}
+#else
+#define G2_MLS938 0
+#endif
 // kra L16 paired native layout (Wn Wb Un Kn KgA Qn QgA AqkA): inside every 512-element group
 // the two 256-element sub-blocks are interleaved per lane (o = 256s + 4l + e -> 8l + 4s + e),
 // so a lane's fragments of sub-blocks 2j and 2j+1 are ONE aligned 16 B load (a dwordx2 costs
@@ -78,6 +98,21 @@ __device__ __forceinline__ void ld16x2(const bf16* p, v4bh& a, v4bh& b) {
 }
 // RNE bf16 conversion for finite inputs, identical to __float2bfloat16.
 __device__ __forceinline__ short bf_rne(float x) {
+#if defined(__gfx938__) && __has_builtin(__builtin_hcu_cvt_pk_bf16_f32)
+    // gfx938's v_cvt_pk_bf16_f32 rounds to nearest even and equals the integer sequence below for
+    // every non-NaN fp32 input (all 2^32 inputs checked on BW1102; NaNs come out quieted): one VALU
+    // instead of three.
+    return (short)(uint32_t)__builtin_hcu_cvt_pk_bf16_f32(0, x, 0, x, false);
+#else
+    uint32_t u = __float_as_uint(x);
+    u += 0x7fffu + ((u >> 16) & 1u);
+    return (short)(u >> 16);
+#endif
+}
+// The integer RNE sequence on every arch.  Kept where gfx938's v_cvt_pk_bf16_f32 does not pay: the
+// recurrence kernels (fwd_h / dhu: latency-chain bound, their schedule moved +-25% with it) and the
+// l2norm backward in bwd_tail (the compiler contracts the surrounding fp differently).
+__device__ __forceinline__ short bf_rne_int(float x) {
     uint32_t u = __float_as_uint(x);
     u += 0x7fffu + ((u >> 16) & 1u);
     return (short)(u >> 16);
@@ -135,6 +170,24 @@ inline const char* g2_getenv(const char* name) { return g2_dev() ? getenv(name) 
 inline long g2_env_long(const char* name, long dflt) {
     const char* e = g2_getenv(name);
     return e ? atol(e) : dflt;
+}
+// kra P-938z: is the current device a gfx938 (BW1102)?  Cached per device (host side, launch decisions only).
+inline bool g2_cur_gfx938() {
+    static int known[64] = {};   // 0 unknown, 1 gfx938, 2 other
+    int d = 0;
+    if (hipGetDevice(&d) != hipSuccess || d < 0 || d >= 64) return false;
+    if (known[d] == 0) {
+        hipDeviceProp_t prop;
+        known[d] = (hipGetDeviceProperties(&prop, d) == hipSuccess && strncmp(prop.gcnArchName, "gfx938", 6) == 0) ? 1 : 2;
+    }
+    return known[d] == 1;
+}
+// kra P-61e / P-938z: the lane-permuted Kn / natural-k Gn layout (kp) for H <= 20; on gfx938 not at H <= 8, where the
+// 16-column fwd_h slabs (8 CTAs per head, P-938z) need the plain layout.  One rule for every producer / consumer.
+inline bool g2_kp_layout(long H) {
+    if (const char* e = g2_getenv("KDA_G2_KPERM_MAX_H")) return H <= atol(e);
+    if (H <= 8 && g2_cur_gfx938()) return false;
+    return H <= 20;
 }
 
 

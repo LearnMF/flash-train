@@ -107,7 +107,7 @@ __global__ void __launch_bounds__(512) g2_fwd_h_v8o_kernel(FwdOParams p) {
         for (int vt = 0; vt < 2; ++vt)
             #pragma unroll
             for (int e = 0; e < 4; ++e) {
-                hx[vt][e] = bf_rne(ht[vt][e]);
+                hx[vt][e] = bf_rne_int(ht[vt][e]);
                 reinterpret_cast<short*>(hB)[(16 * vt + m) * kPadK + 16 * wv + c_col(l, e)] = hx[vt][e];
             }
     };
@@ -146,7 +146,7 @@ __global__ void __launch_bounds__(512) g2_fwd_h_v8o_kernel(FwdOParams p) {
             #pragma unroll
             for (int e = 0; e < 4; ++e) {
                 const float uv = __uint_as_float(((uint32_t)(unsigned short)uf[e]) << 16);
-                x[e] = bf_rne(uv - acc[e]);
+                x[e] = bf_rne_int(uv - acc[e]);
                 reinterpret_cast<short*>(vB)[(16 * v1a + c_col(l, e)) * kPadT + 16 * r1 + m] = x[e];
             }
             if (p.Vn != nullptr)                         // forward: Vn unused (null)
@@ -212,7 +212,7 @@ __global__ void __launch_bounds__(512) g2_fwd_h_v8o_kernel(FwdOParams p) {
                 bf16* st = oStage[wv];
                 #pragma unroll
                 for (int e = 0; e < 4; ++e)
-                    reinterpret_cast<short*>(st)[m * 16 + q4 + 4 * e] = bf_rne(o[e]);
+                    reinterpret_cast<short*>(st)[m * 16 + q4 + 4 * e] = bf_rne_int(o[e]);
                 o_wave_order();
                 const int m2 = l & 15, g2_ = l >> 4;
                 const v4bh ov = *reinterpret_cast<const v4bh*>(
@@ -323,7 +323,7 @@ __global__ void __launch_bounds__(256) g2_fwd_h_v8o4_kernel(FwdOParams p) {
         for (int vt = 0; vt < 2; ++vt) {
             #pragma unroll
             for (int e = 0; e < 4; ++e) {
-                hx[vt][e] = bf_rne(ht[vt][e]);
+                hx[vt][e] = bf_rne_int(ht[vt][e]);
                 if constexpr (!KP)
                     reinterpret_cast<short*>(hB)[(16 * vt + m) * kPadK + 16 * kb + c_col(l, e)] = hx[vt][e];
             }
@@ -414,8 +414,8 @@ __global__ void __launch_bounds__(256) g2_fwd_h_v8o4_kernel(FwdOParams p) {
             for (int e = 0; e < 4; ++e) {
                 const float u0 = __uint_as_float(((uint32_t)(unsigned short)uf0[e]) << 16);
                 const float u1 = __uint_as_float(((uint32_t)(unsigned short)uf1[e]) << 16);
-                x0[e] = bf_rne(u0 - acc0[e]);
-                x1[e] = bf_rne(u1 - acc1[e]);
+                x0[e] = bf_rne_int(u0 - acc0[e]);
+                x1[e] = bf_rne_int(u1 - acc1[e]);
                 const int vc = VP ? 4 * q4 + e : c_col(l, e);   // kra P-62: lane's v columns
                 reinterpret_cast<short*>(vB)[(16 * 0 + vc) * kPadT + 16 * r1 + m] = x0[e];
                 reinterpret_cast<short*>(vB)[(16 * 1 + vc) * kPadT + 16 * r1 + m] = x1[e];
@@ -506,7 +506,7 @@ __global__ void __launch_bounds__(256) g2_fwd_h_v8o4_kernel(FwdOParams p) {
                         } else {
                             v4bh ov;
                             #pragma unroll
-                            for (int e = 0; e < 4; ++e) ov[e] = bf_rne(o[e]);
+                            for (int e = 0; e < 4; ++e) ov[e] = bf_rne_int(o[e]);
                             *reinterpret_cast<v4bh*>(p.Ob + obase + 4 * q4) = ov;
                         }
                     }
@@ -520,7 +520,7 @@ __global__ void __launch_bounds__(256) g2_fwd_h_v8o4_kernel(FwdOParams p) {
                     bf16* st_ = oStage[wv];
                     #pragma unroll
                     for (int e = 0; e < 4; ++e)
-                        reinterpret_cast<short*>(st_)[m * 16 + q4 + 4 * e] = bf_rne(o[e]);
+                        reinterpret_cast<short*>(st_)[m * 16 + q4 + 4 * e] = bf_rne_int(o[e]);
                     r1a_o_wave_order();
                     const int m2 = l & 15, g2_ = l >> 4;
                     const v4bh ov = *reinterpret_cast<const v4bh*>(
@@ -635,9 +635,13 @@ __global__ void __launch_bounds__(256) g2_fwd_h_v8o4w_kernel(FwdOParams p) {
         for (int j = 0; j < 2; ++j) ld16x2(src + j * 512, aqf[2 * j], aqf[2 * j + 1]);
     };
     auto loadU = [&](int i) {                         // paired V-tiles (NVH*vs + 2pr, +1)
+        if constexpr (NVH == 1) {   // kra P-938z: one 16-column V-tile, the even / odd half of its pair's 16 B lane quad
+            uf[0] = ld8(p.Un + (((chunk + i) * 4 + r1) * 8 + (vs & ~1)) * 256 + l * 8 + (vs & 1) * 4);
+        } else {
         #pragma unroll
         for (int pr = 0; pr < NVH / 2; ++pr)
             ld16x2(p.Un + (((chunk + i) * 4 + r1) * 8 + NVH * vs + 2 * pr) * 256 + l * 8, uf[2 * pr], uf[2 * pr + 1]);
+        }
     };
     auto loadG = [&](int i, int kb, f4& gl) {
         gl = *reinterpret_cast<const f4*>(p.Gn + ((chunk + i) * 8 + kb) * 16 + q4 * 4);
@@ -652,7 +656,7 @@ __global__ void __launch_bounds__(256) g2_fwd_h_v8o4w_kernel(FwdOParams p) {
         for (int vt = 0; vt < NVH; ++vt)
             #pragma unroll
             for (int e = 0; e < 4; ++e)
-                reinterpret_cast<short*>(hB)[(16 * vt + m) * kPadK + 16 * kb + c_col(l, e)] = bf_rne(ht[vt][e]);
+                reinterpret_cast<short*>(hB)[(16 * vt + m) * kPadK + 16 * kb + c_col(l, e)] = bf_rne_int(ht[vt][e]);
     };
     auto bN_emit = [&](int i2, int kb) {
         if (hasBN) {
@@ -701,7 +705,7 @@ __global__ void __launch_bounds__(256) g2_fwd_h_v8o4w_kernel(FwdOParams p) {
             #pragma unroll
             for (int e = 0; e < 4; ++e) {
                 const float u = __uint_as_float(((uint32_t)(unsigned short)uf[v][e]) << 16);
-                x[e] = bf_rne(u - acc[v][e]);
+                x[e] = bf_rne_int(u - acc[v][e]);
                 reinterpret_cast<short*>(vB)[(16 * v + c_col(l, e)) * kPadT + 16 * r1 + m] = x[e];
             }
             if (hasVn)
@@ -760,7 +764,7 @@ __global__ void __launch_bounds__(256) g2_fwd_h_v8o4w_kernel(FwdOParams p) {
                     bf16* st_ = oStage[wv];
                     #pragma unroll
                     for (int e = 0; e < 4; ++e)
-                        reinterpret_cast<short*>(st_)[m * 16 + q4 + 4 * e] = bf_rne(o[e]);
+                        reinterpret_cast<short*>(st_)[m * 16 + q4 + 4 * e] = bf_rne_int(o[e]);
                     r1a_o_wave_order();
                     const int m2 = l & 15, g2_ = l >> 4;
                     const v4bh ov = *reinterpret_cast<const v4bh*>(
@@ -885,7 +889,7 @@ extern "C" int g2_fwd_h_v8o(const void* Wn, const void* Kn, const void* Un, cons
                  scale, H, T / kBT, seg, nseg, ctok, clen, (const float*)GnRaw};
     int r1a = 1;   // R1a: 4-wave dedup form (bitwise equal; 0 restores the 8-wave form)
     if (const char* e = g2::g2_getenv("KDA_G2_R1A")) r1a = atoi(e);
-    const bool kp = H <= g2_env_long("KDA_G2_KPERM_MAX_H", 20);   // kra P-61e: Kn lane-permuted / Gn natural-k producers
+    const bool kp = g2_kp_layout(H);   // kra P-61e: Kn lane-permuted / Gn natural-k producers
     if (kp) r1a = 1;
     const dim3 grid(kK / kBV, (unsigned)nseg * H);
     // kra P-9: the production output sets get compile-time instances, others the generic one
@@ -948,10 +952,26 @@ extern "C" int g2_fwd_h_v8o(const void* Wn, const void* Kn, const void* Un, cons
     // are issued by 2 CTAs instead of 4 (bit-identical per column)
     // gated to long sequences: at NT < 512 the 96-CTA wide grid's CU imbalance cost more than the shared
     // loads it saves (16K/48 mode 4 0.91x, 8K/96 0.68x); 32K/48 1.02-1.12x, 64K/48 1.12-1.40x
-    if (r1a && !kp && H >= g2_env_long("KDA_G2_V8O4W_MIN_H", 40) && T / kBT >= g2_env_long("KDA_G2_V8O4W_MIN_NT", 512)) {
-        const dim3 gridw(kK / 64, (unsigned)nseg * H);
+    // kra P-938z: gfx938 at H <= 8 (<= 32 CTAs of 32 columns on 72 CUs): 16-column slabs, 8 CTAs per head.  The step
+    // latency scales with the slab width (64-col 2.0-2.3x slower than 32-col), and 16-col is 1.12-1.18x faster than the
+    // kp 32-col default at H = 8 (bit-identical).  At H >= 16 it loses (0.64-0.87x), so not there.
+    const bool narrow938 = r1a && !kp && H <= 8 && g2_cur_gfx938();
+    if (narrow938 || (r1a && !kp && H >= g2_env_long("KDA_G2_V8O4W_MIN_H", 40) && T / kBT >= g2_env_long("KDA_G2_V8O4W_MIN_NT", 512))) {
+        const int nvh = (int)g2_env_long("KDA_G2_V8O4W_NVH", narrow938 ? 1 : 4);   // kra P-938z: 1 = 16-column slabs
+        const dim3 gridw(kK / (16 * nvh), (unsigned)nseg * H);
         auto v8o4w = [&](auto vl) {
             constexpr bool VL = decltype(vl)::value;
+            if (nvh == 1) {
+                switch (mode) {
+                    case 1: hipLaunchKernelGGL((g2_fwd_h_v8o4w_kernel<VL, 1, 1>), gridw, dim3(256), 0, s, p); break;
+                    case 2: hipLaunchKernelGGL((g2_fwd_h_v8o4w_kernel<VL, 2, 1>), gridw, dim3(256), 0, s, p); break;
+                    case 3: hipLaunchKernelGGL((g2_fwd_h_v8o4w_kernel<VL, 3, 1>), gridw, dim3(256), 0, s, p); break;
+                    case 4: hipLaunchKernelGGL((g2_fwd_h_v8o4w_kernel<VL, 4, 1>), gridw, dim3(256), 0, s, p); break;
+                    case 5: hipLaunchKernelGGL((g2_fwd_h_v8o4w_kernel<VL, 5, 1>), gridw, dim3(256), 0, s, p); break;
+                    default: hipLaunchKernelGGL((g2_fwd_h_v8o4w_kernel<VL, 0, 1>), gridw, dim3(256), 0, s, p); break;
+                }
+                return;
+            }
             switch (mode) {
                 case 1: hipLaunchKernelGGL((g2_fwd_h_v8o4w_kernel<VL, 1>), gridw, dim3(256), 0, s, p); break;
                 case 2: hipLaunchKernelGGL((g2_fwd_h_v8o4w_kernel<VL, 2>), gridw, dim3(256), 0, s, p); break;

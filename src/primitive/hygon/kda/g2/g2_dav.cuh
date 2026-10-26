@@ -38,7 +38,20 @@ __global__ void __launch_bounds__(256) g2_dav_kernel(DavParams p_) {
     const int i = blockIdx.x, hh = blockIdx.y, tid = threadIdx.x;
     const int wv = tid >> 6, l = tid & 63;
     const long t0 = g2_row_tok<VL>(p.ctok, i);
+#if defined(__gfx938__)
+    // kra P-938v: unpadded 16 KB slab (4 CTAs per CU instead of 3) with an XOR swizzle of column bits 2..5 by the
+    // row's low 4 bits in place of the +4 padding: vectors stay contiguous, the 16-row operand reads stay
+    // conflict-free.  Layout only -- bit-identical.
+    __shared__ __align__(16) short slab[128 * 64];
+    auto i1 = [](int r, int c) { return (size_t)r * kK + (c ^ ((r & 15) << 2)); };       // pass 1 [j][v]
+    auto i2 = [](int v, int j) { return (size_t)v * 64 + (j ^ ((v & 15) << 2)); };       // pass 2 [v][t]
+    auto iA = [](int t, int j) { return (size_t)t * 64 + (j ^ ((t & 15) << 2)); };       // dA staging fp32
+#else
     __shared__ __align__(16) short slab[128 * kPadJ3];       // 8704 shorts:
+    auto i1 = [](int r, int c) { return (size_t)r * (kK + 4) + c; };
+    auto i2 = [](int v, int j) { return (size_t)v * kPadJ3 + j; };
+    auto iA = [](int t, int j) { return (size_t)t * kPadJ3 + j; };
+#endif
     const int cl = g2_row_len<VL>(p.clen, i);
     // varlen: ONE uniform branch per CTA -- full chunks run the unmasked body (M=1)
     g2_vl_dispatch<VL>(cl, [&](auto mode_) {
@@ -63,7 +76,7 @@ __global__ void __launch_bounds__(256) g2_dav_kernel(DavParams p_) {
             const int d0 = sb >> 3, d1 = sb & 7, m = c & 15, q = c >> 4;
             #pragma unroll
             for (int e = 0; e < 4; ++e)
-                slab[(size_t)(16 * d0 + m) * (kK + 4) + 16 * d1 + q + 4 * e] = vq[e];
+                slab[i1(16 * d0 + m, 16 * d1 + q + 4 * e)] = vq[e];
         }
         __syncthreads();
         if (p.dA != nullptr)
@@ -79,7 +92,7 @@ __global__ void __launch_bounds__(256) g2_dav_kernel(DavParams p_) {
                     + 16 * vs + (l >> 4) * 4) : v4bh{0, 0, 0, 0};
                 #pragma unroll
                 for (int jt = 0; jt < 4; ++jt) {
-                    const size_t lo = (size_t)(16 * jt + (l & 15)) * (kK + 4) + 16 * vs + (l >> 4) * 4;
+                    const size_t lo = i1(16 * jt + (l & 15), 16 * vs + (l >> 4) * 4);
                     acc[jt] = mmac(df, *reinterpret_cast<const v4bh*>(slab + lo), acc[jt]);
                 }
             }
@@ -93,7 +106,7 @@ __global__ void __launch_bounds__(256) g2_dav_kernel(DavParams p_) {
                 #pragma unroll
                 for (int e = 0; e < 4; ++e) {           // C-frag col = (l>>4) + 4e
                     const float val = (t >= j0 + 4 * e) ? acc[jt][e] * p.scale : 0.f;
-                    dAs[t * kPadJ3 + j0 + 4 * e] = val;
+                    dAs[iA(t, j0 + 4 * e)] = val;
                 }
             }
             __syncthreads();
@@ -102,7 +115,7 @@ __global__ void __launch_bounds__(256) g2_dav_kernel(DavParams p_) {
                 const int c = tid + 256 * it, t = c >> 4, j = (c & 15) * 4;
                 if (!g2_row_ok<M>(t, cl)) continue;
                 *reinterpret_cast<f4*>(p.dA + g2_rm_tok(t0 + t, hh, p.H, kBT) + j) =
-                    *reinterpret_cast<const f4*>(dAs + t * kPadJ3 + j);
+                    *reinterpret_cast<const f4*>(dAs + iA(t, j));
             }
         }
 
@@ -122,7 +135,7 @@ __global__ void __launch_bounds__(256) g2_dav_kernel(DavParams p_) {
                 : v4bh{0, 0, 0, 0};
             #pragma unroll
             for (int d = 0; d < 4; ++d)
-                slab[(size_t)(vq + d) * kPadJ3 + j] = dv_[d];
+                slab[i2(vq + d, j)] = dv_[d];
             // T3: the SAME do loads also emit P2's dOT (B form, stride-4 quads, std
             // block order) and P3's aN_do (A form, plain row nibble, P3 block order)
             // -- the two B3.5 convert2 calls (which re-read do, ~200 MB @8K/48)
@@ -138,7 +151,7 @@ __global__ void __launch_bounds__(256) g2_dav_kernel(DavParams p_) {
                 : v4bh{0, 0, 0, 0};
             #pragma unroll
             for (int d = 0; d < 4; ++d)
-                slab[(size_t)(vq + d) * kPadJ3 + j] = dv_[d];
+                slab[i2(vq + d, j)] = dv_[d];
             // T3: the SAME do loads also emit P2's dOT (B form, stride-4 quads, std
             // block order) and P3's aN_do (A form, plain row nibble, P3 block order)
             // -- the two B3.5 convert2 calls (which re-read do, ~200 MB @8K/48)
@@ -158,8 +171,8 @@ __global__ void __launch_bounds__(256) g2_dav_kernel(DavParams p_) {
             const int c = tid + 256 * it, x = 8 * c;
             const int j0 = 4 * ((x >> 6) & 3) + 16 * ((x >> 8) & 3);
             const int v0 = ((x >> 2) & 15) + 16 * (x >> 10);
-            const v4bh lo = *reinterpret_cast<const v4bh*>(slab + (size_t)v0 * kPadJ3 + j0);
-            const v4bh hi = *reinterpret_cast<const v4bh*>(slab + (size_t)(v0 + 1) * kPadJ3 + j0);
+            const v4bh lo = *reinterpret_cast<const v4bh*>(slab + i2(v0, j0));
+            const v4bh hi = *reinterpret_cast<const v4bh*>(slab + i2(v0 + 1, j0));
             st16x2(p.dOT + nblk + x, lo, hi);
         }
         if (p.dVn != nullptr)
@@ -179,7 +192,7 @@ __global__ void __launch_bounds__(256) g2_dav_kernel(DavParams p_) {
                 }
                 #pragma unroll
                 for (int vt = 0; vt < 8; ++vt) {
-                    const size_t lo = (size_t)(16 * vt + (l & 15)) * kPadJ3 + 16 * js + (l >> 4) * 4;
+                    const size_t lo = i2(16 * vt + (l & 15), 16 * js + (l >> 4) * 4);
                     acc[vt] = mmac(af, *reinterpret_cast<const v4bh*>(slab + lo), acc[vt]);
                 }
             }
@@ -205,9 +218,11 @@ extern "C" int g2_dav(const void* do_, const void* Vn, const void* A,
     g2::DavParams p{(const short*)do_, (const short*)Vn, (const short*)A,
                     (float*)dA, (short*)dVn, (short*)dOT, (short*)aNdo,
                     (float)scale, H, T / 64, ctok, clen};
+    // kra P-938v: residency probe knob (dev only): dynamic LDS on top of the static slab caps the CTAs per CU
+    const int lds_extra = (int)g2::g2_env_long("KDA_G2_DAV_LDS_EXTRA", 0);
     if (ctok)
-        hipLaunchKernelGGL(g2::g2_dav_kernel<true>, dim3(T / 64, H), dim3(256), 0, s, p);
+        hipLaunchKernelGGL(g2::g2_dav_kernel<true>, dim3(T / 64, H), dim3(256), lds_extra, s, p);
     else
-        hipLaunchKernelGGL(g2::g2_dav_kernel<false>, dim3(T / 64, H), dim3(256), 0, s, p);
+        hipLaunchKernelGGL(g2::g2_dav_kernel<false>, dim3(T / 64, H), dim3(256), lds_extra, s, p);
     return (int)hipGetLastError();
 }

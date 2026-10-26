@@ -462,7 +462,7 @@ extern "C" int g2_wu(const void* k, const void* v, const void* q, const void* be
                    (short*)Wn, (short*)Wb, (short*)Un, (short*)KgA, (short*)Kn, (short*)Qn,
                    (short*)kgB, (short*)vB,
                    H, T / 64, ctok, clen, stop};
-    p.kp = H <= g2::g2_env_long("KDA_G2_KPERM_MAX_H", 20);   // kra P-61e
+    p.kp = g2::g2_kp_layout(H);   // kra P-61e
     p.HbN = (const short*)hbn; p.VnOut = (short*)vn_out;      // kra P-82
     // kra P-95: the diagonal order whenever the chunk row stride H * 16 KiB is a multiple of 512 KiB
     // (H % 32 == 0): chunk-fastest CTAs then step through k / v / q / g / kgB in lock-step on the same

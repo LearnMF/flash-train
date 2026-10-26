@@ -1156,9 +1156,51 @@ __device__ __forceinline__ void s4b_tail(const WyS4BParams& p, S4BSmem& sm, cons
     const bf16* dwTg = p.dwT + g2_nat_blk(i, hh, H, 0, true, kD * kBT);
 
     f4 dak[4];
+    f4 aqA[A + 1], aqB[4 - A], akB[4 - A];
+#if G2_MLS938
+    // MLS reads whole 64 B row segments: only for 256 B-aligned tile bases (CTA-uniform); otherwise per-lane loads
+    if (M != 2 && ((reinterpret_cast<uintptr_t>(dAg) | reinterpret_cast<uintptr_t>(aq_)) & 255) == 0) {
+        // kra P-938t: full chunk.  dA and dAqk (64 x 64 fp32, row pitch RA) -> LDS by MLS once per CTA (the whole
+        // S4BSmem is free here), then the rows (dak, aqA) and the column gathers (akB, aqB) are read from LDS.
+        // Tile t (wave A loads t = 2A, 2A + 1): rows 32 (t >> 2).., floats 16 (t & 3)..; LDS: dAqk at 0, dA at 16 KB.
+        char* base = reinterpret_cast<char*>(&sm);
+        #pragma unroll
+        for (int u = 0; u < 2; ++u) {
+            const int t = 2 * A + u;
+            g2_mls_tile(dAg + (size_t)(32 * (t >> 2)) * RA + 16 * (t & 3), 2 * RA, base + 16384 + t * 2048);
+            g2_mls_tile(aq_ + (size_t)(32 * (t >> 2)) * RA + 16 * (t & 3), 2 * RA, base + t * 2048);
+        }
+        asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+        lds_barrier();
+        auto at = [&](int off, int r, int c) {
+            return reinterpret_cast<const float*>(base + off + (((r >> 5) * 4 + (c >> 4)) * 32 + (r & 31)) * 64 + (c & 15) * 4);
+        };
+        #pragma unroll
+        for (int ut = 0; ut < 4; ++ut) dak[ut] = *reinterpret_cast<const f4*>(at(16384, row, 16 * ut + 4 * q));
+        #pragma unroll
+        for (int b = 0; b <= A; ++b) {
+            aqA[b] = *reinterpret_cast<const f4*>(at(0, row, 16 * b + 4 * q));
+            if (b == A) {
+                #pragma unroll
+                for (int x = 0; x < 4; ++x)
+                    if (4 * q + x > m) aqA[b][x] = 0.f;
+            }
+        }
+        #pragma unroll
+        for (int b = A; b < 4; ++b)
+            #pragma unroll
+            for (int x = 0; x < 4; ++x) {
+                const int j = 16 * b + 4 * q + x;
+                const bool keep = b > A || 4 * q + x >= m;
+                akB[b - A][x] = keep ? *at(16384, j, row) : 0.f;
+                aqB[b - A][x] = keep ? *at(0, j, row) : 0.f;
+            }
+        lds_barrier();
+    } else
+#endif
+    {
     #pragma unroll
     for (int ut = 0; ut < 4; ++ut) dak[ut] = ld16f(dAg + row * RA + 16 * ut + 4 * q);
-    f4 aqA[A + 1], aqB[4 - A], akB[4 - A];
     #pragma unroll
     for (int b = 0; b <= A; ++b) {
         aqA[b] = rok ? ld16f(aq_ + row * RA + 16 * b + 4 * q) : f4{0.f, 0.f, 0.f, 0.f};
@@ -1177,6 +1219,7 @@ __device__ __forceinline__ void s4b_tail(const WyS4BParams& p, S4BSmem& sm, cons
             akB[b - A][x] = keep ? dAg[j * RA + row] : 0.f;   // dAT[row][j] == dA[j][row]
             aqB[b - A][x] = (keep && g2_row_ok<M>(j, cl)) ? aq_[j * RA + row] : 0.f;
         }
+    }
     const size_t cQ = g2_nat_blk(i, hh, H, 0, true, 8 * 8 * 256);
     const bf16* hb = p.h + cQ;
     const bf16* dhb = p.dh + cQ;

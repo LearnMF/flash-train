@@ -139,13 +139,27 @@ std::uint64_t spread(std::uint64_t spacing, std::uint64_t n) noexcept {
 
 // kra P-61e: the kp layouts (Kn lane-permuted, natural-k recompute decays) -- same rule as the
 // kernels' launchers, including their FTRAIN_KDA_DEV gate (g2_common.h g2_getenv)
+// kra P-61e / P-938z: the kp layout rule -- the SAME rule as g2_common.h g2_kp_layout (which the kernels' launchers use):
+// H <= 20, except on gfx938 at H <= 8 (the 16-column fwd_h slabs need the plain layout).
 inline bool g2KpLayout(long H) {
     static const bool dev = [] {
         const char* e = std::getenv(FTRAIN_KDA_DEV);
         return e != nullptr && *e != '\0' && std::strcmp(e, "0") != 0;
     }();
     const char* e = dev ? std::getenv("KDA_G2_KPERM_MAX_H") : nullptr;
-    return H <= (e ? std::atol(e) : 20);
+    if (e) { return H <= std::atol(e); }
+    if (H <= 8) {
+        static int known[64] = {};   // 0 unknown, 1 gfx938, 2 other
+        int d = 0;
+        if (hipGetDevice(&d) == hipSuccess && d >= 0 && d < 64) {
+            if (known[d] == 0) {
+                hipDeviceProp_t prop;
+                known[d] = (hipGetDeviceProperties(&prop, d) == hipSuccess && std::strncmp(prop.gcnArchName, "gfx938", 6) == 0) ? 1 : 2;
+            }
+            if (known[d] == 1) { return false; }
+        }
+    }
+    return H <= 20;
 }
 
 // kra P-94: the forward runs the R4 prep also without in-kernel l2norm (bitwise the X1 chain);

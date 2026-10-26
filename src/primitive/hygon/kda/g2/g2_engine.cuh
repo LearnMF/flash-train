@@ -74,7 +74,7 @@ __global__ void __launch_bounds__(64 * NW) g2_fwd_h_v7_kernel(FwdNParams p) {
             for (int kl = 0; kl < KPW; ++kl)
                 #pragma unroll
                 for (int e = 0; e < 4; ++e) {
-                    hx[vt][kl][e] = bf_rne(ht[vt][kl][e]);
+                    hx[vt][kl][e] = bf_rne_int(ht[vt][kl][e]);
                     reinterpret_cast<short*>(hB)[(16 * vt + c_row(l)) * kPadK + 16 * (KPW * wv + kl) + c_col(l, e)] = hx[vt][kl][e];
                 }
     };
@@ -103,7 +103,7 @@ __global__ void __launch_bounds__(64 * NW) g2_fwd_h_v7_kernel(FwdNParams p) {
             #pragma unroll
             for (int e = 0; e < 4; ++e) {
                 const float uv = __uint_as_float(((uint32_t)(unsigned short)uf[j][e]) << 16);
-                x[e] = bf_rne(uv - acc[j][e]);
+                x[e] = bf_rne_int(uv - acc[j][e]);
                 reinterpret_cast<short*>(vB)[(16 * (v1a + j) + c_col(l, e)) * kPadT + 16 * r1 + c_row(l)] = x[e];
             }
             *reinterpret_cast<v4bh*>(p.Vn + (((chunk + i) * 4 + r1) * 8 + 2 * vs + v1a + j) * 256 + l * 4) = x;
@@ -200,7 +200,7 @@ extern "C" __global__ void __launch_bounds__(512) g2_dhu_w8b_kernel(BwdNParams p
         for (int vt = 0; vt < 2; ++vt)
             #pragma unroll
             for (int e = 0; e < 4; ++e) {
-                hx[vt][e] = bf_rne(st[vt][e]);
+                hx[vt][e] = bf_rne_int(st[vt][e]);
                 reinterpret_cast<short*>(dhB)[(16 * vt + c_row(l)) * kPadK + 16 * wv + c_col(l, e)] = hx[vt][e];
             }
     };
@@ -240,7 +240,7 @@ extern "C" __global__ void __launch_bounds__(512) g2_dhu_w8b_kernel(BwdNParams p
             #pragma unroll
             for (int e = 0; e < 4; ++e) {
                 const float d = acc[e] + __uint_as_float(((uint32_t)(unsigned short)dvf[e]) << 16);
-                x[e] = bf_rne(d);
+                x[e] = bf_rne_int(d);
                 reinterpret_cast<short*>(vB)[(16 * v1 + c_col(l, e)) * kPadT + 16 * r1 + c_row(l)] = x[e];
             }
             *reinterpret_cast<v4bh*>(p.dv2 + (((chunk + i) * 4 + r1) * 8 + 2 * vs + v1) * 256 + l * 4) = x;
@@ -313,7 +313,7 @@ __global__ void __launch_bounds__(512) g2_dhu_v8b_kernel(BwdNParams p) {
         for (int vt = 0; vt < 2; ++vt)
             #pragma unroll
             for (int e = 0; e < 4; ++e) {
-                hx[vt][e] = bf_rne(st[vt][e]);
+                hx[vt][e] = bf_rne_int(st[vt][e]);
                 reinterpret_cast<short*>(dhB)[(16 * vt + c_row(l)) * kPadK + 16 * wv + c_col(l, e)] = hx[vt][e];
             }
     };
@@ -371,7 +371,7 @@ __global__ void __launch_bounds__(512) g2_dhu_v8b_kernel(BwdNParams p) {
             #pragma unroll
             for (int e = 0; e < 4; ++e) {
                 const float d = acc[e] + __uint_as_float(((uint32_t)(unsigned short)dvf[e]) << 16);
-                x[e] = bf_rne(d);
+                x[e] = bf_rne_int(d);
                 reinterpret_cast<short*>(vB)[(16 * v1 + c_col(l, e)) * kPadT + 16 * r1 + c_row(l)] = x[e];
             }
             if (hasDV2)  // T9b: the global dV2n write is optional; the
@@ -474,7 +474,7 @@ __global__ void __launch_bounds__(256) g2_dhu_v8b4_kernel(BwdNParams p) {
         for (int vt = 0; vt < 2; ++vt)
             #pragma unroll
             for (int e = 0; e < 4; ++e) {
-                hx[vt][e] = bf_rne(st[vt][e]);
+                hx[vt][e] = bf_rne_int(st[vt][e]);
                 reinterpret_cast<short*>(dhB)[(16 * vt + c_row(l)) * kPadK + 16 * kb + c_col(l, e)] = hx[vt][e];
             }
     };
@@ -534,7 +534,7 @@ __global__ void __launch_bounds__(256) g2_dhu_v8b4_kernel(BwdNParams p) {
             #pragma unroll
             for (int e = 0; e < 4; ++e) {
                 const float d = acc[e] + __uint_as_float(((uint32_t)(unsigned short)dvf[e]) << 16);
-                x[e] = bf_rne(d);
+                x[e] = bf_rne_int(d);
                 reinterpret_cast<short*>(vB)[(16 * v1 + c_col(l, e)) * kPadT + 16 * r1 + c_row(l)] = x[e];
             }
             if (hasDV2)

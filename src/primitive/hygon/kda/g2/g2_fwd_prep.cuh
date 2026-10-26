@@ -443,6 +443,17 @@ __global__ void __launch_bounds__(256) g2_fwd_prep_a_kernel(PrepAParams p) {
     });   // g2_vl_dispatch
 }
 
+// kra P-938w: prep_b's T2 index.  gfx938: unpadded [128][64] (the union fits 16 KB -> 4 CTAs per CU) with the
+// token's bits 2..5 XORed by the dim's low 4 bits instead of the +4 padding (4-token vectors stay contiguous, the
+// 16-dim operand reads stay conflict-free).  Layout only.
+__device__ __forceinline__ int prepb_t2i(int dim, int tok) {
+#if defined(__gfx938__)
+    return dim * 64 + (tok ^ ((dim & 15) << 2));
+#else
+    return dim * fi2::kT2 + tok;
+#endif
+}
+
 // fis::s_post verbatim except the T2 pass-0 operand: Kb (already bf16(kn * beta * 2^g)).
 template <int I, int M>
 __device__ __forceinline__ void b_post(const PrepBParams& p, float* smem, const float* Rg,
@@ -576,14 +587,14 @@ __device__ __forceinline__ void b_post(const PrepBParams& p, float* smem, const 
                 const v4bh k1 = rok ? *reinterpret_cast<const v4bh*>(p.Kb + o + 4) : z4;
                 #pragma unroll
                 for (int d = 0; d < 8; ++d)
-                    T2[(cq + d) * kT2 + row] = d < 4 ? k0[d & 3] : k1[d & 3];
+                    T2[prepb_t2i(cq + d, row)] = d < 4 ? k0[d & 3] : k1[d & 3];
             } else {
                 const float b = rok ? p.beta[g2_rm_tok(tok0 + row, hh, p.H, 1)] : 0.f;
                 const v4bh v0 = rok ? *reinterpret_cast<const v4bh*>(p.v + o) : z4;
                 const v4bh v1 = rok ? *reinterpret_cast<const v4bh*>(p.v + o + 4) : z4;
                 #pragma unroll
                 for (int d = 0; d < 8; ++d)
-                    T2[(cq + d) * kT2 + row] = bf_rne(bf2f(d < 4 ? v0[d & 3] : v1[d & 3]) * b);
+                    T2[prepb_t2i(cq + d, row)] = bf_rne(bf2f(d < 4 ? v0[d & 3] : v1[d & 3]) * b);
             }
         }
         lds_barrier();
@@ -596,8 +607,7 @@ __device__ __forceinline__ void b_post(const PrepBParams& p, float* smem, const 
             #pragma unroll
             for (int vt = 0; vt < 8; ++vt) {
                 const int n = (pass == 0 || p.kp) ? pm : m;   // kra P-62
-                acc[vt] = mmac(a, *reinterpret_cast<const v4bh*>(T2 + (16 * vt + n) * kT2
-                                                               + 16 * j + 4 * q4), acc[vt]);
+                acc[vt] = mmac(a, *reinterpret_cast<const v4bh*>(T2 + prepb_t2i(16 * vt + n, 16 * j + 4 * q4)), acc[vt]);
             }
         }
         short* out = pass == 0 ? p.Wn : p.Un;
@@ -610,7 +620,11 @@ __device__ __forceinline__ void b_post(const PrepBParams& p, float* smem, const 
 
 template <bool VL>
 __global__ void __launch_bounds__(256) g2_fwd_prep_b_kernel(PrepBParams p) {
+#if defined(__gfx938__)
+    __shared__ __align__(16) float smem[4096];       // kra P-938w: 16 KB (4 CTAs per CU), T2 swizzled
+#else
     __shared__ __align__(16) float smem[4352];
+#endif
     const int i = blockIdx.x, hh = blockIdx.y;
     const int wv = __builtin_amdgcn_readfirstlane(threadIdx.x >> 6);
     const int l = threadIdx.x & 63;
@@ -651,7 +665,7 @@ extern "C" int g2_fwd_prep_l2n(const void* q, const void* k, const void* v, cons
                            (float*)k_rstd, (float*)Gn, ctok, clen, (float)lower_bound,
                            (float)gscale, H, NT, 0};
     if (const char* e = g2::g2_getenv("G2_PREP_STOP")) pa.stop = atoi(e);
-    pa.kp = H <= g2::g2_env_long("KDA_G2_KPERM_MAX_H", 20);   // kra P-61e
+    pa.kp = g2::g2_kp_layout(H);   // kra P-61e
     pa.qn_out = (short*)qn_out; pa.kn_out = (short*)kn_out;    // kra P-77b
     const dim3 grid(NT, H), blk(256);
 #define G2_PREP_A(GT, VLT, L2) hipLaunchKernelGGL((g2::r4::g2_fwd_prep_a_kernel<GT, VLT, L2>), grid, blk, 0, s, pa)
