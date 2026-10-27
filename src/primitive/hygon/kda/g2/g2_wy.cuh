@@ -1533,7 +1533,9 @@ extern "C" int g2_wy_s4_split_r2(const void* q_kgb, const void* k, const void* v
                        ctok, clen, (const bf16*)dv2c};
         const dim3 s4grd = g2::g2_env_long("KDA_G2_S4_HF", 1) ? dim3(H, NT) : dim3(NT, H);   // kra P-88 (default on)
         pa.hf = g2::g2_env_long("KDA_G2_S4_HF", 1) != 0;   // kra P-96
-        int afs_maxh = 12;   // kra P-28c (H=24 measured mixed: 1.036x at 8K, 0.94-0.97x at 32K-64K)
+        // kra P-28c (H=24 measured mixed on gfx936: 1.036x at 8K, 0.94-0.97x at 32K-64K).  kra P-938s4: on gfx938 the
+        // staged form wins at every H (s4a 1.25x at 2048/16, 1.32x at 4096/32, 1.35x at 8192/64)
+        int afs_maxh = g2::g2_cur_gfx938() ? (1 << 30) : 12;
         if (const char* e = g2::g2_getenv("KDA_G2_S4A_AFS_MAXH")) afs_maxh = atoi(e);
         const bool afs = H <= afs_maxh;
         const bool pf = g2::g2_env_long("KDA_G2_S4A_PF", 1) != 0;   // kra P-83 (default on)
