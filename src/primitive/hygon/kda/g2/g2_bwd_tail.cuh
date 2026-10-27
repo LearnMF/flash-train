@@ -164,7 +164,11 @@ __global__ void __launch_bounds__(256) g2_bwd_tail_kernel(TailParams p) {
                     const int t = tb + 15 - u;
                     const float suffix = loc[u] + carry;
                     const float gg = bf2f(j ? gr2[u].y : gr2[u].x) + dtbj;   // kra P-54a
+#if G2_SIGFAST && KDA_B1_SIG
+                    const float sg = g2_sig_b1(A * gg);
+#else
                     const float sg = 1.f / (1.f + expf(-(A * gg)));
+#endif
                     float bdg = suffix * (p.lower_bound * (sg * (1.f - sg)));   // dyg*t1
                     bdg *= A;
                     {   // dAs += bdg * gg (compensated)

@@ -115,6 +115,12 @@ __global__ void __launch_bounds__(256) g2_gate_kernel(GateParams p) {
         float2 gt = v[u];
         if constexpr (GATE == 1) {
 #if G2_SIGFAST
+#if KDA_B1_SIG
+            if (true) {
+                gt.x = p.lower_bound * g2_sig_b1(A * gt.x);
+                gt.y = p.lower_bound * g2_sig_b1(A * gt.y);
+            } else
+#endif
             if (fast) {
                 gt.x = p.lower_bound * rcp1(1.f + expf_core(-(A * gt.x)));
                 gt.y = p.lower_bound * rcp1(1.f + expf_core(-(A * gt.y)));

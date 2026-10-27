@@ -83,6 +83,14 @@ __device__ __forceinline__ float rcp1(float d) {
 // wave-uniform selector: every argument |x| <= 87 and none NaN (a NaN anywhere makes the running sum NaN)
 __device__ __forceinline__ void g2_sig_acc(float x, float& mx, float& sx) { mx = fmaxf(mx, fabsf(x)); sx += x; }
 __device__ __forceinline__ bool g2_sig_fast(float mx, float sx) { return __all(mx <= 87.f && sx == sx); }
+// kra P-938b1 (B class, numerics change -- gated against the FP64 oracle): the safe-gate sigmoid as bare v_exp_f32 +
+// v_rcp_f32 (~1e-6 relative), applied consistently in prep_a, the backward gate kernel and bwd_tail
+#ifndef KDA_B1_SIG
+#define KDA_B1_SIG 1
+#endif
+__device__ __forceinline__ float g2_sig_b1(float x) {
+    return __builtin_amdgcn_rcpf(1.f + __builtin_amdgcn_exp2f(-x * 1.4426950408889634f));
+}
 #endif
 
 // kra P-938t: gfx938 MLS as a tile copier: one wave instruction moves 32 rows x 64 B (row stride stride_b16 2-byte
