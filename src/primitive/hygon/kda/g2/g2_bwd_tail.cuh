@@ -209,8 +209,39 @@ __global__ void __launch_bounds__(256) g2_bwd_tail_kernel(TailParams p) {
 
         // ---- Phase B: l2norm backward (one warp per row), then the beta tail
         if (!p.use_l2) {
-            // plain dtype cast (the rstd=None branch): bf16(dy), same lane mapping
-            // as the l2 branch (64 lanes x 2 columns per row)
+#if defined(__gfx938__)
+            // kra P-938c: the cast as 16 B loads (lane: 4 columns of one of 2 rows per instruction), all 16 of the
+            // warp's loads (dq, dk x its 16 rows) issued before the first convert; 8 B stores.  Same bf_rne per element.
+            {
+                const int cq = 4 * (l & 31), rh = l >> 5;
+                f4 x[2][8];
+                #pragma unroll
+                for (int w2 = 0; w2 < 2; ++w2) {
+                    const float* dy = w2 ? p.dk : p.dq;
+                    #pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        const int r = wv * 16 + 2 * j + rh;
+                        x[w2][j] = g2_row_ok<M>(r, cl)
+                            ? *reinterpret_cast<const f4*>(dy + ((size_t)(t0 + r) * p.H + hh) * kK + cq) : f4{0.f, 0.f, 0.f, 0.f};
+                    }
+                }
+                #pragma unroll
+                for (int w2 = 0; w2 < 2; ++w2) {
+                    short* out = w2 ? p.dko : p.dqo;
+                    #pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        const int r = wv * 16 + 2 * j + rh;
+                        if (g2_row_ok<M>(r, cl)) {
+                            v4bh o;
+                            #pragma unroll
+                            for (int e = 0; e < 4; ++e) o[e] = bf_rne(x[w2][j][e]);
+                            *reinterpret_cast<v4bh*>(out + ((size_t)(t0 + r) * p.H + hh) * kK + cq) = o;
+                        }
+                    }
+                }
+            }
+            if (false)
+#endif
             for (int which = 0; which < 2; ++which) {
                 const float* dy = which ? p.dk : p.dq;
                 short* out = which ? p.dko : p.dqo;
