@@ -60,6 +60,35 @@ __global__ void __launch_bounds__(256) g2_dav_kernel(DavParams p_) {
         const size_t vbase = ((size_t)t0 * p.H + hh) * kV;
         const size_t nblk = (size_t)(hh * p.NT + i) * 8192;       // Vn / dVn native
         const size_t nblk3 = g2_nat_blk(i, hh, p.H, p.NT, true, 8192);   // aN_do's (i*H+hh)
+#if defined(__gfx938__)
+        // kra P-938d: every global operand of both passes issued up front (pass 1's do rows, pass 2's do tile and A^T
+        // gathers): their latency hid nowhere before (SQTT: vmcnt waits 32% of dav).  Same loads, same values.
+        v4bh dfa[8], dva[8], afa[4];
+        {
+            const int rdo = 16 * wv + (l & 15);
+            const bool dok = g2_row_ok<M>(rdo, cl);
+            #pragma unroll
+            for (int vs = 0; vs < 8; ++vs)
+                dfa[vs] = dok ? *reinterpret_cast<const v4bh*>(p.do_ + g2_rm_tok(t0 + rdo, hh, p.H, kV) + 16 * vs + (l >> 4) * 4)
+                              : v4bh{0, 0, 0, 0};
+            #pragma unroll
+            for (int it_ = 0; it_ < 8; ++it_) {
+                const int t = tid + 256 * it_;
+                const int j = t >> 5, vq = (t & 31) << 2;
+                dva[it_] = g2_row_ok<M>(j, cl) ? *reinterpret_cast<const v4bh*>(p.do_ + vbase + (size_t)j * rstride + vq)
+                                               : v4bh{0, 0, 0, 0};
+            }
+            const int tp = 16 * wv + (l & 15);
+            #pragma unroll
+            for (int js = 0; js < 4; ++js)
+                #pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    const int t = 16 * js + 4 * (l >> 4) + e;
+                    afa[js][e] = (t >= tp && g2_row_ok<M>(t, cl)) ?
+                        *reinterpret_cast<const short*>(p.A + g2_rm_tok(t0 + t, hh, p.H, kBT) + tp) : 0;
+                }
+        }
+#endif
         // pass 1 stages the B operand as [j][v] (n = j, k = v -- 132-stride, v spans
         // 128); pass 2 stages [v][t] (n = v, k = t -- 68-stride).  Both fit 17.4KB.
                                                                   // pass1 [j][132] = 8448,
@@ -86,10 +115,17 @@ __global__ void __launch_bounds__(256) g2_dav_kernel(DavParams p_) {
             for (int jt = 0; jt < 4; ++jt) acc[jt] = f4{0.f, 0.f, 0.f, 0.f};
             const int rdo = 16 * wv + (l & 15);
             const bool dok = g2_row_ok<M>(rdo, cl);
+#if defined(__gfx938__)
+            #pragma unroll
+#endif
             for (int vs = 0; vs < 8; ++vs) {                      // reduction over v
+#if defined(__gfx938__)
+                const v4bh df = dfa[vs];
+#else
                 const v4bh df = dok ? *reinterpret_cast<const v4bh*>(
                     p.do_ + g2_rm_tok(t0 + rdo, hh, p.H, kV)
                     + 16 * vs + (l >> 4) * 4) : v4bh{0, 0, 0, 0};
+#endif
                 #pragma unroll
                 for (int jt = 0; jt < 4; ++jt) {
                     const size_t lo = i1(16 * jt + (l & 15), 16 * vs + (l >> 4) * 4);
@@ -130,9 +166,13 @@ __global__ void __launch_bounds__(256) g2_dav_kernel(DavParams p_) {
         for (int it_ = 0; it_ < 8; ++it_) {
             const int t = tid + 256 * it_;
             const int j = t >> 5, vq = (t & 31) << 2;
+#if defined(__gfx938__)
+            const v4bh dv_ = dva[it_];
+#else
             const v4bh dv_ = g2_row_ok<M>(j, cl)
                 ? *reinterpret_cast<const v4bh*>(p.do_ + vbase + (size_t)j * rstride + vq)
                 : v4bh{0, 0, 0, 0};
+#endif
             #pragma unroll
             for (int d = 0; d < 4; ++d)
                 slab[i2(vq + d, j)] = dv_[d];
@@ -146,9 +186,13 @@ __global__ void __launch_bounds__(256) g2_dav_kernel(DavParams p_) {
         for (int it_ = 0; it_ < 8; ++it_) {
             const int t = tid + 256 * it_;
             const int j = t >> 5, vq = (t & 31) << 2;
+#if defined(__gfx938__)
+            const v4bh dv_ = dva[it_];
+#else
             const v4bh dv_ = g2_row_ok<M>(j, cl)
                 ? *reinterpret_cast<const v4bh*>(p.do_ + vbase + (size_t)j * rstride + vq)
                 : v4bh{0, 0, 0, 0};
+#endif
             #pragma unroll
             for (int d = 0; d < 4; ++d)
                 slab[i2(vq + d, j)] = dv_[d];
@@ -181,8 +225,14 @@ __global__ void __launch_bounds__(256) g2_dav_kernel(DavParams p_) {
             #pragma unroll
             for (int vt = 0; vt < 8; ++vt) acc[vt] = f4{0.f, 0.f, 0.f, 0.f};
             const int tp = 16 * wv + (l & 15);                    // this lane's t' row
+#if defined(__gfx938__)
+            #pragma unroll
+#endif
             for (int js = 0; js < 4; ++js) {                      // reduction over t
                 v4bh af;
+#if defined(__gfx938__)
+                af = afa[js];
+#else
                 #pragma unroll
                 for (int e = 0; e < 4; ++e) {
                     const int t = 16 * js + 4 * (l >> 4) + e;
@@ -190,6 +240,7 @@ __global__ void __launch_bounds__(256) g2_dav_kernel(DavParams p_) {
                         *reinterpret_cast<const short*>(
                             p.A + g2_rm_tok(t0 + t, hh, p.H, kBT) + tp) : 0;
                 }
+#endif
                 #pragma unroll
                 for (int vt = 0; vt < 8; ++vt) {
                     const size_t lo = i2(16 * vt + (l & 15), 16 * js + (l >> 4) * 4);
