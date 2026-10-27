@@ -622,7 +622,9 @@ extern "C" int g2_dhu_v8b(const void* KgA, const void* Qg, const void* Wb, const
     auto dyn = [&](auto kern) -> size_t { return dthrottle ? g2_lds_topup(kern, 33 * 1024) : 0; };
     // kra P-22d: linear aN(dv2) emit only in the latency-bound regime (few CTAs); at deep saturation
     // the scattered stores pace the loads (R21).  KDA_G2_DHU_LIN=0/1 forces it.
-    bool lin = ctas <= 96;
+    // kra P-938l: on gfx938 the linear emit wins at every grid (dhu 1.25x at 128 CTAs, 1.33x at 256, neutral at 32-64):
+    // the scattered 2 B stores' issue stalls (SQTT: ~17% of dhu at 8192/64) cost more than the vB re-read
+    bool lin = ctas <= 96 || g2_cur_gfx938();
     if (const char* e = g2::g2_getenv("KDA_G2_DHU_LIN")) lin = atoi(e) != 0;
     // kra P-10: the production output set gets the compile-time instance
     const bool prod = HbN != nullptr && ANv2 != nullptr && dv2 == nullptr;
