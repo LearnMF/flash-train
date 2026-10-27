@@ -825,6 +825,8 @@ struct WyS4BParams {
     const bf16* do_row;                 // kra P-20: row-major do, read when do_ (aN_do) is null
     const bf16* vnc;                    // kra P-22: C-form v_new (std order), read when v_new is null
     int hf = 0;                         // kra P-96: head-fastest grid (blockIdx.x = head), set by the launcher
+    short* dq_bf = nullptr;             // kra P-938q: non-null -> dq / dk go out as the final bf16 (gfx938, no l2norm)
+    short* dk_bf = nullptr;
 };
 
 #if defined(__gfx938__)
@@ -1435,8 +1437,21 @@ __device__ __forceinline__ void s4b_tail(const WyS4BParams& p, S4BSmem& sm, cons
         }
         dbacc += (dbp[0] + dbp[1]) + (dbp[2] + dbp[3]);
         if (rok) {
+#if defined(__gfx938__)
+            // kra P-938q: the tail's dtype cast done here (same bf_rne per element): dq / dk leave as bf16 and the
+            // fp32 copies are neither written nor read back by bwd_tail
+            if (p.dq_bf != nullptr) {
+                v4bh bq, bk;
+                #pragma unroll
+                for (int e = 0; e < 4; ++e) { bq[e] = bf_rne(oq[e]); bk[e] = bf_rne(ok[e]); }
+                *reinterpret_cast<v4bh*>(p.dq_bf + cb + ro + kc) = bq;
+                *reinterpret_cast<v4bh*>(p.dk_bf + cb + ro + kc) = bk;
+            } else
+#endif
+            {
             *reinterpret_cast<f4*>(dq_ + ro + kc) = oq;
             *reinterpret_cast<f4*>(dk_ + ro + kc) = ok;
+            }
             *reinterpret_cast<f4*>(dg_ + ro + kc) = og;
         }
         lds_barrier();                             // table WAR: kt's reads done before kt+1 writes
@@ -1499,15 +1514,16 @@ p3_wy_s4b_kernel(WyS4BParams p) {
 }
 
 // kra P-20: + do_row (row-major do; read by s4b when do_ == nullptr)
-extern "C" int g2_wy_s4_split_r(const void* q_kgb, const void* k, const void* v_vb,
-                                const void* v_new, const void* g, const void* beta,
-                                const void* A, const void* h, const void* do_, const void* dh,
-                                const void* dv, const void* dAqk, void* dq, void* dk,
-                                void* dv2, void* dg, void* db, void* dA, void* dwT,
-                                void* db_part, float scale, int T, int H, int NT,
-                                const void* q_row, const void* v_row, const int* ctok,
-                                const int* clen, const void* do_row, const void* dv2c,
-                                const void* vnc, hipStream_t s) {
+// kra P-938q: + dq_bf / dk_bf (bf16 final dq / dk straight from s4b; null = the fp32 hand-off)
+extern "C" int g2_wy_s4_split_r2(const void* q_kgb, const void* k, const void* v_vb,
+                                 const void* v_new, const void* g, const void* beta,
+                                 const void* A, const void* h, const void* do_, const void* dh,
+                                 const void* dv, const void* dAqk, void* dq, void* dk,
+                                 void* dv2, void* dg, void* db, void* dA, void* dwT,
+                                 void* db_part, float scale, int T, int H, int NT,
+                                 const void* q_row, const void* v_row, const int* ctok,
+                                 const int* clen, const void* do_row, const void* dv2c,
+                                 const void* vnc, void* dq_bf, void* dk_bf, hipStream_t s) {
     // T = chunk-padded rows (NT = T/64); with ctok/clen the row tensors are packed.
     if (T % kBT || NT != T / kBT || ((ctok == nullptr) != (clen == nullptr))) return -1;
     {
@@ -1545,10 +1561,25 @@ extern "C" int g2_wy_s4_split_r(const void* q_kgb, const void* k, const void* v_
                        ctok, clen, (const bf16*)do_row, (const bf16*)vnc};
         const dim3 s4grd = g2::g2_env_long("KDA_G2_S4_HF", 1) ? dim3(H, NT) : dim3(NT, H);   // kra P-88 (default on)
         pb.hf = g2::g2_env_long("KDA_G2_S4_HF", 1) != 0;   // kra P-96
+        pb.dq_bf = (short*)dq_bf; pb.dk_bf = (short*)dk_bf;
         if (ctok) hipLaunchKernelGGL(p3_wy_s4b_kernel<true>, s4grd, dim3(256), 0, s, pb);
         else hipLaunchKernelGGL(p3_wy_s4b_kernel<false>, s4grd, dim3(256), 0, s, pb);
         return (int)hipGetLastError();
     }
+}
+
+extern "C" int g2_wy_s4_split_r(const void* q_kgb, const void* k, const void* v_vb,
+                                const void* v_new, const void* g, const void* beta,
+                                const void* A, const void* h, const void* do_, const void* dh,
+                                const void* dv, const void* dAqk, void* dq, void* dk,
+                                void* dv2, void* dg, void* db, void* dA, void* dwT,
+                                void* db_part, float scale, int T, int H, int NT,
+                                const void* q_row, const void* v_row, const int* ctok,
+                                const int* clen, const void* do_row, const void* dv2c,
+                                const void* vnc, hipStream_t s) {
+    return g2_wy_s4_split_r2(q_kgb, k, v_vb, v_new, g, beta, A, h, do_, dh, dv, dAqk, dq, dk, dv2, dg, db, dA,
+                             dwT, db_part, scale, T, H, NT, q_row, v_row, ctok, clen, do_row, dv2c, vnc,
+                             nullptr, nullptr, s);
 }
 
 extern "C" int g2_wy_s4_split(const void* q_kgb, const void* k, const void* v_vb,

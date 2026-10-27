@@ -47,6 +47,7 @@ struct TailParams {
     // the fp32 reverse chunk-cumsum of dg (FLA chunk_local_cumsum(reverse)), no dA/ddt.
     // beta_f32 -> beta_raw / db_out are fp32 (fused_beta_sigmoid_bwd keeps x's dtype).
     int gate_none; int beta_f32;
+    int no_cast = 0;                         // kra P-938q: dq / dk already final (s4b wrote bf16): skip the cast
 };
 
 // VL (varlen phase 2): rows r >= clen load as 0 and are never stored; ALL arithmetic
@@ -210,6 +211,7 @@ __global__ void __launch_bounds__(256) g2_bwd_tail_kernel(TailParams p) {
         // ---- Phase B: l2norm backward (one warp per row), then the beta tail
         if (!p.use_l2) {
 #if defined(__gfx938__)
+            if (p.no_cast) {} else
             // kra P-938c: the cast as 16 B loads (lane: 4 columns of one of 2 rows per instruction), all 16 of the
             // warp's loads (dq, dk x its 16 rows) issued before the first convert; 8 B stores.  Same bf_rne per element.
             {
@@ -347,7 +349,7 @@ __global__ void g2_bwd_tail_reduce_kernel(TailParams p) {
 
 }  // namespace g2
 
-extern "C" int g2_bwd_tail(const void* dq, const void* dk, const void* dg,
+extern "C" int g2_bwd_tail2(const void* dq, const void* dk, const void* dg,
                            const void* db, const void* qn, const void* kn,
                            const void* q_rstd, const void* k_rstd,
                            const void* g_raw, const void* A_log,
@@ -358,7 +360,7 @@ extern "C" int g2_bwd_tail(const void* dq, const void* dk, const void* dg,
                            double lower_bound, double beta_scale,
                            int use_l2, int use_beta,
                            int B, int T, int H, const int* ctok, const int* clen, int NTv,
-                           int gate_none, int beta_f32, hipStream_t s) {
+                           int gate_none, int beta_f32, int no_cast, hipStream_t s) {
     // Dense: T rows, NT = T/64.  Varlen phase 2: T packed rows, NTv chunks (ctok/clen).
     if (B != 1 || (ctok == nullptr && T % 64) || ((ctok == nullptr) != (clen == nullptr)))
         return -1;
@@ -373,6 +375,7 @@ extern "C" int g2_bwd_tail(const void* dq, const void* dk, const void* dg,
                      (float*)dA_part, (float*)ddt_part,
                      (float)lower_bound, (float)beta_scale,
                      use_l2, use_beta, H, NT, ctok, clen, gate_none, beta_f32};
+    p.no_cast = (no_cast && !use_l2) ? 1 : 0;
     if (ctok)
         hipLaunchKernelGGL(g2::g2_bwd_tail_kernel<true>, dim3(NT, H), dim3(256), 0, s, p);
     else
@@ -380,4 +383,21 @@ extern "C" int g2_bwd_tail(const void* dq, const void* dk, const void* dg,
     if (!gate_none)
         hipLaunchKernelGGL(g2::g2_bwd_tail_reduce_kernel, dim3(H), dim3(256), 0, s, p);
     return (int)hipGetLastError();
+}
+
+extern "C" int g2_bwd_tail(const void* dq, const void* dk, const void* dg,
+                           const void* db, const void* qn, const void* kn,
+                           const void* q_rstd, const void* k_rstd,
+                           const void* g_raw, const void* A_log,
+                           const void* dt_bias, const void* beta_raw,
+                           void* dqo, void* dko, void* dg_raw, void* dA_log,
+                           void* ddt_bias, void* db_out,
+                           void* dA_part, void* ddt_part,
+                           double lower_bound, double beta_scale,
+                           int use_l2, int use_beta,
+                           int B, int T, int H, const int* ctok, const int* clen, int NTv,
+                           int gate_none, int beta_f32, hipStream_t s) {
+    return g2_bwd_tail2(dq, dk, dg, db, qn, kn, q_rstd, k_rstd, g_raw, A_log, dt_bias, beta_raw, dqo, dko, dg_raw,
+                        dA_log, ddt_bias, db_out, dA_part, ddt_part, lower_bound, beta_scale, use_l2, use_beta, B, T,
+                        H, ctok, clen, NTv, gate_none, beta_f32, 0, s);
 }

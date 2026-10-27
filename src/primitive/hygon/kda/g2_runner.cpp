@@ -66,6 +66,18 @@ int g2_wy_s4_split_r(const void* q_kgb, const void* k, const void* v_vb, const v
                      void* db_part, float scale, int T, int H, int NT, const void* q_row, const void* v_row,
                      const int* ctok, const int* clen, const void* do_row, const void* dv2c, const void* vnc,
                      hipStream_t s);
+int g2_wy_s4_split_r2(const void* q_kgb, const void* k, const void* v_vb, const void* v_new, const void* g,
+                      const void* beta, const void* A, const void* h, const void* do_, const void* dh, const void* dv,
+                      const void* dAqk, void* dq, void* dk, void* dv2, void* dg, void* db, void* dA, void* dwT,
+                      void* db_part, float scale, int T, int H, int NT, const void* q_row, const void* v_row,
+                      const int* ctok, const int* clen, const void* do_row, const void* dv2c, const void* vnc,
+                      void* dq_bf, void* dk_bf, hipStream_t s);
+int g2_bwd_tail2(const void* dq, const void* dk, const void* dg, const void* db, const void* qn, const void* kn,
+                 const void* q_rstd, const void* k_rstd, const void* g_raw, const void* A_log, const void* dt_bias,
+                 const void* beta_raw, void* dqo, void* dko, void* dg_raw, void* dA_log, void* ddt_bias, void* db_out,
+                 void* dA_part, void* ddt_part, double lower_bound, double beta_scale, int use_l2, int use_beta, int B,
+                 int T, int H, const int* ctok, const int* clen, int NTv, int gate_none, int beta_f32, int no_cast,
+                 hipStream_t s);
 int g2_bwd_tail(const void* dq, const void* dk, const void* dg, const void* db, const void* qn, const void* kn,
                 const void* q_rstd, const void* k_rstd, const void* g_raw, const void* A_log, const void* dt_bias,
                 const void* beta_raw, void* dqo, void* dko, void* dg_raw, void* dA_log, void* ddt_bias, void* db_out,
@@ -160,6 +172,27 @@ inline bool g2KpLayout(long H) {
         }
     }
     return H <= 20;
+}
+
+// kra P-938q: gfx938 without in-kernel l2norm -- s4b writes the final bf16 dq / dk and bwd_tail skips its cast.
+// KDA_G2_S4B_BF16=0 (FTRAIN_KDA_DEV only) restores the fp32 hand-off.
+inline bool g2S4bBf16(const Shape& shape) {
+    if (shape.l2norm_qk) { return false; }
+    static const bool on = [] {
+        const char* d = std::getenv(FTRAIN_KDA_DEV);
+        const bool dev = d != nullptr && *d != '\0' && std::strcmp(d, "0") != 0;
+        const char* e = dev ? std::getenv("KDA_G2_S4B_BF16") : nullptr;
+        return e == nullptr || std::strcmp(e, "0") != 0;
+    }();
+    if (!on) { return false; }
+    static int known[64] = {};   // 0 unknown, 1 gfx938, 2 other
+    int d = 0;
+    if (hipGetDevice(&d) != hipSuccess || d < 0 || d >= 64) { return false; }
+    if (known[d] == 0) {
+        hipDeviceProp_t prop;
+        known[d] = (hipGetDeviceProperties(&prop, d) == hipSuccess && std::strncmp(prop.gcnArchName, "gfx938", 6) == 0) ? 1 : 2;
+    }
+    return known[d] == 1;
 }
 
 // kra P-94: the forward runs the R4 prep also without in-kernel l2norm (bitwise the X1 chain);
@@ -416,16 +449,20 @@ void backward(const Shape& shape, const BackwardArgs& p, void* workspace, FTrain
     check(g2_dhu_v8b(L.KgA, L.Qn, L.Wb, L.dOT, L.dVn, L.Gn, nullptr, L.HbNdh, L.ANv2, p.scale, 1, NT * 64, H, L.tab.seg,
                      nseg, stream),
           "dhu");
-    check(g2_wy_s4_split_r(L.kgB, kn, nullptr, ANv, L.g, p.beta, p.akk, HbN, nullptr, L.HbNdh, L.ANv2, dA, L.dq,
-                           L.dk, p.dv, L.dg, p.dbeta, L.dAout, L.dwT, L.dbPart, p.scale, NT * 64, H, NT, qn, p.v,
-                           ctok, clen, p.d_o, nullptr, kept ? nullptr : Vn, stream),
+    // kra P-938q: gfx938 without in-kernel l2norm -- s4b writes the final bf16 dq / dk, bwd_tail skips its cast
+    const bool s4bq = g2S4bBf16(shape);
+    check(g2_wy_s4_split_r2(L.kgB, kn, nullptr, ANv, L.g, p.beta, p.akk, HbN, nullptr, L.HbNdh, L.ANv2, dA, L.dq,
+                            L.dk, p.dv, L.dg, p.dbeta, L.dAout, L.dwT, L.dbPart, p.scale, NT * 64, H, NT, qn, p.v,
+                            ctok, clen, p.d_o, nullptr, kept ? nullptr : Vn, s4bq ? p.dq : nullptr,
+                            s4bq ? p.dk : nullptr, stream),
           "wy");
     // dbeta: the post-activation beta's gradient is wy's fp32 db, written in place (use_beta = 0).
-    check(g2_bwd_tail(L.dq, L.dk, L.dg, p.dbeta, qn, kn, p.q_rstd, p.k_rstd, p.g,
+    check(g2_bwd_tail2(L.dq, L.dk, L.dg, p.dbeta, qn, kn, p.q_rstd, p.k_rstd, p.g,
                       shape.gate_in_kernel ? p.a_log : nullptr, shape.gate_in_kernel ? p.dt_bias : nullptr, p.beta,
                       p.dq, p.dk, p.dg, shape.gate_in_kernel ? p.da_log : nullptr,
                       shape.gate_in_kernel ? p.ddt_bias : nullptr, nullptr, L.dAPart, L.ddtPart, p.lower_bound, 1.0,
-                      shape.l2norm_qk ? 1 : 0, 0, 1, T, H, ctok, clen, NT, shape.gate_in_kernel ? 0 : 1, 1, stream),
+                      shape.l2norm_qk ? 1 : 0, 0, 1, T, H, ctok, clen, NT, shape.gate_in_kernel ? 0 : 1, 1, s4bq ? 1 : 0,
+                      stream),
           "bwd_tail");
 }
 
