@@ -544,7 +544,9 @@ __device__ __forceinline__ void b_post(const PrepBParams& p, float* smem, const 
     }
 #endif
     lds_barrier();
-    if (p.stop == 1) return;
+#if defined(__gfx938__)
+    if (p.stop == 1) return;   // G2_PREPB_STOP (dev, gfx938 build only)
+#endif
 
     const int t = 16 * I + m;
     const bool tok_ = g2_row_ok<M>(t, cl);
@@ -565,7 +567,9 @@ __device__ __forceinline__ void b_post(const PrepBParams& p, float* smem, const 
             *reinterpret_cast<v4bh*>(p.AqkA + nat16(nblk64 + (size_t)(cb + 4 * I) * 256 + 4 * l)) = b;
         }
     }
+#if defined(__gfx938__)
     if (p.stop == 2) return;
+#endif
     f4 Ai[4];
     {
         f4 raw;
@@ -640,12 +644,16 @@ __device__ __forceinline__ void b_post(const PrepBParams& p, float* smem, const 
         }
     }
 
+#if defined(__gfx938__)
     if (p.stop == 3) return;
+#endif
     short* T2 = reinterpret_cast<short*>(smem);
     lds_barrier();
     #pragma unroll
     for (int pass = 0; pass < 2; ++pass) {
+#if defined(__gfx938__)
         if (pass == 1 && p.stop == 4) return;
+#endif
         #pragma unroll
         for (int it = 0; it < 4; ++it) {
             const int tid = 64 * I + l;
