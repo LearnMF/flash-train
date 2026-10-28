@@ -97,11 +97,18 @@ KDA 的 HIP kernel（G2）已经编译在 flash-train 里（`libflash_train.so`�
 
 **完整步骤速览**（每一步的细节见下面对应小节）：
 
-1. 在训练镜像里获取 flash-train 源码，编译并安装 wheel（约 3–4 分钟）；
-2. 把 `kimi_k3_ops.kda()` 里的 `from fla.ops.kda import chunk_kda` 换成 `from flash_train.torch import chunk_kda`，参数不动；
+1. 安装 wheel：镜像与下表的预编译 wheel 一致时直接 `pip install`；否则在训练镜像里从源码编译（约 3–4 分钟）；
+2. 把 Megatron 里的 `from fla.ops.kda import chunk_kda` 换成 `from flash_train.torch import chunk_kda`，参数不动；
 3. 照原来的命令启动训练，用打印或 profiler 确认 KDA 走的是 flash-train。
 
-**环境要求**：BW1000 等 gfx936 卡；K = V = 128（K3 满足）。已验证的镜像为 das megatron 0.18.2（DTK 26.04、torch 2.10、Python 3.10）。
+**环境要求**：BW1000 等 gfx936 卡；K = V = 128（K3 满足）。gfx938（BW1102）的版本还在优化，本分支在 gfx938 上会抛 `FTRAIN_STATUS_UNSUPPORTED`。
+
+| 镜像 | DTK / torch / Python | 安装方式 | 验证情况 |
+|---|---|---|---|
+| megatron 0.19.2（`megatron:0.19.2-ubuntu22.04-dtk2610-py3.12-1009`） | 26.10 / 2.11 / 3.12 | 预编译 wheel 或源码编译 | 逐位门禁、pytest 104 项、Megatron-LM-k3 3 层配方训练 |
+| das megatron 0.18.2 | 26.04 / 2.10 / 3.10 | 源码编译 | 早期版本在该镜像上验证过；`e9eb1ef` 未在该镜像上单独复测 |
+
+**性能**（BW1000，与同卡 FLA 0.5.2 比较，B = 1、K = V = 128，T = 1K–32K × 每卡 H = 64/32/16/8 共 24 个形状）：前向 1.63–2.27 倍，反向 1.83–2.44 倍，前向 + 反向约 2.1 倍；结果确定（多次运行逐位相同）。KDA 在整个模型里占比小的配置（例如 3 层调试模型），端到端只会快百分之一左右。
 
 #### 输入形状：B / T / H 的含义
 
@@ -125,14 +132,25 @@ q / k / v / g 都是 `[B, T, H, 128]`，beta 是 `[B, T, H]`，A_log 是 `[H]`�
 
 需要我们按实际训练配置测性能时，提供以下几项即可：TP（或每卡 head 数）、micro batch size、seq_len、是否传 `cu_seqlens`（是的话附大致的文档长度分布或一份典型的 `cu_seqlens`）、是否开全层重算。CP（context parallel）目前不支持。
 
-#### 1. 获取源码、编译和安装
+#### 1. 安装
 
-在训练用的镜像（容器）里执行。wheel 绑定编译时的 DTK、torch 和 Python 版本，所以要在同一个镜像里编译；换了镜像要重新编译。
+wheel 绑定编译时的 DTK、torch 和 Python 版本：镜像与预编译 wheel 一致时直接安装（1a）；其他镜像在训练用的镜像（容器）里从源码编译（1b），换了镜像要重新编译。
+
+**1a. 预编译 wheel**（megatron 0.19.2 / DTK 26.10 / torch 2.11 / Python 3.12）
+
+从本仓库 Releases 页面的 `kda-mk3-e9eb1ef` 下载 `flash_train-0.1.0-cp312-cp312-linux_x86_64.whl`（MD5 `baf1a94f7cf648e0da22c6559db8d03e`，由提交 `e9eb1ef` 编译），然后：
 
 ```bash
-git clone -b feat/kda https://github.com/LearnMF/flash-train.git
+python3 -m pip install --no-deps --force-reinstall flash_train-0.1.0-cp312-cp312-linux_x86_64.whl
+python3 -c "import flash_train.torch as ft; print(ft.__file__, ft.chunk_kda)"
+```
+
+**1b. 源码编译**
+
+```bash
+git clone -b feat/kda-mk3 https://github.com/LearnMF/flash-train.git
 cd flash-train
-git checkout <commit>                         # 如果拿到的是指定版本（例如 7aeab8c），先切到该提交
+git checkout <commit>                         # 如果拿到的是指定版本（例如 e9eb1ef），先切到该提交
 git rev-parse --short HEAD                    # 记下实际使用的版本，反馈问题时附上
 
 export DTKROOT=/opt/dtk                       # CMake 靠它找到 roctx
@@ -147,10 +165,32 @@ python3 -c "import flash_train.torch as ft; print(ft.__file__, ft.chunk_kda)"
 - 最后一行应打印出 `.../site-packages/flash_train/torch/__init__.py` 和 `chunk_kda` 函数。
 - 多节点训练时，在一个节点上编译出 `dist/flash_train-*.whl`，其他节点（同一镜像）只需要 `pip install --no-deps` 这个 wheel，不需要上面的编译依赖。
 - wheel 里只有 flash-train 自己：`libflash_train.so`（框架加 KDA kernel）、`_flash_train_torch*.so`（PyTorch 绑定）和 Python 代码。torch、DTK 运行时、FLA 都由镜像提供。
+- 装好后建议在源码目录跑一遍自带测试（约 2 分钟），应为 104 项全部通过：`python3 -m pytest tests -q`。测试用 1b 克隆的源码；1a 只装 wheel 时，也要克隆同一提交的源码来拿 `tests/`。
 
 #### 2. 修改调用点
 
-Megatron-Bridge Kimi K3 的 KDA 调用在 `megatron/bridge/models/kimi/kimi_k3_ops.py` 的 `kda()` 里，把 import 换成 flash-train 即可：
+**Megatron-LM-k3**：KDA 的 import 在 `megatron/core/ssm/gated_delta_net/kda.py` 文件开头，换成 flash-train 即可，调用处（`self.gated_delta_rule(...)`，`use_qk_l2norm_in_kernel=False`）不用改：
+
+```python
+try:
+    from flash_train.torch import chunk_kda       # 原来：from fla.ops.kda import chunk_kda
+    HAVE_FLA_KDA = HAVE_FLA                        # 卷积、归一化等仍用 FLA 的实现
+except ImportError:
+    chunk_kda = None
+    HAVE_FLA_KDA = False
+```
+
+需要在 FLA 和 flash-train 之间切换做对比时，可以在 Megatron 里加一个开关。下面是我们 A/B 测试用的写法；变量名 `KDA_IMPL` 是 Megatron 侧自定义的，flash-train 不读取它：
+
+```python
+import os
+if os.environ.get("KDA_IMPL", "fla") == "ft":
+    from flash_train.torch import chunk_kda
+else:
+    from fla.ops.kda import chunk_kda
+```
+
+**Megatron-Bridge**：Kimi K3 的 KDA 调用在 `megatron/bridge/models/kimi/kimi_k3_ops.py` 的 `kda()` 里，把 import 换成 flash-train 即可：
 
 ```python
 def kda(q, k, v, g, beta, a_log, dt_bias, lower_bound, *, cu_seqlens=None):
@@ -188,7 +228,7 @@ def kda(q, k, v, g, beta, a_log, dt_bias, lower_bound, *, cu_seqlens=None):
 - 只做布局转换，与在打包 THD 张量上直接调用 `kimi_delta_attention` 逐位一致：`[B, T, H, D]` 展平成 `[B*T, H, D]`；`B > 1` 且不传 `cu_seqlens` 时按 B 条长度为 T 的序列处理；传 `cu_seqlens` 时要求 `B == 1`（与 FLA 相同）。
 - gate：`use_gate_in_kernel=True` 时要求给出 `A_log`、`dt_bias` 和 `lower_bound`（FLA 的 safe_gate 形式，即 K3 的用法）；`use_gate_in_kernel=False` 时 g 是逐 token log 衰减。`use_beta_sigmoid_in_kernel=True` 时在宿主侧对 beta 做 sigmoid（`allow_neg_eigval` 时乘 2）。
 - `disable_recompute` 与 FLA 含义相同，见上一节；不传时用算子自选的策略（FLA 的默认值是 `False`，这里是 `None`）。`chunk_size`、`cu_seqlens_cpu` 是 FLA 的调优参数，这里接受但不起作用。
-- 不支持的参数直接抛异常，不会悄悄回退：`initial_state`、`output_final_state=True`、`return_intermediate_states`、`cp_context`、没有 `lower_bound` 的 softplus gate 抛 `NotImplementedError`；未知关键字抛 `TypeError`。
+- 不支持的参数直接抛异常，不会悄悄回退：`initial_state`、`output_final_state=True`、`return_intermediate_states`、不为 None 的 `cp_context`（即 CP > 1）、没有 `lower_bound` 的 softplus gate 抛 `NotImplementedError`；未知关键字抛 `TypeError`。
 
 ### KDA 调试开关（flash-train 开发用，训练不需要）
 
