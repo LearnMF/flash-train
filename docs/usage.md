@@ -141,6 +141,8 @@ wheel 绑定编译时的 DTK、torch 和 Python 版本：镜像与预编译 whee
 从本仓库 Releases 页面的 `kda-mk3-e9eb1ef` 下载 `flash_train-0.1.0-cp312-cp312-linux_x86_64.whl`（MD5 `baf1a94f7cf648e0da22c6559db8d03e`，由提交 `e9eb1ef` 编译），然后：
 
 ```bash
+wget https://github.com/LearnMF/flash-train/releases/download/kda-mk3-e9eb1ef/flash_train-0.1.0-cp312-cp312-linux_x86_64.whl
+md5sum flash_train-0.1.0-cp312-cp312-linux_x86_64.whl   # baf1a94f7cf648e0da22c6559db8d03e
 python3 -m pip install --no-deps --force-reinstall flash_train-0.1.0-cp312-cp312-linux_x86_64.whl
 python3 -c "import flash_train.torch as ft; print(ft.__file__, ft.chunk_kda)"
 ```
