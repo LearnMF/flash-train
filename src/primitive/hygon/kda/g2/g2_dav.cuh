@@ -25,6 +25,7 @@ struct DavParams {
     short* dOT; short* aNdo;      // T3: P2's dOT (B form) + P3's aN_do (A form, p3 order)
     float scale; int H, NT;
     const int* ctok; const int* clen;        // varlen phase 2 (null = dense)
+    int order = 0, order_m = 4;              // kra P-938o2: CTA visiting order (g2_cta_order)
 };
 
 constexpr int kPadJ3 = 68;
@@ -34,8 +35,10 @@ constexpr int kPadJ3 = 68;
 template <bool VL>
 __global__ void __launch_bounds__(256) g2_dav_kernel(DavParams p_) {
     // kra P-35: field-wise copy, pointers stamped global (global_* ops, not flat)
-    const DavParams p{g2_glb(p_.do_), g2_glb(p_.Vn), g2_glb(p_.A), g2_glb(p_.dA), g2_glb(p_.dVn), g2_glb(p_.dOT), g2_glb(p_.aNdo), p_.scale, p_.H, p_.NT, g2_glb(p_.ctok), g2_glb(p_.clen)};
-    const int i = blockIdx.x, hh = blockIdx.y, tid = threadIdx.x;
+    const DavParams p{g2_glb(p_.do_), g2_glb(p_.Vn), g2_glb(p_.A), g2_glb(p_.dA), g2_glb(p_.dVn), g2_glb(p_.dOT), g2_glb(p_.aNdo), p_.scale, p_.H, p_.NT, g2_glb(p_.ctok), g2_glb(p_.clen), p_.order, p_.order_m};
+    int i, hh;
+    g2_cta_order(p.order, p.order_m, p.H, p.NT, i, hh);   // kra P-938o2
+    const int tid = threadIdx.x;
     const int wv = tid >> 6, l = tid & 63;
     const long t0 = g2_row_tok<VL>(p.ctok, i);
 #if defined(__gfx938__)
@@ -271,6 +274,10 @@ extern "C" int g2_dav(const void* do_, const void* Vn, const void* A,
                     (float)scale, H, T / 64, ctok, clen};
     // kra P-938v: residency probe knob (dev only): dynamic LDS on top of the static slab caps the CTAs per CU
     const int lds_extra = (int)g2::g2_env_long("KDA_G2_DAV_LDS_EXTRA", 0);
+    // kra P-938o2 (gfx938): diagonal order at H % 64 == 0 (row-major do / A against the p3-order natives)
+    p.order = (int)g2::g2_env_long("KDA_G2_DAV_ORDER", g2::g2_cur_gfx938() && H % 64 == 0 ? 2 : 0);
+    p.order_m = (int)g2::g2_env_long("KDA_G2_DAV_ORDER_M", 4);
+    if (p.order == 3 && (p.order_m < 1 || H % p.order_m)) p.order = 0;
     if (ctok)
         hipLaunchKernelGGL(g2::g2_dav_kernel<true>, dim3(T / 64, H), dim3(256), lds_extra, s, p);
     else

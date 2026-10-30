@@ -38,6 +38,7 @@ struct PrepAParams {
     int stop;                           // phase timing (G2_PREP_STOP): 0 = full
     int kp = 0;                         // kra P-61e: Kn lane-permuted + Gn natural-k (H <= KPERM_MAX_H)
     short *qn_out = nullptr, *kn_out = nullptr;   // kra P-77b: non-null -> emit qn / kn row-major
+    int order = 0, order_m = 4;         // kra P-938o2: CTA visiting order (g2_cta_order)
 };
 
 struct PrepBParams {
@@ -49,6 +50,7 @@ struct PrepBParams {
     int kp = 0;   // kra P-62: Un with the pm column order (as Wn) when H <= KPERM_MAX_H
     int stop = 0; // phase timing (G2_PREPB_STOP, dev only): 1 after the R loads, 2 after Aqk / AqkA, 3 after the
                   // solve + Akk, 4 after pass 0 (Wn); 0 = full
+    int order = 0, order_m = 4;   // kra P-938o2: CTA visiting order (g2_cta_order)
 };
 
 
@@ -64,9 +66,27 @@ template <int GATE, bool VL>
 __device__ __forceinline__ void gate_load(const PrepAParams& p, GRaw<GATE>& gr, int hh, long t0,
                                           int cl) {
     const int c = threadIdx.x & 63, w = threadIdx.x >> 6;
+    const int r0 = 16 * w;
+#if defined(__gfx938__)
+    // kra P-938ga: one wave-uniform chunk base + 32-bit unsigned lane offsets (saddr form, no per-lane 64-bit
+    // address pairs); the same addresses as below
+    const uint32_t step32 = (uint32_t)p.H * 128u, lo = 2u * (uint32_t)c;
+    const size_t cb = ((size_t)t0 * p.H + hh) * 128;
+    #pragma unroll
+    for (int u = 0; u < 16; ++u) {
+        const int r = r0 + u;
+        const bool ok = !VL || r < cl;
+        const uint32_t o = lo + (uint32_t)r * step32;
+        if constexpr (GATE == 1) {
+            gr.v[u] = ok ? *reinterpret_cast<const uint32_t*>(reinterpret_cast<const short*>(p.g_raw) + cb + o) : 0u;
+        } else {
+            gr.v[u] = ok ? *reinterpret_cast<const float2*>(reinterpret_cast<const float*>(p.g_raw) + cb + o)
+                         : float2{0.f, 0.f};
+        }
+    }
+#else
     const size_t step = (size_t)p.H * 128;
     const size_t base = ((size_t)t0 * p.H + hh) * 128 + 2 * c;
-    const int r0 = 16 * w;
     #pragma unroll
     for (int u = 0; u < 16; ++u) {
         const int r = r0 + u;
@@ -80,6 +100,7 @@ __device__ __forceinline__ void gate_load(const PrepAParams& p, GRaw<GATE>& gr, 
                          : float2{0.f, 0.f};
         }
     }
+#endif
 }
 
 // G half tile: 32 rows x 128 fp32 (quarters 2h, 2h+1), columns XOR-swizzled by row.
@@ -104,7 +125,7 @@ __device__ __forceinline__ void gate_scan(const PrepAParams& p, const GRaw<GATE>
 #if defined(__gfx938__)
     // P-938sg: one wave-uniform test (all |x| <= 87 and no NaN) selects the range-free expf / divide
     bool fast = false;
-    if constexpr (GATE == 1) {
+    if constexpr (GATE == 1 && !KDA_B1_SIG) {   // kra P-938sd: B1 never reads the range test
         float mx = 0.f, sx = 0.f, sy = 0.f;
         #pragma unroll
         for (int u = 0; u < 16; ++u) {
@@ -196,7 +217,8 @@ __global__ void __launch_bounds__(256) g2_fwd_prep_a_kernel(PrepAParams p) {
     __shared__ __align__(16) float lds[5376];
     float* const G = lds;
     float* const smem = lds;
-    const int i = blockIdx.x, hh = blockIdx.y;
+    int i, hh;
+    g2_cta_order(p.order, p.order_m, p.H, p.NT, i, hh);   // kra P-938o2
     const int wv = __builtin_amdgcn_readfirstlane(threadIdx.x >> 6);
     const int l = threadIdx.x & 63, m = l & 15, q4 = l >> 4;
     const long tok0 = g2_row_tok<VL>(p.ctok, i);
@@ -710,7 +732,8 @@ __global__ void __launch_bounds__(256) g2_fwd_prep_b_kernel(PrepBParams p) {
 #else
     __shared__ __align__(16) float smem[4352];
 #endif
-    const int i = blockIdx.x, hh = blockIdx.y;
+    int i, hh;
+    g2_cta_order(p.order, p.order_m, p.H, p.NT, i, hh);   // kra P-938o2
     const int wv = __builtin_amdgcn_readfirstlane(threadIdx.x >> 6);
     const int l = threadIdx.x & 63;
     const long tok0 = g2_row_tok<VL>(p.ctok, i);
@@ -752,6 +775,12 @@ extern "C" int g2_fwd_prep_l2n(const void* q, const void* k, const void* v, cons
     if (const char* e = g2::g2_getenv("G2_PREP_STOP")) pa.stop = atoi(e);
     pa.kp = g2::g2_kp_layout(H);   // kra P-61e
     pa.qn_out = (short*)qn_out; pa.kn_out = (short*)kn_out;    // kra P-77b
+    // kra P-938o2 (gfx938, measured over T = 2K / 8K / 32K x H = 8-64): diagonal order at H % 64 == 0 (the chunk row
+    // stride H * 256 B and the head-major natives both advance by powers of two in lock-step otherwise)
+    const bool o938 = g2::g2_cur_gfx938();
+    pa.order = (int)g2::g2_env_long("KDA_G2_PREPA_ORDER", o938 && H % 64 == 0 ? 2 : 0);
+    pa.order_m = (int)g2::g2_env_long("KDA_G2_PREPA_ORDER_M", 4);
+    if (pa.order == 3 && (pa.order_m < 1 || H % pa.order_m)) pa.order = 0;
     const dim3 grid(NT, H), blk(256);
 #define G2_PREP_A(GT, VLT, L2) hipLaunchKernelGGL((g2::r4::g2_fwd_prep_a_kernel<GT, VLT, L2>), grid, blk, 0, s, pa)
     if (l2n) {
@@ -770,6 +799,9 @@ extern "C" int g2_fwd_prep_l2n(const void* q, const void* k, const void* v, cons
                            ctok, clen, (float)scale, H, NT};
     pb.kp = pa.kp;   // kra P-62
     if (const char* e = g2::g2_getenv("G2_PREPB_STOP")) pb.stop = atoi(e);
+    pb.order = (int)g2::g2_env_long("KDA_G2_PREPB_ORDER", o938 && H % 64 == 0 ? 2 : 0);   // kra P-938o2
+    pb.order_m = (int)g2::g2_env_long("KDA_G2_PREPB_ORDER_M", 4);
+    if (pb.order == 3 && (pb.order_m < 1 || H % pb.order_m)) pb.order = 0;
     if (ctok) hipLaunchKernelGGL(g2::r4::g2_fwd_prep_b_kernel<true>, grid, blk, 0, s, pb);
     else hipLaunchKernelGGL(g2::r4::g2_fwd_prep_b_kernel<false>, grid, blk, 0, s, pb);
     return (int)hipGetLastError();

@@ -48,6 +48,7 @@ struct TailParams {
     // beta_f32 -> beta_raw / db_out are fp32 (fused_beta_sigmoid_bwd keeps x's dtype).
     int gate_none; int beta_f32;
     int no_cast = 0;                         // kra P-938q: dq / dk already final (s4b wrote bf16): skip the cast
+    int order = 0, order_m = 4;              // kra P-938o2: CTA visiting order (g2_cta_order)
 };
 
 // VL (varlen phase 2): rows r >= clen load as 0 and are never stored; ALL arithmetic
@@ -55,7 +56,9 @@ struct TailParams {
 // to the dense kernel on the zero-padded stream.
 template <bool VL>
 __global__ void __launch_bounds__(256) g2_bwd_tail_kernel(TailParams p) {
-    const int i = blockIdx.x, hh = blockIdx.y, tid = threadIdx.x;
+    int i, hh;
+    g2_cta_order(p.order, p.order_m, p.H, p.NT, i, hh);   // kra P-938o2
+    const int tid = threadIdx.x;
     const int wv = tid >> 6, l = tid & 63;              // wave64
     const long t0 = g2_row_tok<VL>(p.ctok, i);          // chunk row 0 (packed token)
     __shared__ float sDA[8 * 64];                      // per-(colhalf,warp) dA partials
@@ -380,10 +383,15 @@ extern "C" int g2_bwd_tail2(const void* dq, const void* dk, const void* dg,
                      (float)lower_bound, (float)beta_scale,
                      use_l2, use_beta, H, NT, ctok, clen, gate_none, beta_f32};
     p.no_cast = (no_cast && !use_l2) ? 1 : 0;
+    // kra P-938o2 (gfx938): row-major in and out -> head-fastest at H % 32 == 0
+    p.order = (int)g2::g2_env_long("KDA_G2_TAIL_ORDER", g2::g2_cur_gfx938() && H % 32 == 0 ? 1 : 0);
+    p.order_m = (int)g2::g2_env_long("KDA_G2_TAIL_ORDER_M", 4);
+    if (p.order == 3 && (p.order_m < 1 || H % p.order_m)) p.order = 0;
+    const dim3 tgrid(NT, H);
     if (ctok)
-        hipLaunchKernelGGL(g2::g2_bwd_tail_kernel<true>, dim3(NT, H), dim3(256), 0, s, p);
+        hipLaunchKernelGGL(g2::g2_bwd_tail_kernel<true>, tgrid, dim3(256), 0, s, p);
     else
-        hipLaunchKernelGGL(g2::g2_bwd_tail_kernel<false>, dim3(NT, H), dim3(256), 0, s, p);
+        hipLaunchKernelGGL(g2::g2_bwd_tail_kernel<false>, tgrid, dim3(256), 0, s, p);
     if (!gate_none)
         hipLaunchKernelGGL(g2::g2_bwd_tail_reduce_kernel, dim3(H), dim3(256), 0, s, p);
     return (int)hipGetLastError();

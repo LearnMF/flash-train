@@ -54,6 +54,7 @@ struct GateParams {
     float lower_bound, scale;
     int H;
     const int* ctok; const int* clen;   // varlen phase 2 (null = dense)
+    int NT = 0, order = 0, order_m = 4; // kra P-938o2: CTA visiting order (g2_cta_order)
 };
 
 // Lane c (0..63) owns columns 2c, 2c+1; quarter w (0..3) scans rows [16w, 16w+16)
@@ -67,7 +68,8 @@ __global__ void __launch_bounds__(256) g2_gate_kernel(GateParams p) {
     // so both instantiations emit identical arithmetic.
     #pragma clang fp contract(off)
     __shared__ float2 sTot[4][64];
-    const int i = blockIdx.x, hh = blockIdx.y;
+    int i, hh;
+    g2_cta_order(p.order, p.order_m, p.H, p.NT, i, hh);   // kra P-938o2
     const int c = threadIdx.x & 63, w = threadIdx.x >> 6;
     const long t0 = g2_row_tok<VL>(p.ctok, i);
     const int cl = g2_row_len<VL>(p.clen, i);
@@ -103,7 +105,7 @@ __global__ void __launch_bounds__(256) g2_gate_kernel(GateParams p) {
     float2 run = float2{0.f, 0.f}, cmp = float2{0.f, 0.f};
 #if G2_SIGFAST
     bool fast = false;                                  // kra P-938sg (gfx938): range-free sigmoid when proven
-    if constexpr (GATE == 1) {
+    if constexpr (GATE == 1 && !KDA_B1_SIG) {           // kra P-938sd: B1 never reads the range test
         float mx = 0.f, sx = 0.f;
         #pragma unroll
         for (int u = 0; u < 16; ++u) { g2_sig_acc(A * v[u].x, mx, sx); g2_sig_acc(A * v[u].y, mx, sx); }
@@ -190,6 +192,11 @@ extern "C" int g2_head_gate(const void* g_raw, const void* A_log, const void* dt
     if ((ctok == nullptr) != (clen == nullptr)) return -1;
     g2::GateParams p{g_raw, (const float*)A_log, (const float*)dt_bias, (float*)g_out,
                      (float)lower_bound, (float)scale, H, ctok, clen};
+    p.NT = NT;
+    // kra P-938o2 (gfx938): row-major in and out -> head-fastest at H % 32 == 0 (1.4-2.1x at H = 32 / 64)
+    p.order = (int)g2::g2_env_long("KDA_G2_GATE_ORDER", g2::g2_cur_gfx938() && H % 32 == 0 ? 1 : 0);
+    p.order_m = (int)g2::g2_env_long("KDA_G2_GATE_ORDER_M", 4);
+    if (p.order == 3 && (p.order_m < 1 || H % p.order_m)) p.order = 0;
     const dim3 grid(NT, H), blk(256);
     if (gate) {
         if (ctok) hipLaunchKernelGGL((g2::g2_gate_kernel<1, true>), grid, blk, 0, s, p);

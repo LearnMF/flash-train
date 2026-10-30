@@ -233,6 +233,16 @@ __device__ __forceinline__ T* g2_glb(T* x) {
     return (T*)(__attribute__((address_space(1))) T*)x;
 }
 
+// kra P-938o2: CTA visiting order on a (NT, H) grid (wu's P-95 orders, shared).  Bitwise-neutral: every CTA is
+// independent.  0 = chunk-fastest (blockIdx.x = chunk); 1 = head-fastest; 2 = diagonal (i = (L/H + hh) % NT);
+// 3 = M adjacent heads per chunk (M | H).
+__device__ __forceinline__ void g2_cta_order(int order, int m, int H, int NT, int& i, int& hh) {
+    const int L = blockIdx.y * gridDim.x + blockIdx.x;
+    if (order == 0) { i = blockIdx.x; hh = blockIdx.y; }
+    else if (order == 3) { const int r = L / m; hh = (r / NT) * m + L % m; i = r % NT; }
+    else { hh = L % H; i = order == 1 ? L / H : (L / H + hh) % NT; }
+}
+
 __device__ __forceinline__ size_t g2_nat_blk(int i, int hh, int H, int NT,
                                              bool p3, int nslot) {
     return (size_t)(p3 ? (size_t)i * H + hh : (size_t)hh * NT + i) * nslot;
