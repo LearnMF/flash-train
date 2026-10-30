@@ -956,7 +956,10 @@ extern "C" int g2_fwd_h_v8o(const void* Wn, const void* Kn, const void* Un, cons
     // latency scales with the slab width (64-col 2.0-2.3x slower than 32-col), and 16-col is 1.12-1.18x faster than the
     // kp 32-col default at H = 8 (bit-identical).  At H >= 16 it loses (0.64-0.87x), so not there.
     const bool narrow938 = r1a && !kp && H <= 8 && g2_cur_gfx938();
-    if (narrow938 || (r1a && !kp && H >= g2_env_long("KDA_G2_V8O4W_MIN_H", 40) && T / kBT >= g2_env_long("KDA_G2_V8O4W_MIN_NT", 512))) {
+    // kra P-938wd: gfx938 at H >= 64 (>= 128 wide CTAs): wide at every NT -- the hand-off-free ceiling showed fwd_h's
+    // K-side reads at 30-55% of its time there; wide 1.04x (2K) .. 1.16x (16K).  At H = 32 (64 CTAs) it loses 0.74-0.79x.
+    const long wmin_nt = g2_env_long("KDA_G2_V8O4W_MIN_NT", g2_cur_gfx938() && H >= 64 ? 0 : 512);
+    if (narrow938 || (r1a && !kp && H >= g2_env_long("KDA_G2_V8O4W_MIN_H", 40) && T / kBT >= wmin_nt)) {
         const int nvh = (int)g2_env_long("KDA_G2_V8O4W_NVH", narrow938 ? 1 : 4);   // kra P-938z: 1 = 16-column slabs
         const dim3 gridw(kK / (16 * nvh), (unsigned)nseg * H);
         auto v8o4w = [&](auto vl) {
