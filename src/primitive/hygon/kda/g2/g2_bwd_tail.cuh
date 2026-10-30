@@ -208,12 +208,23 @@ __global__ void __launch_bounds__(256) g2_bwd_tail_kernel(TailParams p) {
             for (int b = 0; b < 4; ++b) sd += sDDt[(c * 4 + b) * 64 + l2];
             p.ddt_part[((size_t)(hh * kK + tid)) * p.NT + i] = sd;
         }
+#if defined(__gfx938__) && KDA_B2_TREE
+        if (!p.gate_none && tid < 64) {                     // kra P-938t2: fixed-order tree on wave 0
+            float s = 0.f;
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) s += sDA[j * 64 + tid];
+            #pragma unroll
+            for (int off = 32; off > 0; off >>= 1) s += __shfl_xor(s, off, 64);   // a + b == b + a: lanes agree
+            if (tid == 0) p.dA_part[(size_t)hh * p.NT + i] = s;
+        }
+#else
         if (!p.gate_none && tid == 0) {                     // fixed-order CTA sum
             float s = 0.f;
             #pragma unroll
             for (int k = 0; k < 8 * 64; ++k) s += sDA[k];
             p.dA_part[(size_t)hh * p.NT + i] = s;
         }
+#endif
 
         // ---- Phase B: l2norm backward (one warp per row), then the beta tail
         if (!p.use_l2) {

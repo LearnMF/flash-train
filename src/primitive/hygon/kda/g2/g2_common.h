@@ -88,6 +88,11 @@ __device__ __forceinline__ bool g2_sig_fast(float mx, float sx) { return __all(m
 #ifndef KDA_B1_SIG
 #define KDA_B1_SIG 1
 #endif
+// kra P-938t2 (B class, numerics change -- gated against the FP64 oracle): bwd_tail's per-CTA dA_log partial (512
+// fp32 terms) as 64 lane runs of 8 + a fixed shfl-xor tree on wave 0, instead of one lane's 512-add chain
+#ifndef KDA_B2_TREE
+#define KDA_B2_TREE 1
+#endif
 __device__ __forceinline__ float g2_sig_b1(float x) {
     return __builtin_amdgcn_rcpf(1.f + __builtin_amdgcn_exp2f(-x * 1.4426950408889634f));
 }
