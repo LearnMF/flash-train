@@ -618,7 +618,10 @@ extern "C" int g2_dhu_v8b(const void* KgA, const void* Qg, const void* Wb, const
     if (const char* e = g2::g2_getenv("KDA_G2_R1A_DHU")) dhu4 = atoi(e);
     // kra P-24: at deep saturation cap dhu at 1 CTA/CU (33 KB LDS per CTA): the operands shared
     // by a head's 4 V-slab CTAs then stay in L2.
-    const bool dthrottle = ctas >= g2_env_long("KDA_G2_DHU_THROTTLE_MIN_CTAS", 192);
+    // kra P-938dt: gfx938 re-sweep (H = 64, 256 CTAs): off 1.13x at NT = 16, 1.01x at 32, 0.97x at 64, 0.83-0.93x at
+    // 128-512 -- short chains have too few steps for the L2 sharing to pay; keep the throttle from 64 chunks on.
+    const bool dthrottle = ctas >= g2_env_long("KDA_G2_DHU_THROTTLE_MIN_CTAS", 192) &&
+                           (!g2_cur_gfx938() || T / kBT >= g2_env_long("KDA_G2_DHU_THROTTLE_MIN_NT", 64));
     auto dyn = [&](auto kern) -> size_t { return dthrottle ? g2_lds_topup(kern, 33 * 1024) : 0; };
     // kra P-22d: linear aN(dv2) emit only in the latency-bound regime (few CTAs); at deep saturation
     // the scattered stores pace the loads (R21).  KDA_G2_DHU_LIN=0/1 forces it.
