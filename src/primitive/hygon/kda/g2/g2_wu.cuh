@@ -150,7 +150,7 @@ __device__ __forceinline__ void wu_emit16s(short* dst, const short* tile, int ti
 
 // kra P-938k: KN = 0 compiles the phase-3 Kn branch out (only launched with Kn == nullptr, the saved-h / keep-state
 // routes): its unrolled k / g / q loads set the kernel's VGPR peak (197 -> 173 on gfx938), although those routes never run it.
-template <bool VL, bool KS = false, bool QS = false, int KN = 2>   // kra P-84b: KS; P-84c: QS
+template <bool VL, bool KS = false, bool QS = false, int KN = 2, bool L16 = false>   // kra P-84b: KS; P-84c: QS
 __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p_) {
     // kra P-35: field-wise copy, pointers stamped global (global_* ops, not flat)
     const WuParams p{g2_glb(p_.k), g2_glb(p_.v), g2_glb(p_.q), g2_glb(p_.beta), g2_glb(p_.A), g2_glb(p_.g), g2_glb(p_.Wn), g2_glb(p_.Wb), g2_glb(p_.Un), g2_glb(p_.KgA), g2_glb(p_.Kn), g2_glb(p_.Qn), g2_glb(p_.kgB), g2_glb(p_.vB), p_.H, p_.NT, g2_glb(p_.ctok), g2_glb(p_.clen), p_.stop, p_.kp, g2_glb(p_.HbN), g2_glb(p_.VnOut), p_.order, p_.order_m};   // kra P-82, P-95
@@ -168,9 +168,13 @@ __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p_) {
     } else { hh = L_ % p_.H; i = p_.order == 1 ? L_ / p_.H : (L_ / p_.H + hh) % p_.NT; }
     const int tid = threadIdx.x;
     const int wv = tid >> 6, l = tid & 63;
-    __shared__ __align__(16) short slab[128 * kPadJ2];
-    __shared__ float sBeta[kBT];
-    __shared__ __align__(16) float sGl[kK];   // chunk-last g row: kg = k * 2^(gl-g)
+    // kra P-938w4: L16 = unpadded slab (columns already XOR-swizzled by wu_slab_col) and unpadded natural vb rows,
+    // beta / the chunk-last g row read from global where used: 16384 B of LDS (the 4th CTA per CU fits).  Layout only.
+    constexpr int PJ = L16 ? 64 : kPadJ2, PN = L16 ? 128 : kPadN;
+    __shared__ __align__(16) char wu_lds[L16 ? 128 * 64 * 2 : 128 * kPadJ2 * 2 + (kBT + kK) * 4];
+    short* const slab = reinterpret_cast<short*>(wu_lds);
+    float* const sBeta = reinterpret_cast<float*>(wu_lds + 128 * kPadJ2 * 2);   // unused when L16
+    float* const sGl = sBeta + kBT;                    // chunk-last g row: kg = k * 2^(gl-g)
 #if !G2_WU_LEAN
     __shared__ __align__(16) short sA[kBT * kPadA];
 #endif
@@ -186,12 +190,22 @@ __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p_) {
         // A (UT inverse, 64x64 bf16): read by BOTH MMAC phases -- cache it in LDS
         // (8KB; occupancy is VGPR-bound at 2 CTAs/CU, so the LDS is free).
 
-        if (tid < kBT)
-            sBeta[tid] = g2_row_ok<M>(tid, cl)
-                ? p.beta[(size_t)(g2_row_tok<VL>(p.ctok, i) + tid) * p.H + hh] : 0.f;
-        if (tid < 32)                  // 128 floats = 32 f4 quads
-            reinterpret_cast<f4*>(sGl)[tid] =
-                ld16f(p.g + sbase + g2_row_g<M>(63, cl) * rstride + 4 * tid);
+        if constexpr (!L16) {
+            if (tid < kBT)
+                sBeta[tid] = g2_row_ok<M>(tid, cl)
+                    ? p.beta[(size_t)(g2_row_tok<VL>(p.ctok, i) + tid) * p.H + hh] : 0.f;
+            if (tid < 32)                  // 128 floats = 32 f4 quads
+                reinterpret_cast<f4*>(sGl)[tid] =
+                    ld16f(p.g + sbase + g2_row_g<M>(63, cl) * rstride + 4 * tid);
+        }
+        auto BETA = [&](int j) -> float {
+            if constexpr (L16) return g2_row_ok<M>(j, cl) ? p.beta[(size_t)(g2_row_tok<VL>(p.ctok, i) + j) * p.H + hh] : 0.f;
+            else return sBeta[j];
+        };
+        auto GL = [&](int vq) -> f4 {
+            if constexpr (L16) return ld16f(p.g + sbase + g2_row_g<M>(63, cl) * rstride + vq);
+            else return *reinterpret_cast<const f4*>(sGl + vq);
+        };
 #if G2_WU_LEAN
         v4bh aF[4];   // kra P-938r: this wave's A fragments (row 16 wv + (l & 15), columns 16 js + 4 (l >> 4))
         {
@@ -238,7 +252,7 @@ __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p_) {
                     const v4bh af1 = *reinterpret_cast<const v4bh*>(
                         sA + (size_t)(16 * wv + (l & 15)) * kPadA + 32 * jp + 16 + (l >> 4) * 4);
 #endif
-                    short* src = slab + (size_t)wu_mls_row(l, jp) * kPadN + 8 * (l & 1);
+                    short* src = slab + (size_t)wu_mls_row(l, jp) * PN + 8 * (l & 1);
                     #pragma unroll
                     for (int vt = 0; vt < 8; ++vt) {
                         const v8bh_l16 r = __builtin_hcu_ds_read_m32x16_bf16(src + 16 * vt);
@@ -258,7 +272,7 @@ __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p_) {
                 #pragma unroll
                 for (int vt = 0; vt < 8; ++vt) {
                     const int br = 16 * vt + (l & 15);
-                    const size_t lo = (size_t)br * kPadJ2 + wu_slab_col(br, 16 * js + (l >> 4) * 4);
+                    const size_t lo = (size_t)br * PJ + wu_slab_col(br, 16 * js + (l >> 4) * 4);
                     acc[vt] = mmac(af, *reinterpret_cast<const v4bh*>(slab + lo), acc[vt]);
                 }
             }
@@ -390,8 +404,8 @@ __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p_) {
             const v4bh kv = KS ? kgr[it] : (g2_row_ok<M>(j, cl) ? *reinterpret_cast<const v4bh*>(p.k + so)
                                                  : v4bh{0, 0, 0, 0});
             const f4 gf = KS ? egr[it] : ld16f(p.g + sbase + (size_t)g2_row_g<M>(j, cl) * rstride + vq);
-            const f4 gl = *reinterpret_cast<const f4*>(sGl + vq);
-            const float b = sBeta[j];
+            const f4 gl = GL(vq);
+            const float b = BETA(j);
             // T7: one exp2f(gf) per element serves both kb and kgB (identical
             // value; the multiply associations below are unchanged).
             f4 eg;
@@ -403,7 +417,7 @@ __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p_) {
                 // fragment then holds lane-contiguous native Wn columns.
                 const int vv = vq + dv;
                 const int sr = 16 * (vv >> 4) + pi16(vv & 15);
-                slab[(size_t)sr * kPadJ2 + wu_slab_col(sr, j)] =
+                slab[(size_t)sr * PJ + wu_slab_col(sr, j)] =
                     bf_rne(bf2f(kv[dv]) * b * eg[dv]);
             }
             short gv[4], gkv[4];
@@ -438,16 +452,16 @@ __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p_) {
             const size_t so = sbase + (size_t)j * rstride + vq;
             const v4bh vv = g2_row_ok<M>(j, cl) ? *reinterpret_cast<const v4bh*>(p.v + so)
                                                  : v4bh{0, 0, 0, 0};
-            const float b = sBeta[j];
+            const float b = BETA(j);
 #if G2_WU_MLS
             short xb[4];   // kra P-938m: natural [j][v] row, one 8 B store
             #pragma unroll
             for (int dv = 0; dv < 4; ++dv) xb[dv] = bf_rne(bf2f(vv[dv]) * b);
-            *reinterpret_cast<v4bh*>(slab + (size_t)j * kPadN + vq) = *reinterpret_cast<const v4bh*>(xb);
+            *reinterpret_cast<v4bh*>(slab + (size_t)j * PN + vq) = *reinterpret_cast<const v4bh*>(xb);
 #else
             #pragma unroll
             for (int dv = 0; dv < 4; ++dv)
-                slab[(size_t)(vq + dv) * kPadJ2 + wu_slab_col(vq + dv, j)] = bf_rne(bf2f(vv[dv]) * b);
+                slab[(size_t)(vq + dv) * PJ + wu_slab_col(vq + dv, j)] = bf_rne(bf2f(vv[dv]) * b);
 #endif
         }
         } else {
@@ -458,16 +472,16 @@ __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p_) {
             const size_t so = sbase + (size_t)j * rstride + vq;
             const v4bh vv = g2_row_ok<M>(j, cl) ? *reinterpret_cast<const v4bh*>(p.v + so)
                                                  : v4bh{0, 0, 0, 0};
-            const float b = sBeta[j];
+            const float b = BETA(j);
 #if G2_WU_MLS
             short xb[4];   // kra P-938m: natural [j][v] row, one 8 B store
             #pragma unroll
             for (int dv = 0; dv < 4; ++dv) xb[dv] = bf_rne(bf2f(vv[dv]) * b);
-            *reinterpret_cast<v4bh*>(slab + (size_t)j * kPadN + vq) = *reinterpret_cast<const v4bh*>(xb);
+            *reinterpret_cast<v4bh*>(slab + (size_t)j * PN + vq) = *reinterpret_cast<const v4bh*>(xb);
 #else
             #pragma unroll
             for (int dv = 0; dv < 4; ++dv)
-                slab[(size_t)(vq + dv) * kPadJ2 + wu_slab_col(vq + dv, j)] = bf_rne(bf2f(vv[dv]) * b);
+                slab[(size_t)(vq + dv) * PJ + wu_slab_col(vq + dv, j)] = bf_rne(bf2f(vv[dv]) * b);
 #endif
             if (p.vB != nullptr)   // kra P-17: production route reads v row-major in s4a instead
                 *reinterpret_cast<v4bh*>(p.vB + wu_vb_quad(j, vq, nblk3)) = vv;
@@ -515,7 +529,7 @@ __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p_) {
                     const size_t so = sbase + (size_t)j * rstride + vq;
                     const v4bh kv = g2_row_ok<M>(j, cl) ? *reinterpret_cast<const v4bh*>(p.k + so) : v4bh{0, 0, 0, 0};
                     const f4 gf = ld16f(p.g + sbase + (size_t)g2_row_g<M>(j, cl) * rstride + vq);
-                    const f4 gl = *reinterpret_cast<const f4*>(sGl + vq);
+                    const f4 gl = GL(vq);
                     #pragma unroll
                     for (int dv = 0; dv < 4; ++dv) qst[it][dv] = bf_rne(bf2f(qv[dv]) * __builtin_amdgcn_exp2f(gf[dv]));
                     #pragma unroll
@@ -622,14 +636,21 @@ extern "C" int g2_wu(const void* k, const void* v, const void* q, const void* be
     if (p.order == 3 && (p.order_m < 1 || H % p.order_m)) p.order = 0;
     const bool ks = g2::g2_env_long("KDA_G2_WU_KS", 1) != 0;   // kra P-84b (default on)
     const bool qs = g2::g2_env_long("KDA_G2_WU_QS", 1) != 0;   // kra P-84c (default on)
+    // kra P-938w4 (gfx938): the 16 KB layout at grids of <= 288 CTAs (wu 1.21x at 256 CTAs: 1024/16, 2048/8; at
+    // 512+ CTAs it measured 0.97-0.98x, so the padded layout stays there)
+    const bool l16 = (long)(T / 64) * H <= g2::g2_env_long("KDA_G2_WU_L16_MAX_CTAS", 288);
     if (ctok) {
-        if (ks && qs && Kn == nullptr && g2::g2_cur_gfx938())   // kra P-938k
+        if (ks && qs && Kn == nullptr && g2::g2_cur_gfx938() && l16)   // kra P-938w4
+                      hipLaunchKernelGGL((g2::g2_wu_kernel<true, true, true, 0, true>), dim3(T / 64, H), dim3(256), 0, s, p);
+        else if (ks && qs && Kn == nullptr && g2::g2_cur_gfx938())   // kra P-938k
                       hipLaunchKernelGGL((g2::g2_wu_kernel<true, true, true, 0>), dim3(T / 64, H), dim3(256), 0, s, p);
         else if (ks && qs) hipLaunchKernelGGL((g2::g2_wu_kernel<true, true, true>), dim3(T / 64, H), dim3(256), 0, s, p);
         else if (ks)  hipLaunchKernelGGL((g2::g2_wu_kernel<true, true>), dim3(T / 64, H), dim3(256), 0, s, p);
         else          hipLaunchKernelGGL(g2::g2_wu_kernel<true>, dim3(T / 64, H), dim3(256), 0, s, p);
     } else {
-        if (ks && qs && Kn == nullptr && g2::g2_cur_gfx938())   // kra P-938k
+        if (ks && qs && Kn == nullptr && g2::g2_cur_gfx938() && l16)   // kra P-938w4
+                      hipLaunchKernelGGL((g2::g2_wu_kernel<false, true, true, 0, true>), dim3(T / 64, H), dim3(256), 0, s, p);
+        else if (ks && qs && Kn == nullptr && g2::g2_cur_gfx938())   // kra P-938k
                       hipLaunchKernelGGL((g2::g2_wu_kernel<false, true, true, 0>), dim3(T / 64, H), dim3(256), 0, s, p);
         else if (ks && qs) hipLaunchKernelGGL((g2::g2_wu_kernel<false, true, true>), dim3(T / 64, H), dim3(256), 0, s, p);
         else if (ks)  hipLaunchKernelGGL((g2::g2_wu_kernel<false, true>), dim3(T / 64, H), dim3(256), 0, s, p);
