@@ -47,6 +47,7 @@
 // stride-64 scalars, the B form stride-16, the C form l*4 vecs.
 #include "g2_common.h"
 
+#include <type_traits>
 namespace g2 {
 
 struct WuParams {
@@ -184,6 +185,16 @@ __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p_) {
     constexpr int M = decltype(mode_)::value;
         const size_t rstride = (size_t)p.H * kK;           // [B,T,H,128] row stride
         const size_t sbase = ((size_t)g2_row_tok<VL>(p.ctok, i) * p.H + hh) * kK;
+        // kra P-938sa: row (j, vq) of this chunk / head through a CTA-uniform base + a 32-bit byte offset (saddr global
+        // ops instead of per-lane 64-bit address math).  Partial varlen chunks keep the 64-bit form (clamped g rows can
+        // be -1 when cl == 0).
+        const uint32_t rs32 = (uint32_t)p.H * kK;
+        auto wa = [&](auto* base, int j, int vq) {
+            using E = std::remove_pointer_t<decltype(base)>;
+            if constexpr (M == 2) return base + sbase + (size_t)j * rstride + vq;
+            else return reinterpret_cast<E*>(reinterpret_cast<std::conditional_t<std::is_const_v<E>, const char*, char*>>(base + sbase)
+                                             + ((uint32_t)j * rs32 + (uint32_t)vq) * (uint32_t)sizeof(E));
+        };
         const size_t nblk = (size_t)(hh * p.NT + i) * 8192;
         const size_t nblk3 = g2_nat_blk(i, hh, p.H, p.NT, true, 8192);   // P3's (i*H+hh)
         // 17.4KB union: transposed MMAC staging (kbT/vbT) OR the row-major gated tile
@@ -392,8 +403,8 @@ __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p_) {
                 const int t = tid + 256 * it;
                 const int j = t >> 5, vq = (t & 31) << 2;
                 const size_t so = sbase + (size_t)j * rstride + vq;
-                kgr[it] = g2_row_ok<M>(j, cl) ? *reinterpret_cast<const v4bh*>(p.k + so) : v4bh{0, 0, 0, 0};
-                egr[it] = ld16f(p.g + sbase + (size_t)g2_row_g<M>(j, cl) * rstride + vq);
+                kgr[it] = g2_row_ok<M>(j, cl) ? *reinterpret_cast<const v4bh*>(wa(p.k, j, vq)) : v4bh{0, 0, 0, 0};
+                egr[it] = ld16f(wa(p.g, g2_row_g<M>(j, cl), vq));
             }
         }
         #pragma unroll
@@ -401,9 +412,9 @@ __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p_) {
             const int t = tid + 256 * it;
             const int j = t >> 5, vq = (t & 31) << 2;
             const size_t so = sbase + (size_t)j * rstride + vq;
-            const v4bh kv = KS ? kgr[it] : (g2_row_ok<M>(j, cl) ? *reinterpret_cast<const v4bh*>(p.k + so)
+            const v4bh kv = KS ? kgr[it] : (g2_row_ok<M>(j, cl) ? *reinterpret_cast<const v4bh*>(wa(p.k, j, vq))
                                                  : v4bh{0, 0, 0, 0});
-            const f4 gf = KS ? egr[it] : ld16f(p.g + sbase + (size_t)g2_row_g<M>(j, cl) * rstride + vq);
+            const f4 gf = KS ? egr[it] : ld16f(wa(p.g, g2_row_g<M>(j, cl), vq));
             const f4 gl = GL(vq);
             const float b = BETA(j);
             // T7: one exp2f(gf) per element serves both kb and kgB (identical
@@ -450,7 +461,7 @@ __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p_) {
             const int t = tid + 256 * it_;
             const int j = t >> 5, vq = (t & 31) << 2;
             const size_t so = sbase + (size_t)j * rstride + vq;
-            const v4bh vv = g2_row_ok<M>(j, cl) ? *reinterpret_cast<const v4bh*>(p.v + so)
+            const v4bh vv = g2_row_ok<M>(j, cl) ? *reinterpret_cast<const v4bh*>(wa(p.v, j, vq))
                                                  : v4bh{0, 0, 0, 0};
             const float b = BETA(j);
 #if G2_WU_MLS
@@ -470,7 +481,7 @@ __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p_) {
             const int t = tid + 256 * it_;
             const int j = t >> 5, vq = (t & 31) << 2;
             const size_t so = sbase + (size_t)j * rstride + vq;
-            const v4bh vv = g2_row_ok<M>(j, cl) ? *reinterpret_cast<const v4bh*>(p.v + so)
+            const v4bh vv = g2_row_ok<M>(j, cl) ? *reinterpret_cast<const v4bh*>(wa(p.v, j, vq))
                                                  : v4bh{0, 0, 0, 0};
             const float b = BETA(j);
 #if G2_WU_MLS
@@ -501,9 +512,9 @@ __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p_) {
             auto qg_of = [&](int t, short* qgv) {           // T7 value, unchanged
                 const int j = t >> 5, vq = (t & 31) << 2;
                 const size_t so = sbase + (size_t)j * rstride + vq;
-                const v4bh qv = g2_row_ok<M>(j, cl) ? *reinterpret_cast<const v4bh*>(p.q + so)
+                const v4bh qv = g2_row_ok<M>(j, cl) ? *reinterpret_cast<const v4bh*>(wa(p.q, j, vq))
                                                      : v4bh{0, 0, 0, 0};
-                const f4 gf = ld16f(p.g + sbase + (size_t)g2_row_g<M>(j, cl) * rstride + vq);
+                const f4 gf = ld16f(wa(p.g, g2_row_g<M>(j, cl), vq));
                 #pragma unroll
                 for (int dv = 0; dv < 4; ++dv) qgv[dv] = bf_rne(bf2f(qv[dv]) * __builtin_amdgcn_exp2f(gf[dv]));
                 return gf;
@@ -523,12 +534,12 @@ __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p_) {
                     const int j = tt >> 5, vq = (tt & 31) << 2;
                     // kra P-19: qg_of's value with the carried exp2f(g); kg = the carried quad
                     const v4bh qv = g2_row_ok<M>(j, cl)
-                        ? *reinterpret_cast<const v4bh*>(p.q + sbase + (size_t)j * rstride + vq)
+                        ? *reinterpret_cast<const v4bh*>(wa(p.q, j, vq))
                         : v4bh{0, 0, 0, 0};
 #if G2_WU_LEAN
                     const size_t so = sbase + (size_t)j * rstride + vq;
-                    const v4bh kv = g2_row_ok<M>(j, cl) ? *reinterpret_cast<const v4bh*>(p.k + so) : v4bh{0, 0, 0, 0};
-                    const f4 gf = ld16f(p.g + sbase + (size_t)g2_row_g<M>(j, cl) * rstride + vq);
+                    const v4bh kv = g2_row_ok<M>(j, cl) ? *reinterpret_cast<const v4bh*>(wa(p.k, j, vq)) : v4bh{0, 0, 0, 0};
+                    const f4 gf = ld16f(wa(p.g, g2_row_g<M>(j, cl), vq));
                     const f4 gl = GL(vq);
                     #pragma unroll
                     for (int dv = 0; dv < 4; ++dv) qst[it][dv] = bf_rne(bf2f(qv[dv]) * __builtin_amdgcn_exp2f(gf[dv]));
@@ -565,8 +576,8 @@ __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p_) {
                         const int tt = tid + 256 * (4 * h + i);
                         const int j = tt >> 5, vq = (tt & 31) << 2;
                         qvs[i] = g2_row_ok<M>(j, cl)
-                            ? *reinterpret_cast<const v4bh*>(p.q + sbase + (size_t)j * rstride + vq) : v4bh{0, 0, 0, 0};
-                        gfs[i] = ld16f(p.g + sbase + (size_t)g2_row_g<M>(j, cl) * rstride + vq);
+                            ? *reinterpret_cast<const v4bh*>(wa(p.q, j, vq)) : v4bh{0, 0, 0, 0};
+                        gfs[i] = ld16f(wa(p.g, g2_row_g<M>(j, cl), vq));
                     }
                     if (h == 0) __syncthreads();            // every wave's u-MMAC slab reads done
                     #pragma unroll
@@ -583,7 +594,7 @@ __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p_) {
                     const int tt = tid + 256 * it;
                     const int j = tt >> 5, vq = (tt & 31) << 2;
                     qvs[it] = g2_row_ok<M>(j, cl)
-                        ? *reinterpret_cast<const v4bh*>(p.q + sbase + (size_t)j * rstride + vq) : v4bh{0, 0, 0, 0};
+                        ? *reinterpret_cast<const v4bh*>(wa(p.q, j, vq)) : v4bh{0, 0, 0, 0};
                 }
                 __syncthreads();                            // every wave's u-MMAC slab reads done
                 #pragma unroll
