@@ -20,6 +20,7 @@
 //           fixed-order carry), results kept in a 32 KB LDS tile instead of global.
 //   P1/RED/post: fwd_intra2a / fis::s_post verbatim; g reads come from the LDS tile.
 #include "g2_common.h"
+#include <type_traits>
 
 namespace g2 {
 namespace r4 {
@@ -232,6 +233,12 @@ __global__ void __launch_bounds__(256) g2_fwd_prep_a_kernel(PrepAParams p) {
     const short* __restrict__ qc = p.q + cta0;
     const short* __restrict__ kc = p.k + cta0;
     const int rs = p.H * kK;
+    // kra P-938sa: CTA-uniform bases + 32-bit byte offsets (saddr global ops instead of per-lane 64-bit address math)
+    auto pa = [](auto* base, uint32_t e) {
+        using E = std::remove_pointer_t<decltype(base)>;
+        return reinterpret_cast<E*>(reinterpret_cast<std::conditional_t<std::is_const_v<E>, const char*, char*>>(base)
+                                    + e * (uint32_t)sizeof(E));
+    };
 
     // ---- raw gate loads first (latency overlaps the l2norm below)
     GRaw<GATE> grw;
@@ -245,8 +252,8 @@ __global__ void __launch_bounds__(256) g2_fwd_prep_a_kernel(PrepAParams p) {
         const bool rok = g2_row_ok<M>(16 * rb + m, cl);
         #pragma unroll
         for (int h = 0; h < 2; ++h) {
-            qv[rb][h] = rok ? *reinterpret_cast<const v4bh*>(qc + o + 4 * h) : v4bh{0, 0, 0, 0};
-            kv[rb][h] = rok ? *reinterpret_cast<const v4bh*>(kc + o + 4 * h) : v4bh{0, 0, 0, 0};
+            qv[rb][h] = rok ? *reinterpret_cast<const v4bh*>(pa(qc, (uint32_t)(o + 4 * h))) : v4bh{0, 0, 0, 0};
+            kv[rb][h] = rok ? *reinterpret_cast<const v4bh*>(pa(kc, (uint32_t)(o + 4 * h))) : v4bh{0, 0, 0, 0};
         }
     }
     {
@@ -381,7 +388,7 @@ __global__ void __launch_bounds__(256) g2_fwd_prep_a_kernel(PrepAParams p) {
             v4bh qg[2], kb[2];
             const int row = 16 * rb + m;
             const bool rok = g2_row_ok<M>(row, cl);
-            const float bta = rok ? p.beta[g2_rm_tok(tok0 + row, hh, p.H, 1)] : 0.f;
+            const float bta = rok ? *pa(p.beta + g2_rm_tok(tok0, hh, p.H, 1), (uint32_t)row * (uint32_t)p.H) : 0.f;
             #pragma unroll
             for (int s = 0; s < 8; ++s) {
                 const float eg = __builtin_amdgcn_exp2f(G_(rb, s));    // shared by QgA and Kb (same argument)
@@ -391,13 +398,13 @@ __global__ void __launch_bounds__(256) g2_fwd_prep_a_kernel(PrepAParams p) {
                 T2[(cbase + s) * kT2 + 16 * rb + m] = bf_rne(K(rb, s) * __builtin_amdgcn_exp2f(gn[s] - G_(rb, s)));
             }
             if (rok) {
-                *reinterpret_cast<v4bh*>(p.Kb + cta0 + (size_t)row * rs + cbase) = kb[0];
-                *reinterpret_cast<v4bh*>(p.Kb + cta0 + (size_t)row * rs + cbase + 4) = kb[1];
+                *reinterpret_cast<v4bh*>(pa(p.Kb + cta0, (uint32_t)(row * rs + cbase))) = kb[0];
+                *reinterpret_cast<v4bh*>(pa(p.Kb + cta0, (uint32_t)(row * rs + cbase + 4))) = kb[1];
             }
             const size_t qb0 = nblk + (size_t)(2048 * rb + 256 * (cbase >> 4) + 4 * m
                                + 128 * ((cbase >> 3) & 1));
-            *reinterpret_cast<v4bh*>(p.QgA + nat16(qb0)) = qg[0];
-            *reinterpret_cast<v4bh*>(p.QgA + nat16(qb0 + 64)) = qg[1];
+            *reinterpret_cast<v4bh*>(pa(p.QgA + nblk, (uint32_t)nat16(qb0 - nblk))) = qg[0];        // nblk % 512 == 0
+            *reinterpret_cast<v4bh*>(pa(p.QgA + nblk, (uint32_t)nat16(qb0 - nblk + 64))) = qg[1];
         }
         lds_barrier();
         #pragma unroll
@@ -410,7 +417,7 @@ __global__ void __launch_bounds__(256) g2_fwd_prep_a_kernel(PrepAParams p) {
                 const int dim = 16 * (U >> 8) + (U & 15), tok = 16 * ((U >> 6) & 3) + 4 * ((U >> 4) & 3);
                 h[s] = *reinterpret_cast<const v4bh*>(T2 + dim * kT2 + tok);
             }
-            st16x2(p.Kn + nblk + 8 * (size_t)(p.kp ? ((P & ~15) | pi16(P & 15)) : P), h[0], h[1]);   // kra P-61e
+            st16x2(pa(p.Kn + nblk, 8u * (uint32_t)(p.kp ? ((P & ~15) | pi16(P & 15)) : P)), h[0], h[1]);   // kra P-61e
         }
         lds_barrier();
     }
