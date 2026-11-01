@@ -28,6 +28,7 @@
 //     of the kernel are bitwise identical.
 #include "g2_common.h"
 
+#include <type_traits>
 namespace g2 {
 
 struct TailParams {
@@ -68,6 +69,17 @@ __global__ void __launch_bounds__(256) g2_bwd_tail_kernel(TailParams p) {
     // varlen: ONE uniform branch per CTA -- full chunks run the unmasked body (M=1)
     g2_vl_dispatch<VL>(cl, [&](auto mode_) {
     constexpr int M = decltype(mode_)::value;
+    // kra P-938sa (gfx938): chunk-row accesses as a CTA-uniform base (SGPRs) + a 32-bit byte offset, so the compiler
+    // emits saddr global ops instead of per-lane 64-bit address math (bwd_tail is VALU bound; ~23% of its instructions
+    // were 64-bit address arithmetic).  Offsets stay < 2^32 (one chunk of rows of one tensor).  Same values.
+    const size_t cb_ = ((size_t)t0 * p.H + hh) * kK;                  // element offset of (row t0, head hh, col 0)
+    const uint32_t rs_ = (uint32_t)p.H * kK;                          // elements per token row
+    auto eo = [&](int t, int col) -> uint32_t { return (uint32_t)t * rs_ + (uint32_t)col; };
+    auto at = [&](auto* base, uint32_t e) {                            // base + e elements, 32-bit byte offset
+        using E = std::remove_pointer_t<decltype(base)>;
+        return reinterpret_cast<E*>(reinterpret_cast<std::conditional_t<std::is_const_v<E>, const char*, char*>>(base + cb_)
+                                    + e * (uint32_t)sizeof(E));
+    };
 
         // ---- Phase A: dg reverse cumsum + gate backward.  ALL FOUR warps work:
         // warp w owns row block w (rows [16w, 16w+16)); each lane owns TWO K
@@ -85,7 +97,7 @@ __global__ void __launch_bounds__(256) g2_bwd_tail_kernel(TailParams p) {
                 for (int u = 0; u < 16; ++u) {
                     const int t = tb + 15 - u;
                     const float y = (g2_row_ok<M>(t, cl)
-                                     ? p.dg[((size_t)(t0 + t) * p.H + hh) * kK + d] : 0.f) - runC;
+                                     ? *at(p.dg, eo(t, d)) : 0.f) - runC;
                     const float tt = run + y;
                     runC = (tt - run) - y;  run = tt;
                     loc[u] = run;
@@ -101,7 +113,7 @@ __global__ void __launch_bounds__(256) g2_bwd_tail_kernel(TailParams p) {
                 for (int u = 0; u < 16; ++u) {
                     const int t = tb + 15 - u;
                     if (g2_row_ok<M>(t, cl))
-                        reinterpret_cast<float*>(p.dg_raw)[((size_t)(t0 + t) * p.H + hh) * kK + d] =
+                        *at(reinterpret_cast<float*>(p.dg_raw), eo(t, d)) =
                             loc[u] + carry;
                 }
                 __syncthreads();                            // sBlk reuse by the next c
@@ -119,7 +131,7 @@ __global__ void __launch_bounds__(256) g2_bwd_tail_kernel(TailParams p) {
             for (int u = 0; u < 16; ++u) {
                 const int t = tb + 15 - u;
                 const float2 v = g2_row_ok<M>(t, cl)
-                    ? *reinterpret_cast<const float2*>(p.dg + ((size_t)(t0 + t) * p.H + hh) * kK + d0)
+                    ? *reinterpret_cast<const float2*>(at(p.dg, eo(t, d0)))
                     : float2{0.f, 0.f};
                 {
                     const float y = v.x - run0C;
@@ -156,7 +168,8 @@ __global__ void __launch_bounds__(256) g2_bwd_tail_kernel(TailParams p) {
             for (int u = 0; u < 16; ++u) {
                 const int t = tb + 15 - u;
                 gr2[u] = *reinterpret_cast<const short2*>(
-                    p.g_raw + ((size_t)(t0 + g2_row_g<M>(t, cl)) * p.H + hh) * kK + d0);
+                    (M == 2 ? p.g_raw + ((size_t)(t0 + g2_row_g<M>(t, cl)) * p.H + hh) * kK + d0   // partial chunk: the clamped
+                         : at(p.g_raw, eo(t, d0))));                                      // row can be -1 (cl == 0)
             }
             // per column a separate straight-line block (the opaque branch keeps the SLP vectorizer from
             // pairing the two columns into packed fp32 ops, which would un-fuse the production's fmas)
@@ -193,7 +206,7 @@ __global__ void __launch_bounds__(256) g2_bwd_tail_kernel(TailParams p) {
             for (int u = 0; u < 16; ++u) {
                 const int t = tb + 15 - u;
                 if (g2_row_ok<M>(t, cl))
-                    *reinterpret_cast<short2*>(p.dg_raw + ((size_t)(t0 + t) * p.H + hh) * kK + d0) = short2{b0[u], b1[u]};
+                    *reinterpret_cast<short2*>(at(p.dg_raw, eo(t, d0))) = short2{b0[u], b1[u]};
             }
             sDDt[slot(d0, wv)] = ddt0;                      // merged below in the production order
             sDDt[slot(d0 + 1, wv)] = ddt1;
