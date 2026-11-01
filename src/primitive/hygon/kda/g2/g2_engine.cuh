@@ -19,6 +19,7 @@
 // Block order is (B, H, NT): head-major, chunk-minor.  P3 in g2_wy.cuh uses (NT, H).
 #include "g2_common.h"
 
+#include <type_traits>
 namespace g2 {
 
 struct FwdNParams {
@@ -286,26 +287,37 @@ __global__ void __launch_bounds__(512) g2_dhu_v8b_kernel(BwdNParams p) {
     const int c0 = p.seg ? p.seg[sg] : 0, c1 = p.seg ? p.seg[sg + 1] : p.NT;
     if (c0 >= c1) return;                                // empty segment
     const size_t chunk = (size_t)bh * p.NT;
+    // kra P-938sa: this head's chunk blocks through CTA-uniform bases + 32-bit byte offsets (saddr global ops instead
+    // of per-step per-lane 64-bit address math on the recurrence chain).  Offsets < NT x 16 KB.
+    auto dga = [](auto* base, int e) {
+        using E = std::remove_pointer_t<decltype(base)>;
+        return reinterpret_cast<E*>(reinterpret_cast<std::conditional_t<std::is_const_v<E>, const char*, char*>>(base)
+                                    + (uint32_t)e * (uint32_t)sizeof(E));
+    };
+    const bf16 *KgAc = p.KgA + chunk * 8192, *dvc = p.dv + chunk * 8192, *Qgc = p.Qg + chunk * 8192,
+               *Wbc = p.Wb + chunk * 8192, *dOTc = p.dOT + chunk * 8192;
+    const float* Gnc = p.Gn + chunk * 128;
+    bf16* dv2c = p.dv2 + chunk * 8192;
     const int r1 = wv & 3, v1 = wv >> 2;                 // GEMM-A tile: t-tile r1, v-tile v1
     f4 st[2];                                            // DH^T C-frags [vt]: v=16vt+c_row, k=16wv+c_col
     st[0] = f4{0.f, 0.f, 0.f, 0.f}; st[1] = st[0];
     v4bh ka[8], qb[4], wb[4], dof, dvf; f4 gl;       // dof: this wave's 1/8 of dO^T
     auto loadKA = [&](int i) {
-        const bf16* src = p.KgA + (((chunk + i) * 4 + r1) * 8) * 256 + l * 8;      // kra L16: paired
+        const bf16* src = dga(KgAc, ((i * 4 + r1) * 8) * 256 + l * 8);      // kra L16: paired
         #pragma unroll
         for (int j = 0; j < 4; ++j) ld16x2(src + j * 512, ka[2 * j], ka[2 * j + 1]);
     };
-    auto loadDV = [&](int i) { dvf = ld8(p.dv + (((chunk + i) * 4 + r1) * 8 + 2 * vs + v1) * 256 + l * 4); };
-    auto loadG = [&](int i) { gl = *reinterpret_cast<const f4*>(p.Gn + ((chunk + i) * 8 + wv) * 16 + (l >> 4) * 4); };
+    auto loadDV = [&](int i) { dvf = ld8(dga(dvc, ((i * 4 + r1) * 8 + 2 * vs + v1) * 256 + l * 4)); };
+    auto loadG = [&](int i) { gl = *reinterpret_cast<const f4*>(dga(Gnc, (i * 8 + wv) * 16 + (l >> 4) * 4)); };
     auto loadQW = [&](int i) {
         #pragma unroll
         for (int j = 0; j < 2; ++j) {                    // kra L16: paired
-            ld16x2(p.Qg + (((chunk + i) * 8 + wv) * 4) * 256 + j * 512 + l * 8, qb[2 * j], qb[2 * j + 1]);
-            ld16x2(p.Wb + (((chunk + i) * 8 + wv) * 4) * 256 + j * 512 + l * 8, wb[2 * j], wb[2 * j + 1]);
+            ld16x2(dga(Qgc, ((i * 8 + wv) * 4) * 256 + j * 512 + l * 8), qb[2 * j], qb[2 * j + 1]);
+            ld16x2(dga(Wbc, ((i * 8 + wv) * 4) * 256 + j * 512 + l * 8), wb[2 * j], wb[2 * j + 1]);
         }
     };
     auto loadDO = [&](int i) {
-        dof = ld8(p.dOT + (((chunk + i) * 8 + 2 * vs + (wv >> 2)) * 4 + (wv & 3)) * 256 + l * 4);
+        dof = ld8(dga(dOTc, ((i * 8 + 2 * vs + (wv >> 2)) * 4 + (wv & 3)) * 256 + l * 4));
     };
     v4bh hx[2];
     auto write_dh = [&]() {
@@ -375,7 +387,7 @@ __global__ void __launch_bounds__(512) g2_dhu_v8b_kernel(BwdNParams p) {
                 reinterpret_cast<short*>(vB)[(16 * v1 + c_col(l, e)) * kPadT + 16 * r1 + c_row(l)] = x[e];
             }
             if (hasDV2)  // T9b: the global dV2n write is optional; the
-                *reinterpret_cast<v4bh*>(p.dv2 + (((chunk + i) * 4 + r1) * 8 + 2 * vs + v1) * 256 + l * 4) = x;
+                *reinterpret_cast<v4bh*>(dga(dv2c, ((i * 4 + r1) * 8 + 2 * vs + v1) * 256 + l * 4)) = x;
             if (hasAN2 && !LIN)  // aN(dv2): same C-frag swap as the engines' aN emits
                 #pragma unroll
                 for (int e = 0; e < 4; ++e)
