@@ -827,6 +827,7 @@ struct WyS4BParams {
     int hf = 0;                         // kra P-96: head-fastest grid (blockIdx.x = head), set by the launcher
     short* dq_bf = nullptr;             // kra P-938q: non-null -> dq / dk go out as the final bf16 (gfx938, no l2norm)
     short* dk_bf = nullptr;
+    int vna = 0;                        // kra P-938va: vnc already holds A-form fragments (dav re-emitted them)
 };
 
 #if defined(__gfx938__)
@@ -1266,12 +1267,18 @@ __device__ __forceinline__ void s4b_tail(const WyS4BParams& p, S4BSmem& sm, cons
             #pragma unroll
             for (int vt = 0; vt < 8; ++vt) avn[vt] = ld8(vnN + ((A * 8 + vt) * 64 + l) * 4);
         } else {                // kra P-22: from the C-form Vn via the in-register transpose
-            const bf16* vnc = p.vnc + g2_nat_blk(i, hh, H, p.NT, false, 8192) + A * 8 * 256 + l * 4;
-            v4bh raw_[8];                                   // kra P-38: all 8 loads in flight first
-            #pragma unroll
-            for (int vt = 0; vt < 8; ++vt) raw_[vt] = ld8(vnc + vt * 256);
-            #pragma unroll
-            for (int vt = 0; vt < 8; ++vt) avn[vt] = g2_c2a_sel(raw_[vt], l);
+            const bf16* vnb = p.vnc + g2_nat_blk(i, hh, H, p.NT, false, 8192) + A * 8 * 256;
+            if (p.vna) {        // kra P-938va: A-form fragments from dav, L16 pairs (vt, vt + 1) per 16 B load
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) ld16x2(vnb + j * 512 + l * 8, avn[2 * j], avn[2 * j + 1]);
+            } else {
+                const bf16* vnc = vnb + l * 4;
+                v4bh raw_[8];                               // kra P-38: all 8 loads in flight first
+                #pragma unroll
+                for (int vt = 0; vt < 8; ++vt) raw_[vt] = ld8(vnc + vt * 256);
+                #pragma unroll
+                for (int vt = 0; vt < 8; ++vt) avn[vt] = g2_c2a_sel(raw_[vt], l);
+            }
         }
     }
     const int4* hg4 = reinterpret_cast<const int4*>(hb);
@@ -1523,7 +1530,7 @@ extern "C" int g2_wy_s4_split_r2(const void* q_kgb, const void* k, const void* v
                                  void* db_part, float scale, int T, int H, int NT,
                                  const void* q_row, const void* v_row, const int* ctok,
                                  const int* clen, const void* do_row, const void* dv2c,
-                                 const void* vnc, void* dq_bf, void* dk_bf, hipStream_t s) {
+                                 const void* vnc, void* dq_bf, void* dk_bf, int vna, hipStream_t s) {   // kra P-938va: + vna
     // T = chunk-padded rows (NT = T/64); with ctok/clen the row tensors are packed.
     if (T % kBT || NT != T / kBT || ((ctok == nullptr) != (clen == nullptr))) return -1;
     {
@@ -1564,6 +1571,7 @@ extern "C" int g2_wy_s4_split_r2(const void* q_kgb, const void* k, const void* v
         const dim3 s4grd = g2::g2_env_long("KDA_G2_S4_HF", 1) ? dim3(H, NT) : dim3(NT, H);   // kra P-88 (default on)
         pb.hf = g2::g2_env_long("KDA_G2_S4_HF", 1) != 0;   // kra P-96
         pb.dq_bf = (short*)dq_bf; pb.dk_bf = (short*)dk_bf;
+        pb.vna = vna;
         if (ctok) hipLaunchKernelGGL(p3_wy_s4b_kernel<true>, s4grd, dim3(256), 0, s, pb);
         else hipLaunchKernelGGL(p3_wy_s4b_kernel<false>, s4grd, dim3(256), 0, s, pb);
         return (int)hipGetLastError();
@@ -1581,7 +1589,7 @@ extern "C" int g2_wy_s4_split_r(const void* q_kgb, const void* k, const void* v_
                                 const void* vnc, hipStream_t s) {
     return g2_wy_s4_split_r2(q_kgb, k, v_vb, v_new, g, beta, A, h, do_, dh, dv, dAqk, dq, dk, dv2, dg, db, dA,
                              dwT, db_part, scale, T, H, NT, q_row, v_row, ctok, clen, do_row, dv2c, vnc,
-                             nullptr, nullptr, s);
+                             nullptr, nullptr, 0, s);
 }
 
 extern "C" int g2_wy_s4_split(const void* q_kgb, const void* k, const void* v_vb,

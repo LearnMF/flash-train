@@ -26,6 +26,7 @@ struct DavParams {
     float scale; int H, NT;
     const int* ctok; const int* clen;        // varlen phase 2 (null = dense)
     int order = 0, order_m = 4;              // kra P-938o2: CTA visiting order (g2_cta_order)
+    short* VnA = nullptr;                    // kra P-938va: non-null -> v_new re-emitted in A form (std order) here
 };
 
 constexpr int kPadJ3 = 68;
@@ -35,7 +36,7 @@ constexpr int kPadJ3 = 68;
 template <bool VL>
 __global__ void __launch_bounds__(256) g2_dav_kernel(DavParams p_) {
     // kra P-35: field-wise copy, pointers stamped global (global_* ops, not flat)
-    const DavParams p{g2_glb(p_.do_), g2_glb(p_.Vn), g2_glb(p_.A), g2_glb(p_.dA), g2_glb(p_.dVn), g2_glb(p_.dOT), g2_glb(p_.aNdo), p_.scale, p_.H, p_.NT, g2_glb(p_.ctok), g2_glb(p_.clen), p_.order, p_.order_m};
+    const DavParams p{g2_glb(p_.do_), g2_glb(p_.Vn), g2_glb(p_.A), g2_glb(p_.dA), g2_glb(p_.dVn), g2_glb(p_.dOT), g2_glb(p_.aNdo), p_.scale, p_.H, p_.NT, g2_glb(p_.ctok), g2_glb(p_.clen), p_.order, p_.order_m, g2_glb(p_.VnA)};
     int i, hh;
     g2_cta_order(p.order, p.order_m, p.H, p.NT, i, hh);   // kra P-938o2
     const int tid = threadIdx.x;
@@ -111,6 +112,20 @@ __global__ void __launch_bounds__(256) g2_dav_kernel(DavParams p_) {
                 slab[i1(16 * d0 + m, 16 * d1 + q + 4 * e)] = vq[e];
         }
         __syncthreads();
+        // kra P-938va: the staged [j][v] tile IS v_new's A form: fragment (row tile a, column tile vt) of lane (q, m) =
+        // v_new[16a + m][16vt + 4q .. +3] = one 8 B slab read at the pass-1 operand position.  Re-emitted over this
+        // CTA's own C-form block (std order, lane-ordered 16 B stores; every lane's Vn loads were consumed before the
+        // barrier above), so s4b reads A-form fragments and skips its in-register C -> A transpose.  Same values.
+        // L16 pairs (as Wn / Kn): sub-blocks 2g, 2g + 1 of lane c are one 16 B store at 512 g + 8 c.
+        if (p.VnA != nullptr && p.dA != nullptr)
+        #pragma unroll
+        for (int it_ = 0; it_ < 4; ++it_) {
+            const int t = tid + 256 * it_;
+            const int g = t >> 6, c = t & 63, a = g >> 2, vt = 2 * (g & 3);
+            const int r = 16 * a + (c & 15), cc = 4 * (c >> 4);
+            st16x2(p.VnA + nblk + (size_t)g * 512 + c * 8, *reinterpret_cast<const v4bh*>(slab + i1(r, 16 * vt + cc)),
+                   *reinterpret_cast<const v4bh*>(slab + i1(r, 16 * vt + 16 + cc)));
+        }
         if (p.dA != nullptr)
         {
             f4 acc[4];
@@ -266,12 +281,13 @@ __global__ void __launch_bounds__(256) g2_dav_kernel(DavParams p_) {
 extern "C" int g2_dav(const void* do_, const void* Vn, const void* A,
                       void* dA, void* dVn, void* dOT, void* aNdo, double scale,
                       int B, int T, int H, const int* ctok, const int* clen,
-                      hipStream_t s) {
+                      void* VnA, hipStream_t s) {   // kra P-938va: + VnA
     // T = chunk-padded rows (NT = T/64); with ctok/clen do/A/dA rows are packed.
     if (B != 1 || T % 64 || ((ctok == nullptr) != (clen == nullptr))) return -1;
     g2::DavParams p{(const short*)do_, (const short*)Vn, (const short*)A,
                     (float*)dA, (short*)dVn, (short*)dOT, (short*)aNdo,
                     (float)scale, H, T / 64, ctok, clen};
+    p.VnA = (short*)VnA;
     // kra P-938v: residency probe knob (dev only): dynamic LDS on top of the static slab caps the CTAs per CU
     const int lds_extra = (int)g2::g2_env_long("KDA_G2_DAV_LDS_EXTRA", 0);
     // kra P-938o2 (gfx938): diagonal order at H % 64 == 0 (row-major do / A against the p3-order natives)

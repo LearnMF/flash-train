@@ -50,7 +50,7 @@ int g2_wu(const void* k, const void* v, const void* q, const void* beta, const v
           void* Wb, void* Un, void* KgA, void* Kn, void* Qn, void* kgB, void* vB, int B, int T, int H, const int* ctok,
           const int* clen, const void* hbn, void* vn_out, hipStream_t s);  // kra P-82: + hbn / vn_out
 int g2_dav(const void* do_, const void* Vn, const void* A, void* dA, void* dVn, void* dOT, void* aNdo, double scale,
-           int B, int T, int H, const int* ctok, const int* clen, hipStream_t s);
+           int B, int T, int H, const int* ctok, const int* clen, void* VnA, hipStream_t s);  // kra P-938va: + VnA
 int g2_dhu_v8b(const void* KgA, const void* Qg, const void* Wb, const void* dOT, const void* dv, const void* Gn,
                void* dv2, void* HbN, void* ANv2, float scale, int B, int T, int H, const int* seg, int nseg,
                hipStream_t s);
@@ -71,7 +71,7 @@ int g2_wy_s4_split_r2(const void* q_kgb, const void* k, const void* v_vb, const 
                       const void* dAqk, void* dq, void* dk, void* dv2, void* dg, void* db, void* dA, void* dwT,
                       void* db_part, float scale, int T, int H, int NT, const void* q_row, const void* v_row,
                       const int* ctok, const int* clen, const void* do_row, const void* dv2c, const void* vnc,
-                      void* dq_bf, void* dk_bf, hipStream_t s);
+                      void* dq_bf, void* dk_bf, int vna, hipStream_t s);  // kra P-938va: + vna
 int g2_bwd_tail2(const void* dq, const void* dk, const void* dg, const void* db, const void* qn, const void* kn,
                  const void* q_rstd, const void* k_rstd, const void* g_raw, const void* A_log, const void* dt_bias,
                  const void* beta_raw, void* dqo, void* dko, void* dg_raw, void* dA_log, void* ddt_bias, void* db_out,
@@ -182,6 +182,26 @@ inline bool g2S4bBf16(const Shape& shape) {
         const char* d = std::getenv(FTRAIN_KDA_DEV);
         const bool dev = d != nullptr && *d != '\0' && std::strcmp(d, "0") != 0;
         const char* e = dev ? std::getenv("KDA_G2_S4B_BF16") : nullptr;
+        return e == nullptr || std::strcmp(e, "0") != 0;
+    }();
+    if (!on) { return false; }
+    static int known[64] = {};   // 0 unknown, 1 gfx938, 2 other
+    int d = 0;
+    if (hipGetDevice(&d) != hipSuccess || d < 0 || d >= 64) { return false; }
+    if (known[d] == 0) {
+        hipDeviceProp_t prop;
+        known[d] = (hipGetDeviceProperties(&prop, d) == hipSuccess && std::strncmp(prop.gcnArchName, "gfx938", 6) == 0) ? 1 : 2;
+    }
+    return known[d] == 1;
+}
+
+// kra P-938va: gfx938 -- dav re-emits v_new in A form in place and s4b skips its C -> A transpose.
+// KDA_G2_VNA=0 (FTRAIN_KDA_DEV only) restores the C-form read.
+inline bool g2Vna() {
+    static const bool on = [] {
+        const char* d = std::getenv(FTRAIN_KDA_DEV);
+        const bool dev = d != nullptr && *d != '\0' && std::strcmp(d, "0") != 0;
+        const char* e = dev ? std::getenv("KDA_G2_VNA") : nullptr;
         return e == nullptr || std::strcmp(e, "0") != 0;
     }();
     if (!on) { return false; }
@@ -443,8 +463,11 @@ void backward(const Shape& shape, const BackwardArgs& p, void* workspace, FTrain
                            NT * 64, H, L.tab.seg, nseg, nullptr, nullptr, L.GnRaw, stream),
               "fwd_h_bn");
     }
+    // kra P-938va (gfx938): dav re-emits the workspace v_new in A form in place, s4b reads it without its C -> A
+    // transpose.  Not on the kept-state route (state_vn is retained; s4b reads state_anv there).
+    const bool vna = !kept && g2Vna();
     check(g2_dav(p.d_o, Vn, p.aqk, dA, L.dVn, L.dOT, nullptr /* kra P-20: no aN_do */, p.scale, 1, NT * 64, H,
-                 ctok, clen, stream),
+                 ctok, clen, vna ? const_cast<void*>(Vn) : nullptr, stream),
           "dav");
     check(g2_dhu_v8b(L.KgA, L.Qn, L.Wb, L.dOT, L.dVn, L.Gn, nullptr, L.HbNdh, L.ANv2, p.scale, 1, NT * 64, H, L.tab.seg,
                      nseg, stream),
@@ -454,7 +477,7 @@ void backward(const Shape& shape, const BackwardArgs& p, void* workspace, FTrain
     check(g2_wy_s4_split_r2(L.kgB, kn, nullptr, ANv, L.g, p.beta, p.akk, HbN, nullptr, L.HbNdh, L.ANv2, dA, L.dq,
                             L.dk, p.dv, L.dg, p.dbeta, L.dAout, L.dwT, L.dbPart, p.scale, NT * 64, H, NT, qn, p.v,
                             ctok, clen, p.d_o, nullptr, kept ? nullptr : Vn, s4bq ? p.dq : nullptr,
-                            s4bq ? p.dk : nullptr, stream),
+                            s4bq ? p.dk : nullptr, vna ? 1 : 0, stream),
           "wy");
     // dbeta: the post-activation beta's gradient is wy's fp32 db, written in place (use_beta = 0).
     check(g2_bwd_tail2(L.dq, L.dk, L.dg, p.dbeta, qn, kn, p.q_rstd, p.k_rstd, p.g,
