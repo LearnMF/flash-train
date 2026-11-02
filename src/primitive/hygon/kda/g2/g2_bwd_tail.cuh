@@ -126,6 +126,86 @@ __global__ void __launch_bounds__(256) g2_bwd_tail_kernel(TailParams p) {
             const int d0 = 2 * l;
             auto slot = [&](int col, int b_) { return ((col >> 6) * 4 + b_) * 64 + (col & 63); };
             const float2 dtb = *reinterpret_cast<const float2*>(p.dt_bias + (size_t)hh * kK + d0);
+#if defined(__gfx938__) && G2_SIGFAST && KDA_B1_SIG
+            {   // kra P-938pk2: lane l's two columns (d0, d0 + 1) as ONE packed fp32 pair through the scan, the carry and
+                // the gate backward (v_pk_add / v_pk_mul / v_pk_fma_f32: one VALU op for both columns; exp2 / rcp stay per
+                // element).  Per column the same operations in the same order as the scalar path below; contraction is
+                // off and the fmas the production forms in the dAs chain are written explicitly -> bit-identical.
+                // This backend splits a packed fsub into two v_sub_f32 and a packed fneg into two v_xor, so a - b is
+                // written as fma(b, -1, a): b * -1 is exact, one rounding of a - b, one v_pk_fma_f32.
+                #pragma clang fp contract(off)
+                typedef float pf2 __attribute__((ext_vector_type(2)));
+                auto ps = [](pf2 a, pf2 b) { return __builtin_elementwise_fma(b, pf2{-1.f, -1.f}, a); };   // a - b
+                pf2 loc[16], run = {0.f, 0.f}, runC = {0.f, 0.f};
+                #pragma unroll
+                for (int u = 0; u < 16; ++u) {
+                    const int t = tb + 15 - u;
+                    const float2 v = g2_row_ok<M>(t, cl)
+                        ? *reinterpret_cast<const float2*>(at(p.dg, eo(t, d0)))
+                        : float2{0.f, 0.f};
+                    const pf2 y = ps(pf2{v.x, v.y}, runC), tt = run + y;
+                    runC = ps(ps(tt, run), y);  run = tt;
+                    loc[u] = run;
+                }
+                sBlk[slot(d0, wv)] = run.x;                 // block totals
+                sBlk[slot(d0 + 1, wv)] = run.y;
+                __syncthreads();
+                pf2 carry = {0.f, 0.f}, carryC = {0.f, 0.f};      // blocks above
+                for (int b = wv + 1; b < 4; ++b) {
+                    const pf2 y = ps(pf2{sBlk[slot(d0, b)], sBlk[slot(d0 + 1, b)]}, carryC), tt = carry + y;
+                    carryC = ps(ps(tt, carry), y);  carry = tt;
+                }
+                uint32_t gw[16];                            // g_raw of both columns (bf16 pair, column d0 low)
+                #pragma unroll
+                for (int u = 0; u < 16; ++u) {
+                    const int t = tb + 15 - u;
+                    gw[u] = *reinterpret_cast<const uint32_t*>(
+                        (M == 2 ? p.g_raw + ((size_t)(t0 + g2_row_g<M>(t, cl)) * p.H + hh) * kK + d0   // partial chunk: the clamped
+                             : at(p.g_raw, eo(t, d0))));                                      // row can be -1 (cl == 0)
+                }
+                const pf2 dt2 = {dtb.x, dtb.y};
+                // dAs's compensation is carried negated, nC = -dAsC, so its fma needs no fneg.  nC' = y - s rounds to
+                // -(s - y) exactly except that s == y gives +0 where -dAsC is -0 (likewise at u == 0); that only flips
+                // the sign of an exact-zero y, and dAs + y is then unchanged (dAs starts at +0 and is never -0 under
+                // RNE), so dAs, the only output of the chain, is bit-identical.
+                pf2 dAs = {0.f, 0.f}, nC = {-0.f, -0.f}, ddt = {0.f, 0.f}, ddtC = {0.f, 0.f};
+                uint32_t bo[16];
+                #pragma unroll
+                for (int u = 0; u < 16; ++u) {
+                    const pf2 suffix = loc[u] + carry;
+                    const pf2 gg = pf2{__uint_as_float(gw[u] << 16), __uint_as_float(gw[u] & 0xffff0000u)} + dt2;
+                    const pf2 e = -(A * gg) * 1.4426950408889634f;                     // g2_sig_b1, both halves
+                    const pf2 ex = pf2{__builtin_amdgcn_exp2f(e.x), __builtin_amdgcn_exp2f(e.y)} + 1.f;
+                    const pf2 sg = pf2{__builtin_amdgcn_rcpf(ex.x), __builtin_amdgcn_rcpf(ex.y)};
+                    pf2 bdg = suffix * (p.lower_bound * (sg * ps(pf2{1.f, 1.f}, sg)));   // dyg*t1
+                    bdg *= A;
+                    if (u == 0) {   // the production folds dAs = dAsC = 0 here: tt = fma(bdg, gg, 0), dAsC = tt - bdg * gg
+                        const pf2 tt = __builtin_elementwise_fma(bdg, gg, pf2{0.f, 0.f});   // contracted (unrounded product)
+                        nC = __builtin_elementwise_fma(bdg, gg, ps(pf2{0.f, 0.f}, tt));  dAs = tt;
+                    } else {        // dAs += bdg * gg (compensated; the production's fma)
+                        const pf2 y = __builtin_elementwise_fma(bdg, gg, nC), tt = dAs + y;
+                        nC = ps(y, ps(tt, dAs));  dAs = tt;
+                    }
+                    const uint32_t b2 = (uint32_t)__builtin_hcu_cvt_pk_bf16_f32(0, bdg.x, 0, bdg.y, false);  // bf_rne x2
+                    {   // ddt += bf2f(b16)
+                        const pf2 y = ps(pf2{__uint_as_float(b2 << 16), __uint_as_float(b2 & 0xffff0000u)}, ddtC),
+                                  tt = ddt + y;
+                        ddtC = ps(ps(tt, ddt), y);  ddt = tt;
+                    }
+                    bo[u] = b2;
+                }
+                #pragma unroll
+                for (int u = 0; u < 16; ++u) {
+                    const int t = tb + 15 - u;
+                    if (g2_row_ok<M>(t, cl))
+                        *reinterpret_cast<uint32_t*>(at(p.dg_raw, eo(t, d0))) = bo[u];
+                }
+                sDDt[slot(d0, wv)] = ddt.x;                 // merged below in the production order
+                sDDt[slot(d0 + 1, wv)] = ddt.y;
+                sDA[slot(d0, wv)] = dAs.x;
+                sDA[slot(d0 + 1, wv)] = dAs.y;
+            }
+#else
             float loc0[16], loc1[16], run0 = 0.f, run0C = 0.f, run1 = 0.f, run1C = 0.f;
             #pragma unroll
             for (int u = 0; u < 16; ++u) {
@@ -222,6 +302,7 @@ __global__ void __launch_bounds__(256) g2_bwd_tail_kernel(TailParams p) {
             sDDt[slot(d0 + 1, wv)] = ddt1;
             sDA[slot(d0, wv)] = dAs0;
             sDA[slot(d0 + 1, wv)] = dAs1;
+#endif
         }
         __syncthreads();
         if (!p.gate_none && tid < kK) {                     // fixed-order per-column
