@@ -133,6 +133,15 @@ __global__ void __launch_bounds__(256) g2_bwd_tail_kernel(TailParams p) {
                 const float2 v = g2_row_ok<M>(t, cl)
                     ? *reinterpret_cast<const float2*>(at(p.dg, eo(t, d0)))
                     : float2{0.f, 0.f};
+#if defined(__gfx938__)
+                {   // kra P-938pk: both columns' Kahan step as packed fp32 add / sub (no fma here: bit-identical)
+                    typedef float pf2 __attribute__((ext_vector_type(2)));
+                    const pf2 vv = pf2{v.x, v.y}, rc = pf2{run0C, run1C}, rr = pf2{run0, run1};
+                    const pf2 y = vv - rc, tt = rr + y, cn = (tt - rr) - y;
+                    run0C = cn.x; run1C = cn.y; run0 = tt.x; run1 = tt.y;
+                    loc0[u] = run0; loc1[u] = run1;
+                }
+#else
                 {
                     const float y = v.x - run0C;
                     const float tt = run0 + y;
@@ -145,6 +154,7 @@ __global__ void __launch_bounds__(256) g2_bwd_tail_kernel(TailParams p) {
                     run1C = (tt - run1) - y;  run1 = tt;
                     loc1[u] = run1;
                 }
+#endif
             }
             sBlk[slot(d0, wv)] = run0;                      // block totals
             sBlk[slot(d0 + 1, wv)] = run1;
