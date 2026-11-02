@@ -104,6 +104,18 @@ __device__ __forceinline__ void gate_load(const PrepAParams& p, GRaw<GATE>& gr, 
 #endif
 }
 
+#if defined(__gfx938__)
+// kra P-938pk2: packed fp32 pairs.  This backend splits a packed fsub / fneg into two scalar ops, so a - b is
+// fma(b, -1, a) (b * -1 is exact: one rounding of a - b, one v_pk_fma_f32).  bf16 pairs as one 32-bit word.
+__device__ __forceinline__ f2 pk_sub(f2 a, f2 b) { return __builtin_elementwise_fma(b, f2{-1.f, -1.f}, a); }
+__device__ __forceinline__ f2 bf2f2(uint32_t w) { return f2{__uint_as_float(w << 16), __uint_as_float(w & 0xffff0000u)}; }
+__device__ __forceinline__ uint32_t bf_rne2(f2 x) { return (uint32_t)__builtin_hcu_cvt_pk_bf16_f32(0, x.x, 0, x.y, false); }
+typedef uint32_t u2x __attribute__((ext_vector_type(2)));
+#endif
+#ifndef G2_PK2                                       // P-938pk2 parts (dev bisect): 1 gate scan / carry, 2 QgA / Kb / Kn, 4 P1a / P1b
+#define G2_PK2 7
+#endif
+
 // G half tile: 32 rows x 128 fp32 (quarters 2h, 2h+1), columns XOR-swizzled by row.
 __device__ __forceinline__ int gsw(int r, int c) { return r * 128 + (c ^ ((r & 7) << 2)); }
 
@@ -122,6 +134,25 @@ __device__ __forceinline__ void gate_scan(const PrepAParams& p, const GRaw<GATE>
         const float2 d2 = *reinterpret_cast<const float2*>(p.dt_bias + hh * 128 + 2 * c);
         dt0 = d2.x; dt1 = d2.y;
     }
+#if defined(__gfx938__) && (G2_PK2 & 1)
+    if constexpr (GATE == 1 && KDA_B1_SIG) {          // kra P-938pk2: both columns as one packed pair, same ops / order
+        const f2 dt2 = {dt0, dt1};
+        f2 rn = {0.f, 0.f}, cm = {0.f, 0.f};
+        #pragma unroll
+        for (int u = 0; u < 16; ++u) {
+            const f2 e = -(A * (bf2f2(gr.v[u]) + dt2)) * 1.4426950408889634f;     // g2_sig_b1's argument
+            const f2 ex = f2{__builtin_amdgcn_exp2f(e.x), __builtin_amdgcn_exp2f(e.y)} + 1.f;
+            f2 gt = p.lower_bound * f2{__builtin_amdgcn_rcpf(ex.x), __builtin_amdgcn_rcpf(ex.y)};
+            if (VL && r0 + u >= cl) gt = f2{0.f, 0.f};
+            const f2 y = pk_sub(gt, cm), t = rn + y;
+            cm = pk_sub(pk_sub(t, rn), y); rn = t;
+            v[u] = float2{rn.x, rn.y};
+        }
+        const f2 tot = pk_sub(rn, cm);
+        sTot[w * 64 + c] = float2{tot.x, tot.y};
+        return;
+    }
+#endif
     float2 run = float2{0.f, 0.f}, cmp = float2{0.f, 0.f};
 #if defined(__gfx938__)
     // P-938sg: one wave-uniform test (all |x| <= 87 and no NaN) selects the range-free expf / divide
@@ -182,6 +213,18 @@ __device__ __forceinline__ void gate_scan(const PrepAParams& p, const GRaw<GATE>
 __device__ __forceinline__ float2 gate_carry(const float2* sTot) {
     #pragma clang fp contract(off)
     const int c = threadIdx.x & 63, w = threadIdx.x >> 6;
+#if defined(__gfx938__) && (G2_PK2 & 1)
+    {   // kra P-938pk2: packed pair
+        f2 cy = {0.f, 0.f}, cq = {0.f, 0.f};
+        for (int b = 0; b < w; ++b) {
+            const float2 s = sTot[b * 64 + c];
+            const f2 y = pk_sub(f2{s.x, s.y}, cq), t = cy + y;
+            cq = pk_sub(pk_sub(t, cy), y); cy = t;
+        }
+        const f2 r = pk_sub(cy, cq);
+        return float2{r.x, r.y};
+    }
+#endif
     float2 carry = float2{0.f, 0.f}, cc = float2{0.f, 0.f};
     for (int b = 0; b < w; ++b) {
         const float yx = sTot[b * 64 + c].x - cc.x, tx = carry.x + yx;
@@ -389,6 +432,29 @@ __global__ void __launch_bounds__(256) g2_fwd_prep_a_kernel(PrepAParams p) {
             const int row = 16 * rb + m;
             const bool rok = g2_row_ok<M>(row, cl);
             const float bta = rok ? *pa(p.beta + g2_rm_tok(tok0, hh, p.H, 1), (uint32_t)row * (uint32_t)p.H) : 0.f;
+#if defined(__gfx938__) && (G2_PK2 & 2)
+            // kra P-938pk2: column pairs (s, s + 1) as packed fp32, both bf16 roundings in one cvt_pk; same ops.  Only
+            // without the in-kernel l2norm: there it lifts VGPR 153 -> 229 (138 -> 167 here, still 3 CTAs per CU).
+            if constexpr (!L2N) {
+                u2x qw[2], kw[2];
+                #pragma unroll
+                for (int kt = 0; kt < 4; ++kt) {
+                    const int s0 = 2 * kt, s1 = s0 + 1, h = kt >> 1, e = kt & 1;
+                    const f2 eg = f2{__builtin_amdgcn_exp2f(G_(rb, s0)), __builtin_amdgcn_exp2f(G_(rb, s1))};
+                    const f2 qf = bf2f2(__builtin_bit_cast(u2x, qv[rb][h])[e]);
+                    const f2 kf = bf2f2(__builtin_bit_cast(u2x, kv[rb][h])[e]);
+                    qw[h][e] = bf_rne2(qf * eg);
+                    kw[h][e] = bf_rne2(kf * bta * eg);
+                    const f2 d = pk_sub(f2{gn[s0], gn[s1]}, f2{G_(rb, s0), G_(rb, s1)});
+                    const uint32_t tw = bf_rne2(kf * f2{__builtin_amdgcn_exp2f(d.x), __builtin_amdgcn_exp2f(d.y)});
+                    T2[(cbase + s0) * kT2 + 16 * rb + m] = (short)tw;
+                    T2[(cbase + s1) * kT2 + 16 * rb + m] = (short)(tw >> 16);
+                }
+                #pragma unroll
+                for (int h = 0; h < 2; ++h) { qg[h] = __builtin_bit_cast(v4bh, qw[h]); kb[h] = __builtin_bit_cast(v4bh, kw[h]); }
+            } else
+#endif
+            {
             #pragma unroll
             for (int s = 0; s < 8; ++s) {
                 const float eg = __builtin_amdgcn_exp2f(G_(rb, s));    // shared by QgA and Kb (same argument)
@@ -396,6 +462,7 @@ __global__ void __launch_bounds__(256) g2_fwd_prep_a_kernel(PrepAParams p) {
                 // Kb = bf16(kn * beta * 2^g): fwd_intra2b's T2 pass-0 value, row-major like kn
                 kb[s >> 2][s & 3] = bf_rne(K(rb, s) * bta * eg);
                 T2[(cbase + s) * kT2 + 16 * rb + m] = bf_rne(K(rb, s) * __builtin_amdgcn_exp2f(gn[s] - G_(rb, s)));
+            }
             }
             if (rok) {
                 *reinterpret_cast<v4bh*>(pa(p.Kb + cta0, (uint32_t)(row * rs + cbase))) = kb[0];
@@ -434,7 +501,12 @@ __global__ void __launch_bounds__(256) g2_fwd_prep_a_kernel(PrepAParams p) {
             for (int kt = 0; kt < 4; ++kt) {
                 const int s0 = 2 * kt, s1 = 2 * kt + 1;
 #if defined(__gfx938__)   // kra P-938ng: gm - G == -(G - gm) in IEEE (non-NaN); the negation folds into v_exp
+#if G2_PK2 & 4
+                const f2 d01 = pk_sub(f2{G_(rb, s0), G_(rb, s1)}, f2{gm[s0], gm[s1]});   // kra P-938pk2
+                const float d0 = d01.x, d1 = d01.y;
+#else
                 const float d0 = G_(rb, s0) - gm[s0], d1 = G_(rb, s1) - gm[s1];
+#endif
                 const f2 eA = f2{exp2_inrange(d0), exp2_inrange(d1)};
                 const f2 eB = f2{exp2_inrange(-d0), exp2_inrange(-d1)};
 #else
@@ -472,12 +544,22 @@ __global__ void __launch_bounds__(256) g2_fwd_prep_a_kernel(PrepAParams p) {
                 #pragma unroll
                 for (int kt = 0; kt < 4; ++kt) {
                     const int s0 = 2 * kt, s1 = 2 * kt + 1;
+#if defined(__gfx938__) && (G2_PK2 & 4)   // kra P-938pk2: the exp2 arguments as packed pairs
+                    const f2 dO = pk_sub(f2{G_(rb, s0), G_(rb, s1)}, f2{gr[s0], gr[s1]});
+                    const f2 eO = f2{exp2_inrange(dO.x), exp2_inrange(dO.y)};
+#else
                     const f2 eO = f2{exp2_inrange(G_(rb, s0) - gr[s0]), exp2_inrange(G_(rb, s1) - gr[s1])};
+#endif
                     const f2 Aq = f2{Q(rb, s0), Q(rb, s1)} * eO;
                     const f2 Ak = f2{K(rb, s0), K(rb, s1)} * eO;
                     #pragma unroll
                     for (int cb = 0; cb < rb; ++cb) {
+#if defined(__gfx938__) && (G2_PK2 & 4)
+                        const f2 dBo = pk_sub(f2{gr[s0], gr[s1]}, f2{G_(cb, s0), G_(cb, s1)});
+                        const f2 eBo = f2{__builtin_amdgcn_exp2f(dBo.x), __builtin_amdgcn_exp2f(dBo.y)};
+#else
                         const f2 eBo = f2{__builtin_amdgcn_exp2f(gr[s0] - G_(cb, s0)), __builtin_amdgcn_exp2f(gr[s1] - G_(cb, s1))};
+#endif
                         const f2 Bo = f2{K(cb, s0), K(cb, s1)} * eBo;
                         const int x = pidx(rb, cb) - 3 * sp;
                         aq[x] = mmac32(Aq, Bo, aq[x]);
