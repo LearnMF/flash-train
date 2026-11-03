@@ -48,7 +48,10 @@ __global__ void __launch_bounds__(256) g2_dav_kernel(DavParams p_) {
     // conflict-free.  Layout only -- bit-identical.
     __shared__ __align__(16) short slab[128 * 64];
     auto i1 = [](int r, int c) { return (size_t)r * kK + (c ^ ((r & 15) << 2)); };       // pass 1 [j][v]
-    auto i2 = [](int v, int j) { return (size_t)v * 64 + (j ^ ((v & 15) << 2)); };       // pass 2 [v][t]
+    // kra P-938bc2: pass 2's swizzle also takes v bits 4..5 into the granule's low bits: the do scatter (lanes with v = 4k + d,
+    // one t) then spreads over 16 granules (8-way -> 2-way bank conflicts, 1792 -> 256 extra cycles per CTA); the dOT and
+    // MMAC b64 reads stay conflict-free (rows 16 vt + m and the 8 even / odd rows of a dOT group still map to distinct granules).
+    auto i2 = [](int v, int j) { return (size_t)v * 64 + (j ^ (((v & 15) ^ ((v >> 4) & 3)) << 2)); };   // pass 2 [v][t]
     auto iA = [](int t, int j) { return (size_t)t * 64 + (j ^ ((t & 15) << 2)); };       // dA staging fp32
 #else
     __shared__ __align__(16) short slab[128 * kPadJ3];       // 8704 shorts:
