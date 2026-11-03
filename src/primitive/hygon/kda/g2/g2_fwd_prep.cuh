@@ -258,7 +258,17 @@ __global__ void __launch_bounds__(256) g2_fwd_prep_a_kernel(PrepAParams p) {
     //                       rows 16rb+8 (P1a), 4-6 = rows 16rb (P1b), 7 = row 63 (gn, Gn, clamp)
     //   T2 / R              [0, 4352) / [0, 5120)              as fwd_intra2a; R blocks 17-19 overlap
     //                       slots 0-5: a barrier precedes the P1b sp=1 RED (last REF read before it)
-    __shared__ __align__(16) float lds[5376];
+#if defined(__gfx938__)
+    // kra P-938a16 (C4): a 16 KB arena -> 4 CTAs per CU on gfx938 (168 VGPRs still allow 4: resid_probe).  The gate
+    // tile goes in 4 rounds of 16 rows (8 KB), the Kn transpose in two token halves (T2 [128][36] bf16), the R partial
+    // blocks are flushed to global after P1a and after each P1b half; the REF slots stay at [3072, 4096) throughout.
+    constexpr bool P16 = true;
+#else
+    constexpr bool P16 = false;
+#endif
+    constexpr int OFF_STOT = P16 ? 2048 : 4352, OFF_XQ = P16 ? 2560 : 4864, OFF_XK = P16 ? 2816 : 5120,
+                  OFF_REF = P16 ? 3072 : 4352, GROWS = P16 ? 16 : 32, kT2h = 36;
+    __shared__ __align__(16) float lds[P16 ? 4096 : 5376];
     float* const G = lds;
     float* const smem = lds;
     int i, hh;
@@ -300,8 +310,8 @@ __global__ void __launch_bounds__(256) g2_fwd_prep_a_kernel(PrepAParams p) {
         }
     }
     {
-        float* Xq = lds + 4864;                       // [64 rows][4 waves] (REF slots 4-7: free
-        float* Xk = lds + 5120;                       // until the round-0 barrier)
+        float* Xq = lds + OFF_XQ;                     // [64 rows][4 waves] (REF slots 4-7: free
+        float* Xk = lds + OFF_XK;                     // until the round-0 barrier)
         if constexpr (L2N) {
         #pragma unroll
         for (int rb = 0; rb < 4; ++rb) {
@@ -323,7 +333,7 @@ __global__ void __launch_bounds__(256) g2_fwd_prep_a_kernel(PrepAParams p) {
             }
         }
         }
-        gate_scan<GATE, VL>(p, grw, graw, reinterpret_cast<float2*>(lds + 4352), hh, cl);
+        gate_scan<GATE, VL>(p, grw, graw, reinterpret_cast<float2*>(lds + OFF_STOT), hh, cl);
         __syncthreads();                              // X and sTot visible (one barrier for both)
         if constexpr (L2N) {
         #pragma unroll
@@ -361,36 +371,36 @@ __global__ void __launch_bounds__(256) g2_fwd_prep_a_kernel(PrepAParams p) {
     // exchanged in two rounds of 32 rows (16 KB): waves 2h, 2h+1 write quarters 2h, 2h+1 (the
     // scale is applied here, as the gate kernel's store does) and every lane takes its rows /
     // reference slot.  sTot / X (in the REF area) are dead once every lane passed round 0's barrier.
-    const float2 carry = gate_carry(reinterpret_cast<const float2*>(lds + 4352));
+    const float2 carry = gate_carry(reinterpret_cast<const float2*>(lds + OFF_STOT));
     f4 gv[4][2];
-    float* const REF = lds + 4352;
+    float* const REF = lds + OFF_REF;
     const int rj = threadIdx.x >> 5, rc4 = 4 * (threadIdx.x & 31);
     const int rrow = g2_row_g<M>(rj < 4 ? 16 * rj + 8 : (rj < 7 ? 16 * (rj - 3) : 63), cl);
     #pragma unroll
-    for (int hr = 0; hr < 2; ++hr) {
-        if ((wv >> 1) == hr) {
+    for (int hr = 0; hr < 64 / GROWS; ++hr) {
+        if ((P16 ? wv : (wv >> 1)) == hr) {
             #pragma clang fp contract(off)
             const int c = threadIdx.x & 63;
             #pragma unroll
             for (int u = 0; u < 16; ++u) {
                 const int r = 16 * wv + u;
                 if (!VL || r < cl)
-                    *reinterpret_cast<float2*>(G + gsw(r - 32 * hr, 2 * c)) =
+                    *reinterpret_cast<float2*>(G + gsw(r - GROWS * hr, 2 * c)) =
                         float2{(graw[u].x + carry.x) * p.gscale, (graw[u].y + carry.y) * p.gscale};
             }
         }
         __syncthreads();
         #pragma unroll
-        for (int rb = 2 * hr; rb < 2 * hr + 2; ++rb) {
+        for (int rb = (GROWS / 16) * hr; rb < (GROWS / 16) * (hr + 1); ++rb) {
             const int row = 16 * rb + m;
             if (g2_row_ok<M>(row, cl)) {
                 #pragma unroll
                 for (int h = 0; h < 2; ++h)
-                    gv[rb][h] = *reinterpret_cast<const f4*>(G + gsw(row - 32 * hr, cbase + 4 * h));
+                    gv[rb][h] = *reinterpret_cast<const f4*>(G + gsw(row - GROWS * hr, cbase + 4 * h));
             }
         }
-        if ((rrow >> 5) == hr) {
-            const f4 refv = *reinterpret_cast<const f4*>(G + gsw(rrow - 32 * hr, rc4));
+        if ((rrow >> (P16 ? 4 : 5)) == hr) {          // (a clamped row of -1 matches no round, as before)
+            const f4 refv = *reinterpret_cast<const f4*>(G + gsw(rrow - GROWS * hr, rc4));
             *reinterpret_cast<f4*>(REF + rj * 128 + rc4) = refv;
             if (rj == 7) {                            // Gn (B,H,NT,8,4,4): [a][c][d] = g[16a+4d+c]
                 float* gnp = p.Gn + g2_nat_blk(i, hh, p.H, p.NT, false, 128);
@@ -426,8 +436,12 @@ __global__ void __launch_bounds__(256) g2_fwd_prep_a_kernel(PrepAParams p) {
         short* T2 = reinterpret_cast<short*>(smem);
         float gn[8];
         ldref(7, gn);
+        auto t2i = [&](int dim, int tok, int half) { return P16 ? dim * kT2h + tok - 32 * half : dim * kT2 + tok; };
         #pragma unroll
-        for (int rb = 0; rb < 4; ++rb) {
+        for (int half = 0; half < (P16 ? 2 : 1); ++half) {
+        #pragma unroll
+        for (int rr = 0; rr < (P16 ? 2 : 4); ++rr) {
+            const int rb = P16 ? 2 * half + rr : rr;
             v4bh qg[2], kb[2];
             const int row = 16 * rb + m;
             const bool rok = g2_row_ok<M>(row, cl);
@@ -447,8 +461,8 @@ __global__ void __launch_bounds__(256) g2_fwd_prep_a_kernel(PrepAParams p) {
                     kw[h][e] = bf_rne2(kf * bta * eg);
                     const f2 d = pk_sub(f2{gn[s0], gn[s1]}, f2{G_(rb, s0), G_(rb, s1)});
                     const uint32_t tw = bf_rne2(kf * f2{__builtin_amdgcn_exp2f(d.x), __builtin_amdgcn_exp2f(d.y)});
-                    T2[(cbase + s0) * kT2 + 16 * rb + m] = (short)tw;
-                    T2[(cbase + s1) * kT2 + 16 * rb + m] = (short)(tw >> 16);
+                    T2[t2i(cbase + s0, 16 * rb + m, half)] = (short)tw;
+                    T2[t2i(cbase + s1, 16 * rb + m, half)] = (short)(tw >> 16);
                 }
                 #pragma unroll
                 for (int h = 0; h < 2; ++h) { qg[h] = __builtin_bit_cast(v4bh, qw[h]); kb[h] = __builtin_bit_cast(v4bh, kw[h]); }
@@ -461,7 +475,7 @@ __global__ void __launch_bounds__(256) g2_fwd_prep_a_kernel(PrepAParams p) {
                 qg[s >> 2][s & 3] = bf_rne(Q(rb, s) * eg);
                 // Kb = bf16(kn * beta * 2^g): fwd_intra2b's T2 pass-0 value, row-major like kn
                 kb[s >> 2][s & 3] = bf_rne(K(rb, s) * bta * eg);
-                T2[(cbase + s) * kT2 + 16 * rb + m] = bf_rne(K(rb, s) * __builtin_amdgcn_exp2f(gn[s] - G_(rb, s)));
+                T2[t2i(cbase + s, 16 * rb + m, half)] = bf_rne(K(rb, s) * __builtin_amdgcn_exp2f(gn[s] - G_(rb, s)));
             }
             }
             if (rok) {
@@ -477,18 +491,21 @@ __global__ void __launch_bounds__(256) g2_fwd_prep_a_kernel(PrepAParams p) {
         #pragma unroll
         for (int it = 0; it < 4; ++it) {                    // kra L16: 16B pair emit
             const int P = threadIdx.x + 256 * it;           // pair P = (group P>>6, lane P&63)
+            if (P16 && ((P >> 6) & 1) != half) continue;    // P-938a16: tokens 32 half .. (wave-uniform: wv & 1)
             v4bh h[2];
             #pragma unroll
             for (int s = 0; s < 2; ++s) {
                 const int U = 128 * (P >> 6) + 64 * s + (P & 63);   // quad of sub-block 2g+s
                 const int dim = 16 * (U >> 8) + (U & 15), tok = 16 * ((U >> 6) & 3) + 4 * ((U >> 4) & 3);
-                h[s] = *reinterpret_cast<const v4bh*>(T2 + dim * kT2 + tok);
+                h[s] = *reinterpret_cast<const v4bh*>(T2 + t2i(dim, tok, half));
             }
             st16x2(pa(p.Kn + nblk, 8u * (uint32_t)(p.kp ? ((P & ~15) | pi16(P & 15)) : P)), h[0], h[1]);   // kra P-61e
         }
         lds_barrier();
+        }   // half
     }
     if (p.stop == 4) return;
+    f4* const Rg4 = reinterpret_cast<f4*>(p.R + g2_nat_blk(i, hh, p.H, p.NT, false, 5120));
     {   // ---- P1a (verbatim; reference = REF slot rb)
         f4 acc[8];
         #pragma unroll
@@ -526,6 +543,12 @@ __global__ void __launch_bounds__(256) g2_fwd_prep_a_kernel(PrepAParams p) {
                 case 2: PA_RED(4, acc[4]) PA_RED(5, acc[5]) break;
                 default: PA_RED(6, acc[6]) PA_RED(7, acc[7]) break;
             }
+            lds_barrier();
+        }
+        if constexpr (P16) {                          // P-938a16: R blocks 0-7 out, the arena reused by P1b
+            const f4* s4 = reinterpret_cast<const f4*>(smem);
+            #pragma unroll
+            for (int j = threadIdx.x; j < 512; j += 256) Rg4[j] = s4[j];
             lds_barrier();
         }
     }
@@ -568,26 +591,36 @@ __global__ void __launch_bounds__(256) g2_fwd_prep_a_kernel(PrepAParams p) {
                 }
             }
             const int o = 3 * sp;
-            if (sp == 1) lds_barrier();               // sp=1 RED (blocks 17-19) overwrites REF
+            if (!P16 && sp == 1) lds_barrier();       // sp=1 RED (blocks 17-19) overwrites REF
+            // P-938a16: blocks 8+o..10+o / 14+o..16+o in arena slots 0-2 / 3-5
+            #define PBK(B) (P16 ? ((B) < 14 ? (B) - 8 - o : (B) - 11 - o) : (B))
             #pragma unroll
             for (int s = 0; s < 4; ++s) {
                 switch ((wv + s) & 3) {
-                    case 0: PA_RED(8 + o, aq[0]) PA_RED(14 + o, ak[0]) break;
-                    case 1: PA_RED(9 + o, aq[1]) PA_RED(15 + o, ak[1]) break;
-                    case 2: PA_RED(10 + o, aq[2]) break;
-                    default: PA_RED(16 + o, ak[2]) break;
+                    case 0: PA_RED(PBK(8 + o), aq[0]) PA_RED(PBK(14 + o), ak[0]) break;
+                    case 1: PA_RED(PBK(9 + o), aq[1]) PA_RED(PBK(15 + o), ak[1]) break;
+                    case 2: PA_RED(PBK(10 + o), aq[2]) break;
+                    default: PA_RED(PBK(16 + o), ak[2]) break;
                 }
                 lds_barrier();
+            }
+            #undef PBK
+            if constexpr (P16) {                      // P-938a16: the half's 6 blocks out
+                const f4* s4 = reinterpret_cast<const f4*>(smem);
+                for (int j = threadIdx.x; j < 384; j += 256) {
+                    const int slot = j >> 6;
+                    Rg4[(slot < 3 ? 8 + o + slot : 11 + o + slot) * 64 + (j & 63)] = s4[j];
+                }
+                if (sp == 0) lds_barrier();           // flush reads before the next half's RED writes
             }
         }
     }
     if (p.stop == 6) return;
     #undef PA_RED
-    {
+    if constexpr (!P16) {
         const f4* s4 = reinterpret_cast<const f4*>(smem);
-        f4* d4 = reinterpret_cast<f4*>(p.R + g2_nat_blk(i, hh, p.H, p.NT, false, 5120));
         #pragma unroll
-        for (int j = threadIdx.x; j < 1280; j += 256) d4[j] = s4[j];
+        for (int j = threadIdx.x; j < 1280; j += 256) Rg4[j] = s4[j];
     }
     });   // g2_vl_dispatch
 }
