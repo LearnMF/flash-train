@@ -108,8 +108,21 @@ __device__ __forceinline__ int wu_mls_row(int l, int jp) {
 // written as one 8 B quad per HbN lane (4 consecutive v of one k) and read back with ds_read_m32x16 as B-fragment pairs
 // (kt = 2jp, 2jp + 1).  The 16 B granule index (v >> 3) is XOR-ed with 2 ((k >> 1) & 1) so that a read instruction's
 // 64 granules (32 k rows x 2 granules) fall evenly on the 8 bank slots.
+// kra P-938bc4: granule XOR 2 (k1 ^ k2) + k3 instead of 2 k1.  ds_read_m32x16 serves 8 lanes per cycle (equal lane bits
+// (1 ^ 4, 3, 5), examples/kda/gfx938/lds_m_bank.hip): their rows differ in k bit 0 and in k bits 2 / 4 together, which the
+// k2 term now separates (2-way -> conflict-free); a staging store group (16 k, one v) spreads over 8 granule slots
+// instead of 4 (4-way -> 2-way).  Per CTA (bank model; hipprof totals match): 1792 -> 256 conflict cycles.
 __device__ __forceinline__ int wu_hbn_idx(int sp, int k, int v) {
-    return sp * 4096 + k * 32 + ((((v >> 3) ^ (((k >> 1) & 1) << 1))) << 3) + (v & 7);
+    return sp * 4096 + k * 32 + ((((v >> 3) ^ ((((k >> 1) ^ (k >> 2)) & 1) << 1) ^ ((k >> 3) & 1))) << 3) + (v & 7);
+}
+// kra P-938bc4: unpadded natural vb rows (L16, PN 128) with the 16 B granule (v >> 3) XOR-ed by 2 (j & 1) + 4 ((j >> 2) & 1):
+// the 4 rows x 2 granules of one ds_read_m32x16 lane group (rows j, j ^ 1, j ^ 20, j ^ 21) then fall on 8 distinct slots
+// (4-way -> conflict-free, 1536 -> 0 cycles per CTA); the fill stores (16 consecutive 8 B of one row) stay conflict-free.
+// Padded rows (PN 136) keep the plain layout: 1 granule shift per row already leaves only the 2-way minimum there.
+template <int PN>
+__device__ __forceinline__ int wu_nat(int j, int v) {
+    const int x = PN == 128 ? (((j & 1) << 1) | (((j >> 2) & 1) << 2)) : 0;
+    return j * PN + ((((v >> 3) ^ x) & 15) << 3) + (v & 7);
 }
 
 // V1 (kra P-1): bank-conflict-free LDS layouts.  Pure address remaps -- every value is
@@ -120,12 +133,32 @@ __device__ __forceinline__ int wu_hbn_idx(int sp, int k, int v) {
 //  tile: the 8 B granule of element e is XOR-ed with (e >> 10) & 7 (stays inside the
 //        8192-element block), spreading the B-form scalar stores (8-way -> 2-way) while
 //        the linear 8 B emit reads stay conflict-free.
+#if defined(__gfx938__)
+// kra P-938bc4 (gfx938 only; layout only, bit-identical).  slab (kbT): with padded rows (PJ 68) the granule XOR takes
+// 2 ((r >> 4) & 7) instead of r >> 3, so the 16 rows of an MMAC B read share one XOR value and their row shifts alone
+// spread them (2-way -> conflict-free) while the column fill keeps its 2-way minimum; unpadded rows (L16, PJ 64) XOR
+// with r's low nibble ^ 4 ((r >> 4) & 3) (8-way -> conflict-free reads, 4-way -> 2-way fill).
+// tile: the granule XOR also takes element bits 6..7, which the B-form C-fragment stores (one wave instruction: bits
+// 0, 1, 4, 6, 7 vary) otherwise leave on 4 banks (4-way -> conflict-free); the 16 B emit reads and the Qn / Kn row
+// stores keep their counts.  Per CTA (bank model; hipprof totals match): slab 768 -> 256 (PJ 68), 4352 -> 256 (PJ 64);
+// tile 1024 -> 256.
+template <bool L16 = false>
+__device__ __forceinline__ int wu_slab_col(int r, int j) {
+    const int h = L16 ? ((r & 15) ^ (((r >> 4) & 3) << 2)) : (((r >> 4) & 7) << 1);
+    return ((((j >> 2) ^ h) & 15) << 2) | (j & 3);
+}
+__device__ __forceinline__ int wu_tile_idx(int e) {
+    return (((e >> 2) ^ ((e >> 10) & 7) ^ ((e >> 6) & 3)) << 2) | (e & 3);
+}
+#else
+template <bool L16 = false>
 __device__ __forceinline__ int wu_slab_col(int r, int j) {
     return ((((j >> 2) ^ (r >> 3)) & 15) << 2) | (j & 3);
 }
 __device__ __forceinline__ int wu_tile_idx(int e) {
     return (((e >> 2) ^ ((e >> 10) & 7)) << 2) | (e & 3);
 }
+#endif
 
 // VL (varlen phase 2): k/v/q/beta/A rows r >= clen read as 0 (the zero padding), g rows
 // are read from the CLAMPED row (address only, the value math is the dense code), incl.
@@ -263,10 +296,10 @@ __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p_) {
                     const v4bh af1 = *reinterpret_cast<const v4bh*>(
                         sA + (size_t)(16 * wv + (l & 15)) * kPadA + 32 * jp + 16 + (l >> 4) * 4);
 #endif
-                    short* src = slab + (size_t)wu_mls_row(l, jp) * PN + 8 * (l & 1);
+                    const int mr = wu_mls_row(l, jp);
                     #pragma unroll
                     for (int vt = 0; vt < 8; ++vt) {
-                        const v8bh_l16 r = __builtin_hcu_ds_read_m32x16_bf16(src + 16 * vt);
+                        const v8bh_l16 r = __builtin_hcu_ds_read_m32x16_bf16(slab + wu_nat<PN>(mr, 16 * vt + 8 * (l & 1)));
                         acc[vt] = mmac(af0, __builtin_shufflevector(r, r, 0, 1, 2, 3), acc[vt]);
                         acc[vt] = mmac(af1, __builtin_shufflevector(r, r, 4, 5, 6, 7), acc[vt]);
                     }
@@ -283,7 +316,7 @@ __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p_) {
                 #pragma unroll
                 for (int vt = 0; vt < 8; ++vt) {
                     const int br = 16 * vt + (l & 15);
-                    const size_t lo = (size_t)br * PJ + wu_slab_col(br, 16 * js + (l >> 4) * 4);
+                    const size_t lo = (size_t)br * PJ + wu_slab_col<L16>(br, 16 * js + (l >> 4) * 4);
                     acc[vt] = mmac(af, *reinterpret_cast<const v4bh*>(slab + lo), acc[vt]);
                 }
             }
@@ -428,7 +461,7 @@ __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p_) {
                 // fragment then holds lane-contiguous native Wn columns.
                 const int vv = vq + dv;
                 const int sr = 16 * (vv >> 4) + pi16(vv & 15);
-                slab[(size_t)sr * PJ + wu_slab_col(sr, j)] =
+                slab[(size_t)sr * PJ + wu_slab_col<L16>(sr, j)] =
                     bf_rne(bf2f(kv[dv]) * b * eg[dv]);
             }
             short gv[4], gkv[4];
@@ -468,11 +501,11 @@ __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p_) {
             short xb[4];   // kra P-938m: natural [j][v] row, one 8 B store
             #pragma unroll
             for (int dv = 0; dv < 4; ++dv) xb[dv] = bf_rne(bf2f(vv[dv]) * b);
-            *reinterpret_cast<v4bh*>(slab + (size_t)j * PN + vq) = *reinterpret_cast<const v4bh*>(xb);
+            *reinterpret_cast<v4bh*>(slab + wu_nat<PN>(j, vq)) = *reinterpret_cast<const v4bh*>(xb);
 #else
             #pragma unroll
             for (int dv = 0; dv < 4; ++dv)
-                slab[(size_t)(vq + dv) * PJ + wu_slab_col(vq + dv, j)] = bf_rne(bf2f(vv[dv]) * b);
+                slab[(size_t)(vq + dv) * PJ + wu_slab_col<L16>(vq + dv, j)] = bf_rne(bf2f(vv[dv]) * b);
 #endif
         }
         } else {
@@ -488,11 +521,11 @@ __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p_) {
             short xb[4];   // kra P-938m: natural [j][v] row, one 8 B store
             #pragma unroll
             for (int dv = 0; dv < 4; ++dv) xb[dv] = bf_rne(bf2f(vv[dv]) * b);
-            *reinterpret_cast<v4bh*>(slab + (size_t)j * PN + vq) = *reinterpret_cast<const v4bh*>(xb);
+            *reinterpret_cast<v4bh*>(slab + wu_nat<PN>(j, vq)) = *reinterpret_cast<const v4bh*>(xb);
 #else
             #pragma unroll
             for (int dv = 0; dv < 4; ++dv)
-                slab[(size_t)(vq + dv) * PJ + wu_slab_col(vq + dv, j)] = bf_rne(bf2f(vv[dv]) * b);
+                slab[(size_t)(vq + dv) * PJ + wu_slab_col<L16>(vq + dv, j)] = bf_rne(bf2f(vv[dv]) * b);
 #endif
             if (p.vB != nullptr)   // kra P-17: production route reads v row-major in s4a instead
                 *reinterpret_cast<v4bh*>(p.vB + wu_vb_quad(j, vq, nblk3)) = vv;
