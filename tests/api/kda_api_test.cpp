@@ -44,11 +44,12 @@ struct Ports {
     }
 };
 
-bool onGfx936() {
+// The KDA primitives run on gfx936 and gfx938 (the latter through its native MMAC builtins).
+bool onSupportedArch() {
     int device = 0;
     hipDeviceProp_t prop;
     return hipGetDevice(&device) == hipSuccess && hipGetDeviceProperties(&prop, device) == hipSuccess &&
-           std::strncmp(prop.gcnArchName, "gfx936", 6) == 0;
+           (std::strncmp(prop.gcnArchName, "gfx936", 6) == 0 || std::strncmp(prop.gcnArchName, "gfx938", 6) == 0);
 }
 
 constexpr FTrainKdaAttributes kGate{0.0883883F, -5.0F, 1, 1};
@@ -82,11 +83,11 @@ TEST(KdaApiTest, UnsupportedHeadDimIsUnsupported) {
     EXPECT_EQ(ftrainKdaForwardGetWorkspaceBytes(&p.fwd, kGate, &bytes), FTRAIN_STATUS_UNSUPPORTED);
 }
 
-TEST(KdaApiTest, SupportedShapeReportsWorkspaceOnGfx936Only) {
+TEST(KdaApiTest, SupportedShapeReportsWorkspaceOnSupportedArch) {
     const Ports p(1000, 4, 128, true);
     std::uint64_t bytes       = 0;
     const FTrainStatus status = ftrainKdaForwardGetWorkspaceBytes(&p.fwd, kGate, &bytes);
-    if (onGfx936()) {
+    if (onSupportedArch()) {
         EXPECT_EQ(status, FTRAIN_STATUS_SUCCESS);
         EXPECT_GT(bytes, 0U);
     } else {
