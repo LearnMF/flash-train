@@ -96,6 +96,14 @@ constexpr int kPadA = 68;   // sA row stride (shorts): 136 B rows spread the MMA
 #else
 #define G2_WU_LEAN 0
 #endif
+// kra P-938cg (gfx938): phase 1's exp2f(g) quads are carried to phase 3 (32 VGPRs) instead of phase 3 re-reading g.
+// R70: wu runs 3 CTAs per CU bound by its 18 KB LDS, not by VGPRs, so the registers P-938r saved are free again.
+// Same values (the same exp2f of the same g quad) -> bit-identical.
+#if G2_WU_LEAN && !defined(G2_WU_CARRYG)
+#define G2_WU_CARRYG 1
+#elif !defined(G2_WU_CARRYG)
+#define G2_WU_CARRYG 0
+#endif
 constexpr int kPadN = 136;   // natural vb row stride (shorts, 272 B): 64 x 136 = the slab's 128 x 68
 // The j row lane l addresses as an MLS source for B-fragment pair jp: source offset o (even part) feeds
 // output element ie = position of o in {0, 4, 8, 12, 2, 6, 10, 14}; ie < 4 -> js = 2jp, else js = 2jp + 1.
@@ -473,6 +481,8 @@ __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p_) {
 #if !G2_WU_LEAN
             kgr[it] = *reinterpret_cast<const v4bh*>(gkv);
             egr[it] = eg;
+#elif G2_WU_CARRYG
+            egr[it] = eg;
 #endif
             *reinterpret_cast<v4bh*>(p.kgB + wu_vb_quad(j, vq, nblk3)) =
                 *reinterpret_cast<const v4bh*>(gv);
@@ -596,7 +606,7 @@ __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p_) {
                     #pragma unroll
                     for (int dv = 0; dv < 4; ++dv) tile[wu_tile_idx(ibn_of(tid + 256 * it) + 4 * dv)] = qst[it][dv];
             } else if constexpr (QS) {   // kra P-84c: carried exp2f(g) (the Kn branch's expression), q quads first
-#if G2_WU_LEAN
+#if G2_WU_LEAN && !G2_WU_CARRYG
                 // kra P-938k: two halves of 4 q / g quads;
                 // the same values land in the same tile slots, so the Qn emit is unchanged
                 #pragma unroll 1   // kra P-938k: NOT unrolled -- the full unroll hoists all of phase 3's addresses /
