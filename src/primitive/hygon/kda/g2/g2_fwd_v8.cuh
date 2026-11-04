@@ -761,14 +761,17 @@ __global__ void __launch_bounds__(256) g2_fwd_h_v8o4w_kernel(FwdOParams p) {
                             p.O[obase + q4 + 4 * e] = o[e];
                     }
                 } else {
+                    // kra P-938os: the wave's 16 x 16 staging tile with its 8 B column granule XOR-ed by (row >> 2) & 3: the
+                    // 32 B row pitch put rows m, m + 4, m + 8, m + 12 on one bank group (C-fragment b16 stores 4-way);
+                    // now stores and the 8 B row reads are conflict-free (hipprof, 8192/64: 704 -> 128 conflict cycles per CTA-step)
                     bf16* st_ = oStage[wv];
                     #pragma unroll
                     for (int e = 0; e < 4; ++e)
-                        reinterpret_cast<short*>(st_)[m * 16 + q4 + 4 * e] = bf_rne_int(o[e]);
+                        reinterpret_cast<short*>(st_)[m * 16 + 4 * (e ^ ((m >> 2) & 3)) + q4] = bf_rne_int(o[e]);
                     r1a_o_wave_order();
                     const int m2 = l & 15, g2_ = l >> 4;
                     const v4bh ov = *reinterpret_cast<const v4bh*>(
-                            reinterpret_cast<const short*>(st_) + m2 * 16 + 4 * g2_);
+                            reinterpret_cast<const short*>(st_) + m2 * 16 + 4 * (g2_ ^ ((m2 >> 2) & 3)));
                     if (ook) *reinterpret_cast<v4bh*>(p.Ob + obase + 4 * g2_) = ov;
                 }
             }
