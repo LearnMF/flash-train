@@ -1157,6 +1157,18 @@ struct S4BSmem {
     bf16 dwTs[16 * 64];          // kra P-29: dwT tile of step kt, column groups XOR-swizzled by row
 };
 
+// kra P-938tz (gfx938): s4b's intra tables indexed as 64-float rows with the 4-float group XOR-ed by
+// h(r) = 4 (r & 1) ^ ((r >> 1) & 1) ^ 2 ((r >> 2) & 1) (fits inside the padded arrays, so LDS and the P-938t prologue
+// footprint are unchanged).  Bank model (§141): the b32 table stores and the b128 operand reads become conflict-free
+// (hipprof on 079f58b: 3136 conflict cycles per CTA, ~2700 of them in the 68-float tables).  Layout only.
+__device__ __forceinline__ int s4b_tix(int r, int c) {
+#if defined(__gfx938__)
+    const int h = ((r & 1) << 2) ^ ((r >> 1) & 1) ^ (((r >> 2) & 1) << 1);
+    return r * 64 + ((((c >> 2) ^ h) & 15) << 2) + (c & 3);
+#else
+    return r * ipi::TS + c;
+#endif
+}
 template <int A, int M>
 __device__ __forceinline__ void s4b_tail(const WyS4BParams& p, S4BSmem& sm, const v4bh (&aa)[4],
                                          float db, float beta_t, long tok0, int cl) {
@@ -1368,7 +1380,7 @@ __device__ __forceinline__ void s4b_tail(const WyS4BParams& p, S4BSmem& sm, cons
         #pragma unroll
         for (int e = 0; e < 4; ++e) {
             const float kf = bf2f(kk[e]), qf = bf2f(qq[e]);
-            const int o = (4 * e + q) * TS + row;
+            const int o = s4b_tix(4 * e + q, row);
             sm.TA[o] = kf * en[e];
             sm.TQ[o] = qf * ep[e];
             sm.TK[o] = kf * beta_t * ep[e];
@@ -1392,7 +1404,7 @@ __device__ __forceinline__ void s4b_tail(const WyS4BParams& p, S4BSmem& sm, cons
         const float gm_n = sm.gM[A][m];
         #pragma unroll
         for (int b = 0; b <= A; ++b) {
-            f4 t = *reinterpret_cast<const f4*>(&sm.TA[m * TS + 16 * b + 4 * q]);
+            f4 t = *reinterpret_cast<const f4*>(&sm.TA[s4b_tix(m, 16 * b + 4 * q)]);
             if (b < A) t *= ex2_diff(gm_n, sm.gM[b][m]);
             cq0 = mm8(lo2(aqA[b]), lo2(t), cq0);
             ck0 = mm8(lo2(dak[b]), lo2(t), ck0);
@@ -1401,8 +1413,8 @@ __device__ __forceinline__ void s4b_tail(const WyS4BParams& p, S4BSmem& sm, cons
         }
         #pragma unroll
         for (int b = A; b < 4; ++b) {
-            f4 tq = *reinterpret_cast<const f4*>(&sm.TQ[m * TS + 16 * b + 4 * q]);
-            f4 tk = *reinterpret_cast<const f4*>(&sm.TK[m * TS + 16 * b + 4 * q]);
+            f4 tq = *reinterpret_cast<const f4*>(&sm.TQ[s4b_tix(m, 16 * b + 4 * q)]);
+            f4 tk = *reinterpret_cast<const f4*>(&sm.TK[s4b_tix(m, 16 * b + 4 * q)]);
             if (b > A) {
                 const float s = ex2_diff(sm.gM[b][m], gm_n);
                 tq *= s;
