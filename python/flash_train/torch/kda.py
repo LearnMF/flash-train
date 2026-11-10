@@ -196,16 +196,24 @@ def chunk_kda(q, k, v, g, beta, scale=None, initial_state=None, output_final_sta
     ``use_beta_sigmoid_in_kernel`` applies ``sigmoid`` (x2 with ``allow_neg_eigval``) to beta
     on the host. ``disable_recompute`` keeps FLA's meaning (see :func:`kimi_delta_attention`;
     not passing it selects the measured policy). ``chunk_size`` and ``cu_seqlens_cpu`` are FLA
-    tuning knobs with no effect here. Not supported (NotImplementedError): initial / final state,
-    intermediate states, context parallelism, FLA's softplus gate (no ``lower_bound``).
+    tuning knobs with no effect here. ``cp_context`` (FLA's chunkwise context parallelism) takes
+    each rank's start state from the ranks before it (see :func:`_cp_initial_state`). Not supported
+    (NotImplementedError): intermediate states, FLA's softplus gate (no ``lower_bound``).
     """
     if transpose_state_layout is not None:  # FLA's deprecated name of state_v_first
         if state_v_first:
             raise ValueError("chunk_kda: cannot pass both state_v_first and transpose_state_layout")
-    if initial_state is not None or output_final_state or return_intermediate_states:
-        raise NotImplementedError("chunk_kda: initial / final / intermediate states are not supported")
+        state_v_first = bool(transpose_state_layout)
+    if return_intermediate_states:
+        raise NotImplementedError("chunk_kda: intermediate states are not supported")
     if cp_context is not None:
-        raise NotImplementedError("chunk_kda: context parallelism is not supported")
+        if initial_state is not None or output_final_state:
+            raise ValueError("chunk_kda: initial_state / output_final_state are not supported with cp_context")
+        if cp_context.cu_seqlens is None:
+            raise ValueError("chunk_kda: cp_context requires cu_seqlens")
+        cu_seqlens = cp_context.cu_seqlens
+        if cp_context.cu_seqlens_cpu is not None:
+            cu_seqlens_cpu = cp_context.cu_seqlens_cpu
     if q.dim() != 4:
         raise ValueError(f"chunk_kda: expected [B, T, H, D] inputs, got {tuple(q.shape)}")
     B, T, H, K = q.shape
@@ -226,10 +234,93 @@ def chunk_kda(q, k, v, g, beta, scale=None, initial_state=None, output_final_sta
         raise ValueError("chunk_kda: A_log / dt_bias require use_gate_in_kernel=True")
     else:
         gate = {}
-    o = kimi_delta_attention(flat(q), flat(k), flat(v), flat(g), flat(beta), cu_seqlens=cu_seqlens, scale=scale,
-                             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-                             disable_recompute=disable_recompute, **gate)
-    return o.view(B, T, H, v.shape[-1]), None
+    x = [flat(q), flat(k), flat(v), flat(g), flat(beta)]
+    kw = dict(scale=scale, use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel, disable_recompute=disable_recompute,
+              **gate)
+    if initial_state is not None and state_v_first:
+        initial_state = initial_state.transpose(-1, -2)
+    if cp_context is not None and cp_context.group is not None:
+        initial_state = _cp_initial_state(x, cu_seqlens, cu_seqlens_cpu, cp_context, kw)
+    out = kimi_delta_attention(*x, cu_seqlens=cu_seqlens, initial_state=initial_state,
+                               output_final_state=output_final_state, **kw)
+    o, ht = out if output_final_state else (out, None)
+    if ht is not None and state_v_first:
+        ht = ht.transpose(-1, -2)
+    return o.view(B, T, H, v.shape[-1]), ht
+
+
+class _CpMerge(torch.autograd.Function):
+    """All-gathers every rank's ``[M | S_loc]`` (fp32 [H, K, K + V]) and composes those of the
+    ``pre`` ranks before this one in order into the start state h0 [n, H, K, V] (sequence 0 only;
+    zero on a sequence's first rank). The backward runs the composition in reverse and
+    reduce-scatters the summaries' gradients. ``anchor`` (an input that requires grad) makes h0
+    require grad on every rank, so every rank enters the backward collective."""
+
+    @staticmethod
+    def forward(ctx, hm, anchor, group, pre, n):
+        import torch.distributed as dist
+        world, rank = dist.get_world_size(group=group), dist.get_rank(group=group)
+        H, K, KV = hm.shape
+        gathered = hm.new_empty(world, H, K, KV)
+        dist.all_gather_into_tensor(gathered, hm.contiguous(), group=group)
+        h = hm.new_zeros(H, K, KV - K)
+        for j in range(rank - pre, rank):
+            h = torch.matmul(gathered[j, ..., :K], h) + gathered[j, ..., K:]
+        ctx.save_for_backward(gathered)
+        ctx.group, ctx.pre, ctx.rank, ctx.world = group, pre, rank, world
+        h0 = hm.new_zeros(n, H, K, KV - K)
+        h0[0] = h
+        return h0
+
+    @staticmethod
+    def backward(ctx, dh0):
+        import torch.distributed as dist
+        (gathered,) = ctx.saved_tensors
+        K = gathered.shape[2]
+        dall = torch.zeros_like(gathered)
+        if dh0 is not None and ctx.pre:
+            hs = [gathered.new_zeros(gathered.shape[1], K, gathered.shape[3] - K)]   # h before rank j
+            for j in range(ctx.rank - ctx.pre, ctx.rank - 1):
+                hs.append(torch.matmul(gathered[j, ..., :K], hs[-1]) + gathered[j, ..., K:])
+            grad = dh0[0].float()
+            for i, j in reversed(list(enumerate(range(ctx.rank - ctx.pre, ctx.rank)))):
+                dall[j, ..., K:] = grad
+                dall[j, ..., :K] = torch.matmul(grad, hs[i].transpose(-1, -2))
+                grad = torch.matmul(gathered[j, ..., :K].transpose(-1, -2), grad)
+        dhm = gathered.new_empty(gathered.shape[1:])
+        dist.reduce_scatter_tensor(dhm, dall, group=ctx.group)
+        return dhm, None, None, None, None
+
+
+def _cp_initial_state(x, cu_seqlens, cu_seqlens_cpu, ctx, kw):
+    """Chunkwise context parallelism (FLA's ``cp_context``): the start states [n, H, K, V] of this
+    rank's local sequences (all zero but the first's, zero too on that sequence's first rank).
+
+    The recurrence is affine in the state, so a rank's last local sequence maps a start state S to
+    ``M @ S + S_loc``: S_loc is its final state from zero, M (K x K) its final state from the
+    identity with v = 0. :class:`_CpMerge` all-gathers ``[M | S_loc]`` and composes those of the
+    ``pre_num_ranks`` ranks before this one; autograd carries the final-state gradient back."""
+    q, k, v = x[0], x[1], x[2]
+    H, K, V = q.shape[1], q.shape[2], v.shape[2]
+    if K != V:
+        raise NotImplementedError("chunk_kda: cp_context needs K == V")
+    if ctx.is_last_rank:
+        hm = q.new_zeros(H, K, K + V, dtype=torch.float32)   # no later rank of its sequence reads it
+    else:
+        if cu_seqlens is None:
+            s, e = 0, q.shape[0]
+        else:
+            bounds = cu_seqlens_cpu if cu_seqlens_cpu is not None else cu_seqlens
+            s, e = int(bounds[-2]), int(bounds[-1])
+        last = [t[s:e] for t in x]
+        _, s_loc = kimi_delta_attention(*last, output_final_state=True, **kw)
+        eye = torch.eye(K, device=q.device, dtype=torch.float32).expand(1, H, K, K).contiguous()
+        _, m = kimi_delta_attention(last[0], last[1], torch.zeros_like(last[2]), last[3], last[4],
+                                    initial_state=eye, output_final_state=True, **kw)
+        hm = torch.cat([m[0], s_loc[0]], dim=-1)
+    n = 1 if cu_seqlens is None else cu_seqlens.numel() - 1
+    pre = 0 if ctx.is_first_rank else int(ctx.pre_num_ranks)
+    return _CpMerge.apply(hm, k, ctx.group, pre, n)
 
 
 # ----------------------------------------------------------------------------- reference
