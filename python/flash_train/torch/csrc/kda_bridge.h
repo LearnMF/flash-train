@@ -15,7 +15,7 @@ enum KdaBridgeType : std::int32_t { kKdaBf16 = 0, kKdaFp32 = 1, kKdaInt32 = 2 };
 // One port: null memory marks an unused optional port.
 struct KdaBridgeView {
     const void* memory;
-    std::int64_t dims[3];
+    std::int64_t dims[4];
     std::int32_t num_dims;
     std::int32_t type;
 };
@@ -31,7 +31,7 @@ struct KdaBridgeAttributes {
 std::uint64_t kdaStateElements(std::int64_t tokens, std::int64_t heads, std::int64_t seqs, bool has_cu_seqlens);
 std::uint64_t kdaSavedHElements(std::int64_t tokens, std::int64_t heads, std::int64_t seqs, bool has_cu_seqlens);
 
-// views: 17 (forward) / 24 (backward) ports in the C API's port order. With query_bytes
+// views: 19 (forward) / 27 (backward) ports in the C API's port order. With query_bytes
 // non-null only the recommended Primitive's workspace size is reported. Returns the
 // FTrainStatus (0 = success); message receives the library's last message on failure.
 unsigned char callKdaForward(const KdaBridgeView* views, KdaBridgeAttributes attributes, void* workspace,

@@ -49,6 +49,8 @@ std::vector<Tensor> forwardPorts(std::int64_t T, std::int64_t H, std::int64_t K,
     p.push_back(makeTensor(14, {T, H, K}, kBf16, false));            // kn (optional, absent)
     p.push_back(makeTensor(15, {1}, kBf16, false));                  // h (optional, absent)
     p.push_back(makeTensor(16, {1}, kBf16, false));                  // state (optional, absent)
+    p.push_back(makeTensor(17, {1}, kFp32, false));                  // initial_state (optional, absent)
+    p.push_back(makeTensor(18, {1}, kFp32, false));                  // final_state (optional, absent)
     return p;
 }
 
@@ -78,6 +80,9 @@ std::vector<Tensor> backwardPorts(std::int64_t T, std::int64_t H, std::int64_t K
     p.push_back(makeTensor(21, {H, K}, kFp32));            // ddt_bias
     p.push_back(makeTensor(22, {1}, kBf16, false));        // h
     p.push_back(makeTensor(23, {1}, kBf16, false));        // state
+    p.push_back(makeTensor(24, {1}, kFp32, false));        // initial_state
+    p.push_back(makeTensor(25, {1}, kFp32, false));        // dht
+    p.push_back(makeTensor(26, {1}, kFp32, false));        // dh0
     return p;
 }
 
@@ -87,11 +92,11 @@ KdaAttributes attributes(bool gate, bool l2 = true) {
 
 TEST(KdaFamilyTest, EnginesDefineTheSupportedPatterns) {
     const OpsEngine<KdaForwardFamily, KdaRegistrationOrderFinder> forward;
-    EXPECT_EQ(forward.getPattern().getNumOperands(), 17U);
+    EXPECT_EQ(forward.getPattern().getNumOperands(), 19U);
     ASSERT_EQ(forward.getPattern().getNumOps(), 1U);
     EXPECT_EQ(forward.getPattern().getOpNode(PatternOperationId{0}).getKind(), OperationKind::kKdaForward);
     const OpsEngine<KdaBackwardFamily, KdaRegistrationOrderFinder> backward;
-    EXPECT_EQ(backward.getPattern().getNumOperands(), 24U);
+    EXPECT_EQ(backward.getPattern().getNumOperands(), 27U);
     ASSERT_EQ(backward.getPattern().getNumOps(), 1U);
     EXPECT_EQ(backward.getPattern().getOpNode(PatternOperationId{0}).getKind(), OperationKind::kKdaBackward);
 }
@@ -143,6 +148,13 @@ TEST(KdaProblemTest, RejectsStructuralViolations) {
     bad_h[KdaForwardProblem::kH] = makeTensor(15, {4 * 4 * 16384 + 1}, kBf16);
     expectInvalid(std::move(bad_h), attributes(true));
 
+    std::vector<Tensor> bad_h0               = forwardPorts(256, 4, 128, true);  // needs [N, H, K, V] = [1, 4, 128, 128]
+    bad_h0[KdaForwardProblem::kInitialState] = makeTensor(17, {4, 128, 128}, kFp32);
+    expectInvalid(std::move(bad_h0), attributes(true));
+    std::vector<Tensor> bad_ht             = forwardPorts(256, 4, 128, true, true);  // N = 2
+    bad_ht[KdaForwardProblem::kFinalState] = makeTensor(18, {1, 4, 128, 128}, kFp32);
+    expectInvalid(std::move(bad_ht), attributes(true));
+
     std::vector<Tensor> h_and_state        = forwardPorts(256, 4, 128, true);  // exclusive
     h_and_state[KdaForwardProblem::kH]     = makeTensor(15, {4 * 4 * 16384}, kBf16);
     h_and_state[KdaForwardProblem::kState] = makeTensor(16, {4 * 4 * 32768}, kBf16);
@@ -183,6 +195,19 @@ TEST(KdaProblemTest, AcceptsTheSavedQknAndH) {
     none[KdaBackwardProblem::kQ] = makeTensor(1, {256, 4, 128}, kBf16, false);
     none[KdaBackwardProblem::kK] = makeTensor(2, {256, 4, 128}, kBf16, false);
     EXPECT_THROW(KdaBackwardProblem(std::move(none), attributes(true)), Exception);
+}
+
+TEST(KdaProblemTest, AcceptsTheRecurrentStatePorts) {
+    std::vector<Tensor> dense               = forwardPorts(256, 4, 128, true);
+    dense[KdaForwardProblem::kInitialState] = makeTensor(17, {1, 4, 128, 128}, kFp32);
+    dense[KdaForwardProblem::kFinalState]   = makeTensor(18, {1, 4, 128, 128}, kFp32);
+    const KdaForwardProblem a(std::move(dense), attributes(true));
+    EXPECT_TRUE(a.hasMemory(KdaForwardProblem::kInitialState));
+    EXPECT_TRUE(a.hasMemory(KdaForwardProblem::kFinalState));
+    std::vector<Tensor> packed               = forwardPorts(256, 4, 128, true, true);
+    packed[KdaForwardProblem::kInitialState] = makeTensor(17, {2, 4, 128, 128}, kFp32);
+    const KdaForwardProblem b(std::move(packed), attributes(true));
+    EXPECT_NE(a.getProblemKey(), KdaForwardProblem(forwardPorts(256, 4, 128, true), attributes(true)).getProblemKey());
 }
 
 TEST(KdaProblemTest, AcceptsTheOptionalState) {

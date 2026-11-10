@@ -193,9 +193,9 @@ def test_no_grad_forward_saves_nothing(monkeypatch):
     seen = []
     real = kda_mod._kda_forward
 
-    def spy(*args):
+    def spy(*args, **kw):
         seen.append(args[-3:])  # keep_state, save_qkn, save_h
-        return real(*args)
+        return real(*args, **kw)
     monkeypatch.setattr(kda_mod, "_kda_forward", spy)
     x = {n: t.requires_grad_(True) for n, t in make_inputs(128, 2, True, seed=9).items()}
     call = lambda: ft.kimi_delta_attention(x["q"], x["k"], x["v"], x["g"], x["beta"], A_log=x["A_log"],
@@ -212,9 +212,9 @@ def _spy_saves(monkeypatch):
     seen = []
     real = kda_mod._kda_forward
 
-    def spy(*args):
+    def spy(*args, **kw):
         seen.append(args[-3:])  # keep_state, save_qkn, save_h
-        return real(*args)
+        return real(*args, **kw)
     monkeypatch.setattr(kda_mod, "_kda_forward", spy)
     return seen
 
@@ -388,3 +388,126 @@ def test_checkpoint_recompute_keeps_state():
         assert launches == want, (mode, launches)
         for name in x:
             assert torch.equal(leaves[name].grad, plain[1][name]), (mode, name)
+
+
+def make_h0(N, H, seed):
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    return torch.randn(N, H, 128, 128, device="cuda", generator=gen) * 0.1
+
+
+def call(fn, x, **kw):
+    return fn(x["q"], x["k"], x["v"], x["g"], x["beta"], A_log=x.get("A_log"), dt_bias=x.get("dt_bias"), **kw)
+
+
+@pytest.mark.parametrize("gate_in_kernel", [True, False])
+@pytest.mark.parametrize("T,H,cu", CASES)
+def test_state_ports_match_fp64_reference(T, H, cu, gate_in_kernel):
+    x = make_inputs(T, H, gate_in_kernel, seed=T + H + 7)
+    cu_t = torch.tensor(cu, dtype=torch.int32, device="cuda") if cu is not None else None
+    h0 = make_h0(1 if cu is None else len(cu) - 1, H, seed=T + H + 8)
+    with torch.no_grad():
+        o, ht = call(ft.kimi_delta_attention, x, cu_seqlens=cu_t, initial_state=h0, output_final_state=True)
+        ro, rht = call(ft.kda_reference, x, cu_seqlens=cu_t, initial_state=h0, output_final_state=True)
+    assert ht.dtype == torch.float32 and ht.shape == h0.shape
+    assert torch.isfinite(o.float()).all() and torch.isfinite(ht).all()
+    assert rel_rms(o, ro) < TOL["o"], rel_rms(o, ro)
+    assert rel_rms(ht, rht) < TOL["o"], rel_rms(ht, rht)
+
+
+def test_zero_initial_state_is_bit_identical():
+    x = make_inputs(333, 2, True, seed=21)
+    cu = torch.tensor([0, 1, 64, 65, 200, 333], dtype=torch.int32, device="cuda")
+    with torch.no_grad():
+        o = call(ft.kimi_delta_attention, x, cu_seqlens=cu)
+        o0, _ = call(ft.kimi_delta_attention, x, cu_seqlens=cu, initial_state=torch.zeros(5, 2, 128, 128,
+                     device="cuda"), output_final_state=True)
+    assert torch.equal(o, o0)
+
+
+@pytest.mark.parametrize("gate_in_kernel", [True, False])
+def test_chunk_aligned_split_chains_the_state(gate_in_kernel):
+    """What chunkwise CP relies on: running [0, s) then [s, T) seeded with the first part's final
+    state is bit-identical to one call over [0, T) when s is a multiple of the chunk (64)."""
+    T, H, s = 512, 4, 192
+    x = make_inputs(T, H, gate_in_kernel, seed=31)
+    part = lambda a, b: {k: (t[a:b] if k not in ("A_log", "dt_bias") else t) for k, t in x.items()}
+    with torch.no_grad():
+        o, ht = call(ft.kimi_delta_attention, x, output_final_state=True)
+        o1, h1 = call(ft.kimi_delta_attention, part(0, s), output_final_state=True)
+        o2, h2 = call(ft.kimi_delta_attention, part(s, T), initial_state=h1, output_final_state=True)
+    assert torch.equal(torch.cat([o1, o2]), o)
+    assert torch.equal(h2, ht)
+
+
+def test_empty_sequence_passes_the_initial_state_through():
+    x = make_inputs(200, 3, True, seed=41)
+    cu = torch.tensor([0, 0, 63, 127, 127, 200], dtype=torch.int32, device="cuda")
+    h0 = make_h0(5, 3, seed=42)
+    with torch.no_grad():
+        _, ht = call(ft.kimi_delta_attention, x, cu_seqlens=cu, initial_state=h0, output_final_state=True)
+    assert torch.equal(ht[0], h0[0]) and torch.equal(ht[3], h0[3])
+
+
+def run_state(fn, x, h0, d_o, d_ht, **kw):
+    leaves = {n: t.detach().clone().requires_grad_(True) for n, t in x.items()}
+    leaves["h0"] = h0.detach().clone().requires_grad_(True)
+    o, ht = fn(leaves["q"], leaves["k"], leaves["v"], leaves["g"], leaves["beta"], A_log=leaves.get("A_log"),
+               dt_bias=leaves.get("dt_bias"), initial_state=leaves["h0"], output_final_state=True, **kw)
+    grads = torch.autograd.grad((o, ht), list(leaves.values()), (d_o.to(o.dtype), d_ht))
+    return o.detach(), ht.detach(), dict(zip(leaves, grads))
+
+
+@pytest.mark.parametrize("gate_in_kernel", [True, False])
+@pytest.mark.parametrize("T,H,cu", CASES)
+def test_state_gradients_match_fp64_reference(T, H, cu, gate_in_kernel):
+    """With an initial_state and a final-state gradient dht: dh0 and every input gradient."""
+    x = make_inputs(T, H, gate_in_kernel, seed=T + H + 11)
+    cu_t = torch.tensor(cu, dtype=torch.int32, device="cuda") if cu is not None else None
+    N = 1 if cu is None else len(cu) - 1
+    h0, d_ht = make_h0(N, H, seed=T + H + 12), make_h0(N, H, seed=T + H + 13)
+    d_o = make_d_o(T, H, seed=T + H + 14)
+    _, _, g = run_state(ft.kimi_delta_attention, x, h0, d_o, d_ht, cu_seqlens=cu_t)
+    _, _, rg = run_state(ft.kda_reference, x, h0, d_o, d_ht, cu_seqlens=cu_t)
+    for name in x:
+        assert rel_rms(g[name], rg[name]) < TOL[name], name
+    assert g["h0"].dtype == torch.float32 and g["h0"].shape == h0.shape
+    assert rel_rms(g["h0"], rg["h0"]) < 4e-2
+
+
+@pytest.mark.parametrize("T,H,cu", [(257, 4, None), (200, 3, [0, 0, 63, 127, 127, 200])])
+def test_state_keep_state_is_bit_identical(T, H, cu):
+    x = make_inputs(T, H, True, seed=T + 21)
+    cu_t = torch.tensor(cu, dtype=torch.int32, device="cuda") if cu is not None else None
+    N = 1 if cu is None else len(cu) - 1
+    args = (x, make_h0(N, H, seed=T + 22), make_d_o(T, H, seed=T + 23), make_h0(N, H, seed=T + 24))
+    a = _with_keep("0", lambda: run_state(ft.kimi_delta_attention, *args, cu_seqlens=cu_t))
+    b = _with_keep("1", lambda: run_state(ft.kimi_delta_attention, *args, cu_seqlens=cu_t))
+    assert torch.equal(a[0], b[0]) and torch.equal(a[1], b[1])
+    for name in a[2]:
+        assert torch.equal(a[2][name], b[2][name]), name
+
+
+@pytest.mark.parametrize("gate_in_kernel", [True, False])
+def test_chunk_aligned_split_chains_the_gradients(gate_in_kernel):
+    """The backward chunkwise CP relies on: the second part's dh0 seeds the first part's dht, and
+    every gradient equals the one-call gradient over [0, T) bit for bit, except the per-call
+    reductions: dA_log adds two fp32 partial sums, ddt_bias two bf16-rounded ones (FLA's contract)."""
+    T, H, s = 512, 4, 192
+    x = make_inputs(T, H, gate_in_kernel, seed=33)
+    d_o, d_ht = make_d_o(T, H, seed=34), make_h0(1, H, seed=35)
+    leaves = {n: t.detach().clone().requires_grad_(True) for n, t in x.items()}
+
+    def fwd(a, b, **kw):
+        part = {n: (t[a:b] if n not in ("A_log", "dt_bias") else t) for n, t in leaves.items()}
+        return call(ft.kimi_delta_attention, part, output_final_state=True, **kw)
+
+    o, ht = fwd(0, T)
+    full = torch.autograd.grad((o, ht), list(leaves.values()), (d_o, d_ht))
+    o1, h1 = fwd(0, s)
+    o2, h2 = fwd(s, T, initial_state=h1)
+    split = torch.autograd.grad((o1, o2, h2), list(leaves.values()), (d_o[:s], d_o[s:], d_ht))
+    for name, a, b in zip(leaves, full, split):
+        if name in ("A_log", "dt_bias"):
+            assert rel_rms(b, a) < (1e-5 if name == "A_log" else 1e-2), name
+        else:
+            assert torch.equal(a, b), name

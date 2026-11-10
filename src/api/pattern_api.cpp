@@ -138,7 +138,8 @@ extern "C" FTrainStatus ftrainPatternAddKdaForward(FTrainPattern pattern, FTrain
                                                    FTrainTensorId cu_seqlens, FTrainTensorId o, FTrainTensorId q_rstd,
                                                    FTrainTensorId k_rstd, FTrainTensorId aqk, FTrainTensorId akk,
                                                    FTrainTensorId qn, FTrainTensorId kn, FTrainTensorId h,
-                                                   FTrainTensorId state) {
+                                                   FTrainTensorId state, FTrainTensorId initial_state,
+                                                   FTrainTensorId final_state) {
     return ftrain::invokeApi([&] {
         if (pattern == nullptr) {
             throw ftrain::Exception(FTRAIN_STATUS_INVALID_ARGUMENT,
@@ -149,7 +150,7 @@ extern "C" FTrainStatus ftrainPatternAddKdaForward(FTrainPattern pattern, FTrain
                                     "ftrainPatternAddKdaForward: op output must not be null");
         }
         *op = pattern->builder.addOperation<ftrain::OperationKind::kKdaForward>(
-            q, k, v, g, beta, a_log, dt_bias, cu_seqlens, o, q_rstd, k_rstd, aqk, akk, qn, kn, h, state);
+            q, k, v, g, beta, a_log, dt_bias, cu_seqlens, o, q_rstd, k_rstd, aqk, akk, qn, kn, h, state, initial_state, final_state);
     });
 }
 
@@ -158,7 +159,8 @@ extern "C" FTrainStatus ftrainPatternAddKdaBackward(
     FTrainTensorId v, FTrainTensorId g, FTrainTensorId beta, FTrainTensorId a_log, FTrainTensorId dt_bias,
     FTrainTensorId cu_seqlens, FTrainTensorId q_rstd, FTrainTensorId k_rstd, FTrainTensorId aqk, FTrainTensorId akk,
     FTrainTensorId qn, FTrainTensorId kn, FTrainTensorId dq, FTrainTensorId dk, FTrainTensorId dv, FTrainTensorId dg,
-    FTrainTensorId dbeta, FTrainTensorId da_log, FTrainTensorId ddt_bias, FTrainTensorId h, FTrainTensorId state) {
+    FTrainTensorId dbeta, FTrainTensorId da_log, FTrainTensorId ddt_bias, FTrainTensorId h, FTrainTensorId state,
+    FTrainTensorId initial_state, FTrainTensorId dht, FTrainTensorId dh0) {
     return ftrain::invokeApi([&] {
         if (pattern == nullptr) {
             throw ftrain::Exception(FTRAIN_STATUS_INVALID_ARGUMENT,
@@ -170,6 +172,6 @@ extern "C" FTrainStatus ftrainPatternAddKdaBackward(
         }
         *op = pattern->builder.addOperation<ftrain::OperationKind::kKdaBackward>(
             d_o, q, k, v, g, beta, a_log, dt_bias, cu_seqlens, q_rstd, k_rstd, aqk, akk, qn, kn, dq, dk, dv, dg, dbeta,
-            da_log, ddt_bias, h, state);
+            da_log, ddt_bias, h, state, initial_state, dht, dh0);
     });
 }

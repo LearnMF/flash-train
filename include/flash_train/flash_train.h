@@ -68,12 +68,17 @@ FTRAIN_API FTrainStatus ftrainGemm(FTrainStorageView a, FTrainStorageView b, FTr
  *   backward's v_new operands, 1024 B per token and head. Meant for activation-checkpoint
  *   recompute at H > 64 (the forward runs right before the backward, so the buffer is
  *   short-lived). Exclusive with h.
+ *
+ * initial_state (optional input) and final_state (optional output), fp32 [N, H, K, V] (N = 1
+ * without cu_seqlens): sequence n starts from initial_state[n] instead of the zero state, and
+ * its state after its last token is written to final_state[n].
  */
 typedef struct {
     FTrainStorageView q, k, v, g, beta, a_log, dt_bias, cu_seqlens;
     FTrainStorageView o, q_rstd, k_rstd, aqk, akk;
     FTrainStorageView qn, kn, h;
     FTrainStorageView state;
+    FTrainStorageView initial_state, final_state;
 } FTrainKdaForwardTensors;
 
 /** @brief The Tensor ports of one KDA backward call (see ftrainPatternAddKdaBackward); qn, kn,
@@ -88,6 +93,10 @@ typedef struct {
     FTrainStorageView dq, dk, dv, dg, dbeta, da_log, ddt_bias;
     FTrainStorageView h;
     FTrainStorageView state;
+    /* Optional, fp32 [N, H, K, V]: the forward's initial_state (the recompute starts from it; unused
+     * with h given), the final state's gradient dht (absent = zero) and the output dh0, the initial
+     * state's gradient. */
+    FTrainStorageView initial_state, dht, dh0;
 } FTrainKdaBackwardTensors;
 
 /** @brief Chunks of the packed layout for T tokens and N sequences: T / 64 for one sequence of
