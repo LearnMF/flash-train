@@ -165,6 +165,10 @@ struct BwdNParams {
     // Varlen/batch (DESIGN_VARLEN_BATCH.md): chunk-aligned segments, as in FwdOParams
     // (dhu_v8b only; the w8b variant ignores them and keeps a single segment).
     const int* seg; int nseg;
+    // Recurrent-state gradient ports, fp32 [nseg, H, 128, 128] (FLA's [N, H, K, V]; ST instances
+    // only): segment sg's reverse recurrence starts from DHt[sg] (null = zero) and writes the
+    // gradient of its start state to DH0[sg] (null = skip).
+    const float* DHt = nullptr; float* DH0 = nullptr;
 };
 extern "C" __global__ void __launch_bounds__(512) g2_dhu_w8b_kernel(BwdNParams p) {
     __shared__ __align__(16) bf16 dhB[kBV * kPadK];      // dh as [v][k]   (GEMM-A B operand)
@@ -269,7 +273,8 @@ extern "C" __global__ void __launch_bounds__(512) g2_dhu_w8b_kernel(BwdNParams p
     }
 }
 
-template <int MODE = 0, bool LIN = false>
+// ST: compile the DHt/DH0 ports in (false: the stateless instance is the pre-port kernel).
+template <int MODE = 0, bool LIN = false, bool ST = false>
 __global__ void __launch_bounds__(512) g2_dhu_v8b_kernel(BwdNParams p) {
     // kra P-10: MODE 1 = production output set (HbN + ANv2; dv2 and dh null) as compile-time
     // constants -- runtime-optional VMEM ops make the waitcnt pass count the skip path.
@@ -284,11 +289,24 @@ __global__ void __launch_bounds__(512) g2_dhu_v8b_kernel(BwdNParams p) {
     const int vs = blockIdx.x;
     const int sg = blockIdx.y / p.H, bh = blockIdx.y - sg * p.H;
     const int c0 = p.seg ? p.seg[sg] : 0, c1 = p.seg ? p.seg[sg + 1] : p.NT;
-    if (c0 >= c1) return;                                // empty segment
+    if (c0 >= c1) {                                      // empty segment: dh0 = dht
+        if constexpr (ST)
+            if (p.DH0) {
+                f4 t[2];
+                g2_state_load(p.DHt, sg, p.H, bh, wv, vs, l, t);
+                g2_state_store(p.DH0, sg, p.H, bh, wv, vs, l, t);
+            }
+        return;
+    }
     const size_t chunk = (size_t)bh * p.NT;
     const int r1 = wv & 3, v1 = wv >> 2;                 // GEMM-A tile: t-tile r1, v-tile v1
     f4 st[2];                                            // DH^T C-frags [vt]: v=16vt+c_row, k=16wv+c_col
-    st[0] = f4{0.f, 0.f, 0.f, 0.f}; st[1] = st[0];
+    if constexpr (ST)
+        g2_state_load(p.DHt, sg, p.H, bh, wv, vs, l, st);
+    else {
+        st[0] = f4{0.f, 0.f, 0.f, 0.f};
+        st[1] = st[0];
+    }
     v4bh ka[8], qb[4], wb[4], dof, dvf; f4 gl;       // dof: this wave's 1/8 of dO^T
     auto loadKA = [&](int i) {
         const bf16* src = p.KgA + (((chunk + i) * 4 + r1) * 8) * 256 + l * 8;      // kra L16: paired
@@ -414,6 +432,8 @@ __global__ void __launch_bounds__(512) g2_dhu_v8b_kernel(BwdNParams p) {
         loadQW(nxt);
         write_dh();
     }
+    if constexpr (ST)
+        if (p.DH0) g2_state_store(p.DH0, sg, p.H, bh, wv, vs, l, st);
 }
 
 // ================================================================ R1a-dhu: 4-wave form
@@ -424,7 +444,7 @@ __global__ void __launch_bounds__(512) g2_dhu_v8b_kernel(BwdNParams p) {
 // 1.026x H=24, 1.093x H=48, occ 3->3, 185 VGPR 0 spill).  At deep saturation
 // (H=96, 384 CTAs) latency hiding is WORSE (0.961x) -> host auto-selects by CTA
 // count; KDA_G2_R1A_DHU=0/1 forces the 8-wave/4-wave form.
-template <int MODE = 0, bool LIN = false>
+template <int MODE = 0, bool LIN = false, bool ST = false>
 __global__ void __launch_bounds__(256) g2_dhu_v8b4_kernel(BwdNParams p) {
     // kra P-10: MODE 1 = production output set (HbN + ANv2; dv2 and dh null) as compile-time
     // constants -- runtime-optional VMEM ops make the waitcnt pass count the skip path.
@@ -439,12 +459,27 @@ __global__ void __launch_bounds__(256) g2_dhu_v8b4_kernel(BwdNParams p) {
     const int vs = blockIdx.x;
     const int sg = blockIdx.y / p.H, bh = blockIdx.y - sg * p.H;
     const int c0 = p.seg ? p.seg[sg] : 0, c1 = p.seg ? p.seg[sg + 1] : p.NT;
-    if (c0 >= c1) return;
+    if (c0 >= c1) {                                      // empty segment: dh0 = dht
+        if constexpr (ST)
+            if (p.DH0) {
+                f4 t[2];
+                g2_state_load(p.DHt, sg, p.H, bh, wv, vs, l, t);
+                g2_state_store(p.DH0, sg, p.H, bh, wv, vs, l, t);
+                g2_state_load(p.DHt, sg, p.H, bh, wv + 4, vs, l, t);
+                g2_state_store(p.DH0, sg, p.H, bh, wv + 4, vs, l, t);
+            }
+        return;
+    }
     const size_t chunk = (size_t)bh * p.NT;
     const int r1 = wv, kb0 = wv, kb1 = wv + 4;
     f4 st0[2], st1[2];
-    st0[0] = f4{0.f, 0.f, 0.f, 0.f}; st0[1] = st0[0];
-    st1[0] = f4{0.f, 0.f, 0.f, 0.f}; st1[1] = st1[0];
+    if constexpr (ST) {
+        g2_state_load(p.DHt, sg, p.H, bh, kb0, vs, l, st0);
+        g2_state_load(p.DHt, sg, p.H, bh, kb1, vs, l, st1);
+    } else {
+        st0[0] = f4{0.f, 0.f, 0.f, 0.f}; st0[1] = st0[0];
+        st1[0] = f4{0.f, 0.f, 0.f, 0.f}; st1[1] = st1[0];
+    }
     v4bh ka[8], qb0[4], wb0[4], qb1[4], wb1[4], dof0, dof1, dvf0, dvf1;
     f4 gl0, gl1;
     auto loadKA = [&](int i) {
@@ -492,7 +527,7 @@ __global__ void __launch_bounds__(256) g2_dhu_v8b4_kernel(BwdNParams p) {
             }
         }
     };
-    const int last = c1 - 1;                             // dh = 0 at the segment end
+    const int last = c1 - 1;                             // dh = dht (0 without ST) at the segment end
     loadKA(last); loadDV(last, 0, dvf0); loadDV(last, 1, dvf1);
     loadG(last, kb0, gl0); loadG(last, kb1, gl1);
     loadQW(last, kb0, qb0, wb0); loadQW(last, kb1, qb1, wb1);
@@ -589,6 +624,11 @@ __global__ void __launch_bounds__(256) g2_dhu_v8b4_kernel(BwdNParams p) {
         write_dh(kb0, st0, hx0);
         write_dh(kb1, st1, hx1);
     }
+    if constexpr (ST)
+        if (p.DH0) {
+            g2_state_store(p.DH0, sg, p.H, bh, kb0, vs, l, st0);
+            g2_state_store(p.DH0, sg, p.H, bh, kb1, vs, l, st1);
+        }
 }
 
 extern "C" int g2_dhu_w8b(const void* KgA, const void* Qg, const void* Wb, const void* dOT, const void* dv,
@@ -602,12 +642,14 @@ extern "C" int g2_dhu_w8b(const void* KgA, const void* Qg, const void* Wb, const
 
 extern "C" int g2_dhu_v8b(const void* KgA, const void* Qg, const void* Wb, const void* dOT, const void* dv,
                           const void* Gn, void* dv2, void* HbN, void* ANv2, float scale, int B, int T, int H,
-                          const int* seg, int nseg, hipStream_t s) {
+                          const int* seg, int nseg, const void* DHt, void* DH0, hipStream_t s) {
     if (T % kBT || B != 1) return -1;                    // batch = segments (seg/nseg)
     if (seg == nullptr) nseg = 1;
     BwdNParams p{(const bf16*)KgA, (const bf16*)Qg, (const bf16*)Wb, (const bf16*)dOT, (const bf16*)dv,
                  (const float*)Gn, nullptr, (bf16*)dv2, scale, H, T / kBT, (const bf16*)HbN,
                  (bf16*)ANv2, seg, nseg};
+    p.DHt = (const float*)DHt;
+    p.DH0 = (float*)DH0;
     // auto window from MEASURED production A/B (dhu-only, kernel time): 48 CTAs
     // (H=12) -9.6%, 96 CTAs (H=24) +2.6% bench / +0.1% e2e, 192 CTAs (H=48) +4.6%,
     // 384 CTAs (H=96) -3.2%.  Low CTA counts need the 8-wave form's latency hiding;
@@ -627,6 +669,15 @@ extern "C" int g2_dhu_v8b(const void* KgA, const void* Qg, const void* Wb, const
     // kra P-10: the production output set gets the compile-time instance
     const bool prod = HbN != nullptr && ANv2 != nullptr && dv2 == nullptr;
     const bool prod2 = HbN != nullptr && ANv2 == nullptr && dv2 != nullptr;   // kra P-22
+    if (DHt != nullptr || DH0 != nullptr) {             // state ports: own instances, the stateless ones stay as is
+        if (dhu4) {
+            if (lin) hipLaunchKernelGGL((g2_dhu_v8b4_kernel<0, true, true>), dim3(kK / kBV, nseg * H), dim3(256), dyn((g2_dhu_v8b4_kernel<0, true, true>)), s, p);
+            else     hipLaunchKernelGGL((g2_dhu_v8b4_kernel<0, false, true>), dim3(kK / kBV, nseg * H), dim3(256), dyn((g2_dhu_v8b4_kernel<0, false, true>)), s, p);
+        } else if (prod && lin) hipLaunchKernelGGL((g2_dhu_v8b_kernel<1, true, true>), dim3(kK / kBV, nseg * H), dim3(512), dyn((g2_dhu_v8b_kernel<1, true, true>)), s, p);
+        else if (prod) hipLaunchKernelGGL((g2_dhu_v8b_kernel<1, false, true>), dim3(kK / kBV, nseg * H), dim3(512), dyn((g2_dhu_v8b_kernel<1, false, true>)), s, p);
+        else      hipLaunchKernelGGL((g2_dhu_v8b_kernel<0, false, true>), dim3(kK / kBV, nseg * H), dim3(512), dyn((g2_dhu_v8b_kernel<0, false, true>)), s, p);
+        return (int)hipGetLastError();
+    }
     if (dhu4) {
         // v8b4: the compile-time instance measured 8% SLOWER (kra P-10) -> generic only
         if (lin) hipLaunchKernelGGL((g2_dhu_v8b4_kernel<0, true>), dim3(kK / kBV, nseg * H), dim3(256), dyn((g2_dhu_v8b4_kernel<0, true>)), s, p);

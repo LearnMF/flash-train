@@ -40,7 +40,8 @@ struct Ports {
                                       view(10, th, 2, fp32),      view(11, th64, 3, bf16),
                                       view(12, th64, 3, bf16),    view(13, thk, 3, bf16, false),
                                       view(14, thk, 3, bf16, false), view(15, cu, 1, bf16, false),
-                                      view(16, cu, 1, bf16, false)};
+                                      view(16, cu, 1, bf16, false),
+                                      view(17, cu, 1, fp32, false), view(18, cu, 1, fp32, false)};
     }
 };
 
@@ -73,7 +74,8 @@ TEST(KdaApiTest, InconsistentShapesAreInvalid) {
     Ports p(128, 2, 128, true);
     p.th[1]             = 3;  // beta / rstd heads no longer match q
     std::uint64_t bytes = 0;
-    EXPECT_EQ(ftrainKdaForwardGetWorkspaceBytes(&p.fwd, kGate, &bytes), FTRAIN_STATUS_INVALID_ARGUMENT);
+    EXPECT_EQ(ftrainKdaForwardGetWorkspaceBytes(&p.fwd, kGate, &bytes), FTRAIN_STATUS_INVALID_ARGUMENT)
+        << ftrainGetLastMessage();
 }
 
 TEST(KdaApiTest, UnsupportedHeadDimIsUnsupported) {

@@ -54,10 +54,11 @@ class OperationTraits<OperationKind::kKdaForward> {
         FTrainTensorId q, FTrainTensorId k, FTrainTensorId v, FTrainTensorId g, FTrainTensorId beta,
         FTrainTensorId a_log, FTrainTensorId dt_bias, FTrainTensorId cu_seqlens, FTrainTensorId o,
         FTrainTensorId q_rstd, FTrainTensorId k_rstd, FTrainTensorId aqk, FTrainTensorId akk, FTrainTensorId qn,
-        FTrainTensorId kn, FTrainTensorId h, FTrainTensorId state) {
+        FTrainTensorId kn, FTrainTensorId h, FTrainTensorId state, FTrainTensorId initial_state,
+        FTrainTensorId final_state) {
         return PatternOperationNode{OperationKind::kKdaForward,
-                                    detail::kdaTensors({q, k, v, g, beta, a_log, dt_bias, cu_seqlens}),
-                                    detail::kdaTensors({o, q_rstd, k_rstd, aqk, akk, qn, kn, h, state})};
+                                    detail::kdaTensors({q, k, v, g, beta, a_log, dt_bias, cu_seqlens, initial_state}),
+                                    detail::kdaTensors({o, q_rstd, k_rstd, aqk, akk, qn, kn, h, state, final_state})};
     }
 };
 
@@ -78,11 +79,12 @@ class OperationTraits<OperationKind::kKdaBackward> {
         FTrainTensorId a_log, FTrainTensorId dt_bias, FTrainTensorId cu_seqlens, FTrainTensorId q_rstd,
         FTrainTensorId k_rstd, FTrainTensorId aqk, FTrainTensorId akk, FTrainTensorId qn, FTrainTensorId kn,
         FTrainTensorId dq, FTrainTensorId dk, FTrainTensorId dv, FTrainTensorId dg, FTrainTensorId dbeta,
-        FTrainTensorId da_log, FTrainTensorId ddt_bias, FTrainTensorId h, FTrainTensorId state) {
+        FTrainTensorId da_log, FTrainTensorId ddt_bias, FTrainTensorId h, FTrainTensorId state,
+        FTrainTensorId initial_state, FTrainTensorId dht, FTrainTensorId dh0) {
         return PatternOperationNode{OperationKind::kKdaBackward,
                                     detail::kdaTensors({d_o, q, k, v, g, beta, a_log, dt_bias, cu_seqlens, q_rstd,
-                                                        k_rstd, aqk, akk, qn, kn, h, state}),
-                                    detail::kdaTensors({dq, dk, dv, dg, dbeta, da_log, ddt_bias})};
+                                                        k_rstd, aqk, akk, qn, kn, h, state, initial_state, dht}),
+                                    detail::kdaTensors({dq, dk, dv, dg, dbeta, da_log, ddt_bias, dh0})};
     }
 };
 

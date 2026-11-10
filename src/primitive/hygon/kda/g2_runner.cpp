@@ -37,7 +37,8 @@ int g2_fwd_prep_l2n(const void* q, const void* k, const void* v, const void* g_r
                     void* qn_out, void* kn_out, int l2n, hipStream_t s);  // kra P-94: l2n = 0 -> no l2norm
 int g2_fwd_h_v8o(const void* Wn, const void* Kn, const void* Un, const void* Gn, const void* QgA, const void* AqkA,
                  void* O, void* Ob, void* Vn, void* HbN, void* ANv, float scale, int B, int T, int H, const int* seg,
-                 int nseg, const int* ctok, const int* clen, const void* GnRaw, hipStream_t s);
+                 int nseg, const int* ctok, const int* clen, const void* GnRaw, const void* H0, void* Ht,
+                 hipStream_t s);
 int g2_exp2_inplace(float* x, long n, hipStream_t s);  // kra P-52: Gn -> exp2f(Gn) decays
 int g2_kda_gn_all(const float* g, const int* ctok, const int* clen, int H, int NT, float* raw, float* gn, float* gnat,
                   int kp, hipStream_t s);  // kra P-99: to_gn (+ to_gn + exp2 | + gn_kp) in one pass
@@ -50,7 +51,7 @@ int g2_dav(const void* do_, const void* Vn, const void* A, void* dA, void* dVn, 
            int B, int T, int H, const int* ctok, const int* clen, hipStream_t s);
 int g2_dhu_v8b(const void* KgA, const void* Qg, const void* Wb, const void* dOT, const void* dv, const void* Gn,
                void* dv2, void* HbN, void* ANv2, float scale, int B, int T, int H, const int* seg, int nseg,
-               hipStream_t s);
+               const void* DHt, void* DH0, hipStream_t s);
 int g2_wy_s4_split(const void* q_kgb, const void* k, const void* v_vb, const void* v_new, const void* g,
                    const void* beta, const void* A, const void* h, const void* do_, const void* dh, const void* dv,
                    const void* dAqk, void* dq, void* dk, void* dv2, void* dg, void* db, void* dA, void* dwT,
@@ -337,7 +338,8 @@ void forward(const Shape& shape, const ForwardArgs& p, void* workspace, FTrainSt
     // kra P-82 saved-h: with p.saved_h set it emits bN(h) only (MODE 5 = o + h).
     void* hbn = p.state_hbn != nullptr ? p.state_hbn : p.saved_h;
     check(g2_fwd_h_v8o(L.Wn, L.Kn, L.Un, L.Gn, L.QgA, L.AqkA, nullptr, p.o, p.state_vn, hbn, p.state_anv, p.scale, 1,
-                       NT * 64, H, L.tab.seg, nseg, L.tab.ctok, L.tab.clen, nullptr, stream),
+                       NT * 64, H, L.tab.seg, nseg, L.tab.ctok, L.tab.clen, nullptr, p.initial_state,
+                       p.final_state, stream),
           "fwd_h_o");
 }
 
@@ -390,14 +392,14 @@ void backward(const Shape& shape, const BackwardArgs& p, void* workspace, FTrain
           "gn_all");
     if (p1) {
         check(g2_fwd_h_v8o(L.Wn, L.Kn, L.Un, kp ? L.GnNat : L.Gn, nullptr, nullptr, nullptr, nullptr, L.Vn, L.HbN, nullptr, 1.f, 1,
-                           NT * 64, H, L.tab.seg, nseg, nullptr, nullptr, L.GnRaw, stream),
+                           NT * 64, H, L.tab.seg, nseg, nullptr, nullptr, L.GnRaw, p.initial_state, nullptr, stream),
               "fwd_h_bn");
     }
     check(g2_dav(p.d_o, Vn, p.aqk, dA, L.dVn, L.dOT, nullptr /* kra P-20: no aN_do */, p.scale, 1, NT * 64, H,
                  ctok, clen, stream),
           "dav");
     check(g2_dhu_v8b(L.KgA, L.Qn, L.Wb, L.dOT, L.dVn, L.Gn, nullptr, L.HbNdh, L.ANv2, p.scale, 1, NT * 64, H, L.tab.seg,
-                     nseg, stream),
+                     nseg, p.dht, p.dh0, stream),
           "dhu");
     check(g2_wy_s4_split_r(L.kgB, kn, nullptr, ANv, L.g, p.beta, p.akk, HbN, nullptr, L.HbNdh, L.ANv2, dA, L.dq,
                            L.dk, p.dv, L.dg, p.dbeta, L.dAout, L.dwT, L.dbPart, p.scale, NT * 64, H, NT, qn, p.v,

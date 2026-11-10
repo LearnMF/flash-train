@@ -68,6 +68,11 @@ struct ForwardArgs {
     void* state_hbn = nullptr;
     void* state_vn  = nullptr;
     void* state_anv = nullptr;
+    // Optional recurrent-state ports, fp32 [N, H, 128, 128] (key-major, FLA's [N, H, K, V]):
+    // sequence n starts from initial_state[n] (null = zero state) and its state after the last
+    // token goes to final_state[n] (null = not written).
+    const void* initial_state = nullptr;
+    void* final_state         = nullptr;
     float scale;
     float lower_bound;
 };
@@ -101,6 +106,12 @@ struct BackwardArgs {
     const void* state_hbn = nullptr;
     const void* state_vn  = nullptr;
     const void* state_anv = nullptr;
+    // Optional recurrent-state ports, fp32 [N, H, 128, 128] (FLA's [N, H, K, V]): the forward's
+    // initial_state (the state recompute starts from it), the final state's gradient dht (null =
+    // zero) and the initial state's gradient dh0 (null = not written).
+    const void* initial_state = nullptr;
+    const void* dht           = nullptr;
+    void* dh0                 = nullptr;
     float scale;
     float lower_bound;
 };

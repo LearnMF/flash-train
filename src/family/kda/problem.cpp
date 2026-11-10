@@ -146,21 +146,24 @@ std::vector<std::uint64_t> makeKey(const std::vector<Tensor>& ports, const KdaAt
 }  // namespace
 
 KdaForwardProblem::KdaForwardProblem(std::vector<Tensor> ports, KdaAttributes attributes) : attributes_(attributes) {
-    if (ports.size() != kCount) { throw Exception(FTRAIN_STATUS_INVALID_ARGUMENT, "KDA forward needs 17 ports"); }
+    if (ports.size() != kCount) { throw Exception(FTRAIN_STATUS_INVALID_ARGUMENT, "KDA forward needs 19 ports"); }
     shape_ = validateCommon(ports, kQ, kK, kV, kG, kBeta, kALog, kDtBias, kCuSeqlens, kQRstd, kKRstd, kAqk, kAkk,
                             attributes_);
     requireDims(ports, kO, dimsOf(ports, kV), "o");
     requireQkn(ports, kQn, kKn, dimsOf(ports, kQ), attributes_);
     requireStates(ports, kH, kState, shape_, portHasMemory(ports, kCuSeqlens));
+    const Dims recurrent{shape_.seqs, shape_.heads, shape_.key_dim, shape_.value_dim};
+    if (portHasMemory(ports, kInitialState)) { requireDims(ports, kInitialState, recurrent, "initial_state"); }
+    if (portHasMemory(ports, kFinalState)) { requireDims(ports, kFinalState, recurrent, "final_state"); }
     requireDevice(ports, {kQ, kK, kV, kG, kBeta, kALog, kDtBias, kCuSeqlens, kO, kQRstd, kKRstd, kAqk, kAkk, kQn, kKn,
-                          kH, kState});
+                          kH, kState, kInitialState, kFinalState});
     tensors_ = std::move(ports);
 }
 
 std::vector<std::uint64_t> KdaForwardProblem::getProblemKey() const { return makeKey(tensors_, attributes_); }
 
 KdaBackwardProblem::KdaBackwardProblem(std::vector<Tensor> ports, KdaAttributes attributes) : attributes_(attributes) {
-    if (ports.size() != kCount) { throw Exception(FTRAIN_STATUS_INVALID_ARGUMENT, "KDA backward needs 24 ports"); }
+    if (ports.size() != kCount) { throw Exception(FTRAIN_STATUS_INVALID_ARGUMENT, "KDA backward needs 27 ports"); }
     // q / k may be left out when the forward saved qn / kn: the queries and keys are then qn / kn.
     const bool has_qk = portHasMemory(ports, kQ) || portHasMemory(ports, kK);
     if (!has_qk && !portHasMemory(ports, kQn)) {
@@ -184,8 +187,12 @@ KdaBackwardProblem::KdaBackwardProblem(std::vector<Tensor> ports, KdaAttributes 
         requireDims(ports, kDDtBias, dimsOf(ports, kDtBias), "ddt_bias");
     }
     requireStates(ports, kH, kState, shape_, portHasMemory(ports, kCuSeqlens));
+    const Dims recurrent{shape_.seqs, shape_.heads, shape_.key_dim, shape_.value_dim};
+    if (portHasMemory(ports, kInitialState)) { requireDims(ports, kInitialState, recurrent, "initial_state"); }
+    if (portHasMemory(ports, kDht)) { requireDims(ports, kDht, recurrent, "dht"); }
+    if (portHasMemory(ports, kDh0)) { requireDims(ports, kDh0, recurrent, "dh0"); }
     requireDevice(ports, {kDO, kQ,   kK,   kV,  kG,  kBeta, kALog, kDtBias, kCuSeqlens, kQRstd, kKRstd, kAqk,
-                          kAkk, kQn, kKn, kDq, kDk, kDv,   kDg,   kDBeta,  kDALog,     kDDtBias, kH,   kState});
+                          kAkk, kQn, kKn, kDq, kDk, kDv,   kDg,   kDBeta,  kDALog,     kDDtBias, kH,   kState, kInitialState, kDht, kDh0});
     tensors_ = std::move(ports);
 }
 

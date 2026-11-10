@@ -86,7 +86,7 @@ def _save_qkn(needs_bwd, l2norm):
 class _KdaFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, g, beta, a_log, dt_bias, cu_seqlens, scale, lower_bound, l2norm, grad_mode,
-                disable_recompute):
+                disable_recompute, initial_state, output_final_state):
         # A backward follows only when the caller ran with grad mode on (inside forward it is always
         # off, and needs_input_grad stays True under no_grad, e.g. a checkpoint's first forward).
         needs_bwd = grad_mode and any(ctx.needs_input_grad)
@@ -98,28 +98,43 @@ class _KdaFunction(torch.autograd.Function):
         else:   # the caller's choice: True saves h (no backward recurrence), False the minimal set
             save_h, save_qkn, keep = needs_bwd and disable_recompute, needs_bwd and l2norm, False
         save_qkn = save_qkn and q.numel() > 0
-        o, q_rstd, k_rstd, aqk, akk, qn, kn, h, state = _kda_forward(
-            q, k, v, g, beta, a_log, dt_bias, cu_seqlens, scale, lower_bound, gate, l2norm, keep, save_qkn, save_h)
+        o, q_rstd, k_rstd, aqk, akk, qn, kn, h, state, final_state = _kda_forward(
+            q, k, v, g, beta, a_log, dt_bias, cu_seqlens, scale, lower_bound, gate, l2norm, keep, save_qkn, save_h,
+            initial_state=initial_state, output_final_state=output_final_state)
         q_sv, k_sv = (None, None) if save_qkn else (q, k)   # qn / kn replace q / k in the saved set
         ctx.save_for_backward(q_sv, k_sv, v, g, beta, a_log, dt_bias, cu_seqlens, q_rstd, k_rstd, aqk, akk,
-                              qn, kn, h, state)
+                              qn, kn, h, state, initial_state)
         ctx.scale, ctx.lower_bound, ctx.gate, ctx.l2norm = scale, lower_bound, gate, l2norm
-        return o
+        ctx.set_materialize_grads(False)
+        return o, (final_state if output_final_state else None)
 
     @staticmethod
-    def backward(ctx, d_o):
-        q, k, v, g, beta, a_log, dt_bias, cu_seqlens, q_rstd, k_rstd, aqk, akk, qn, kn, h, state = ctx.saved_tensors
-        dq, dk, dv, dg, dbeta, da_log, ddt_bias = _kda_backward(
+    def backward(ctx, d_o, d_ht):
+        (q, k, v, g, beta, a_log, dt_bias, cu_seqlens, q_rstd, k_rstd, aqk, akk, qn, kn, h, state,
+         initial_state) = ctx.saved_tensors
+        want_dh0 = ctx.needs_input_grad[13]
+        if d_o is None:
+            d_o = torch.zeros_like(v)
+        dht = d_ht.float().contiguous() if d_ht is not None else None
+        dq, dk, dv, dg, dbeta, da_log, ddt_bias, dh0 = _kda_backward(
             d_o.contiguous(), q, k, v, g, beta, a_log, dt_bias, cu_seqlens, q_rstd, k_rstd, aqk, akk, qn, kn, h,
-            state, ctx.scale, ctx.lower_bound, ctx.gate, ctx.l2norm)
+            state, ctx.scale, ctx.lower_bound, ctx.gate, ctx.l2norm, initial_state, dht, want_dh0)
         if not ctx.gate:
             da_log = ddt_bias = None
-        return dq, dk, dv, dg, dbeta, da_log, ddt_bias, None, None, None, None, None, None
+        return (dq, dk, dv, dg, dbeta, da_log, ddt_bias, None, None, None, None, None, None,
+                dh0 if want_dh0 else None, None)
 
 
 def kimi_delta_attention(q, k, v, g, beta, *, cu_seqlens=None, scale=None, A_log=None, dt_bias=None,
-                         lower_bound=-5.0, use_qk_l2norm_in_kernel=True, check_decay=True, disable_recompute=None):
-    """KDA forward (differentiable) on the current stream; returns o [T, H, V] (bf16).
+                         lower_bound=-5.0, use_qk_l2norm_in_kernel=True, check_decay=True, disable_recompute=None,
+                         initial_state=None, output_final_state=False):
+    """KDA forward (differentiable) on the current stream; returns o [T, H, V] (bf16), or
+    (o, final_state) with ``output_final_state``.
+
+    ``initial_state``: fp32 [N, H, 128, 128] (key-major, FLA's [N, H, K, V]; N = 1 without
+    cu_seqlens), each sequence's start state instead of zero. ``final_state`` (same layout) is
+    each sequence's state after its last token. Both are differentiable: the backward takes the
+    final state's gradient (dht) and returns the initial state's (dh0).
 
     q, k, v: bf16 [T, H, 128]; beta: post-activation [T, H] (computed in fp32);
     g: bf16 raw gate with ``A_log`` (fp32-able [H]) / ``dt_bias`` ([H, 128] or [H*128]),
@@ -143,20 +158,23 @@ def kimi_delta_attention(q, k, v, g, beta, *, cu_seqlens=None, scale=None, A_log
         # One sequence ([0, T]) is the dense layout: bit-identical, and the dense kernel instances
         # are faster than the packed ones (no host read of cu_seqlens needed to tell).
         cu_seqlens = None if cu_seqlens.numel() == 2 else cu_seqlens.to(device=q.device, dtype=torch.int32).contiguous()
+    if initial_state is not None:
+        initial_state = initial_state.to(device=q.device, dtype=torch.float32).contiguous()
     if A_log is not None:
         if dt_bias is None:
             raise ValueError("kimi_delta_attention: A_log requires dt_bias")
         a32, d32 = A_log.float().contiguous(), dt_bias.float().contiguous()
-        o = _KdaFunction.apply(q, k, v, g.to(torch.bfloat16), beta32, a32, d32, cu_seqlens, float(scale),
-                               float(lower_bound), bool(use_qk_l2norm_in_kernel), torch.is_grad_enabled(),
-                               disable_recompute)
+        o, ht = _KdaFunction.apply(q, k, v, g.to(torch.bfloat16), beta32, a32, d32, cu_seqlens, float(scale),
+                                   float(lower_bound), bool(use_qk_l2norm_in_kernel), torch.is_grad_enabled(),
+                                   disable_recompute, initial_state, bool(output_final_state))
     else:
         g32 = g.float()
         if check_decay and g32.numel() and float(g32.detach().amin()) < DECAY_LOWER_BOUND:
             raise ValueError("kimi_delta_attention: per-token log decay below -5 is outside the supported range")
-        o = _KdaFunction.apply(q, k, v, g32, beta32, None, None, cu_seqlens, float(scale), 0.0,
-                               bool(use_qk_l2norm_in_kernel), torch.is_grad_enabled(), disable_recompute)
-    return o
+        o, ht = _KdaFunction.apply(q, k, v, g32, beta32, None, None, cu_seqlens, float(scale), 0.0,
+                                   bool(use_qk_l2norm_in_kernel), torch.is_grad_enabled(), disable_recompute,
+                                   initial_state, bool(output_final_state))
+    return (o, ht) if output_final_state else o
 
 
 def chunk_kda(q, k, v, g, beta, scale=None, initial_state=None, output_final_state=False,
@@ -216,9 +234,10 @@ def chunk_kda(q, k, v, g, beta, scale=None, initial_state=None, output_final_sta
 
 # ----------------------------------------------------------------------------- reference
 def kda_reference(q, k, v, g, beta, *, cu_seqlens=None, scale=None, A_log=None, dt_bias=None, lower_bound=-5.0,
-                  use_qk_l2norm_in_kernel=True, dtype=torch.float64):
+                  use_qk_l2norm_in_kernel=True, dtype=torch.float64, initial_state=None, output_final_state=False):
     """PyTorch reference of :func:`kimi_delta_attention` (same arguments): the token-by-token
-    recurrence in ``dtype`` (fp64 by default), differentiable. Returns o [T, H, V] in dtype."""
+    recurrence in ``dtype`` (fp64 by default), differentiable. Returns o [T, H, V] in dtype, or
+    (o, final_state [N, H, K, V]) with ``output_final_state``."""
     q, k, v, g = (_thd(t, n).to(dtype) for t, n in ((q, "q"), (k, "k"), (v, "v"), (g, "g")))
     beta = beta.squeeze(0).to(dtype) if beta.dim() == 3 else beta.to(dtype)
     T, H, K = q.shape
@@ -231,15 +250,17 @@ def kda_reference(q, k, v, g, beta, *, cu_seqlens=None, scale=None, A_log=None, 
         g = lower_bound * torch.sigmoid(A_log.to(dtype).exp().view(1, H, 1) * (g + dt_bias.to(dtype).view(1, H, K)))
     alpha = g.exp()
     bounds = [0, T] if cu_seqlens is None else [int(x) for x in cu_seqlens.tolist()]
-    outs = []
-    for s, e in zip(bounds[:-1], bounds[1:]):
-        state = q.new_zeros(H, K, v.shape[-1])
+    outs, finals = [], []
+    for n, (s, e) in enumerate(zip(bounds[:-1], bounds[1:])):
+        state = q.new_zeros(H, K, v.shape[-1]) if initial_state is None else initial_state[n].to(dtype)
         for t in range(s, e):
             state = alpha[t].unsqueeze(-1) * state
             residual = v[t] - torch.einsum("hk,hkv->hv", k[t], state)
             state = state + beta[t].view(H, 1, 1) * k[t].unsqueeze(-1) * residual.unsqueeze(-2)
             outs.append(torch.einsum("hk,hkv->hv", q[t] * scale, state))
-    return torch.stack(outs, 0) if outs else v.new_zeros(0, H, v.shape[-1])
+        finals.append(state)
+    o = torch.stack(outs, 0) if outs else v.new_zeros(0, H, v.shape[-1])
+    return (o, torch.stack(finals, 0)) if output_final_state else o
 
 
 def kda_chunked_reference(q, k, v, g, beta, *, cu_seqlens=None, scale=None, A_log=None, dt_bias=None,

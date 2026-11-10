@@ -41,7 +41,8 @@ struct KdaForwardFamily {
             const FTrainKdaForwardOpId op = pattern.addOperation<OperationKind::kKdaForward>(
                 ports[P::kQ], ports[P::kK], ports[P::kV], ports[P::kG], ports[P::kBeta], ports[P::kALog],
                 ports[P::kDtBias], ports[P::kCuSeqlens], ports[P::kO], ports[P::kQRstd], ports[P::kKRstd],
-                ports[P::kAqk], ports[P::kAkk], ports[P::kQn], ports[P::kKn], ports[P::kH], ports[P::kState]);
+                ports[P::kAqk], ports[P::kAkk], ports[P::kQn], ports[P::kKn], ports[P::kH], ports[P::kState],
+                ports[P::kInitialState], ports[P::kFinalState]);
             return Roles{pattern.buildPattern(), ports, op};
         }();
         return roles;
@@ -83,7 +84,8 @@ struct KdaBackwardFamily {
                 ports[P::kDO], ports[P::kQ], ports[P::kK], ports[P::kV], ports[P::kG], ports[P::kBeta], ports[P::kALog],
                 ports[P::kDtBias], ports[P::kCuSeqlens], ports[P::kQRstd], ports[P::kKRstd], ports[P::kAqk],
                 ports[P::kAkk], ports[P::kQn], ports[P::kKn], ports[P::kDq], ports[P::kDk], ports[P::kDv], ports[P::kDg],
-                ports[P::kDBeta], ports[P::kDALog], ports[P::kDDtBias], ports[P::kH], ports[P::kState]);
+                ports[P::kDBeta], ports[P::kDALog], ports[P::kDDtBias], ports[P::kH], ports[P::kState],
+                ports[P::kInitialState], ports[P::kDht], ports[P::kDh0]);
             return Roles{pattern.buildPattern(), ports, op};
         }();
         return roles;

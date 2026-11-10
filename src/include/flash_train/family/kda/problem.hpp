@@ -45,6 +45,7 @@ inline std::int64_t kdaSavedHElements(const KdaShape& s, bool has_cu) noexcept {
 //   qn, kn [T, H, K] (optional, l2norm_qk only: the l2-normalized q / k the forward saves)
 //   h [kdaSavedHElements(T, H, N, cu)] (optional, opaque saved recurrent state h)
 //   state [kdaStateElements(T, H, N, cu)] (optional, opaque recurrent state; exclusive with h)
+//   initial_state, final_state, dht, dh0 [N, H, K, V] fp32 (optional: per-sequence start / end state and their gradients)
 // and lives in device memory. Optional ports carry null memory when unused (their dims are
 // then ignored): a_log/dt_bias (and their gradients) without gate_in_kernel, cu_seqlens for one
 // sequence, q_rstd/k_rstd without l2norm_qk, qn/kn/h/state when not exchanged, and in the
@@ -87,6 +88,8 @@ class KdaForwardProblem final : public KdaPortSet {
         kKn,
         kH,
         kState,
+        kInitialState,
+        kFinalState,
         kCount
     };
 
@@ -132,6 +135,9 @@ class KdaBackwardProblem final : public KdaPortSet {
         kDDtBias,
         kH,
         kState,
+        kInitialState,
+        kDht,
+        kDh0,
         kCount
     };
 

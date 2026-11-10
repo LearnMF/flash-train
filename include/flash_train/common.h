@@ -333,7 +333,9 @@ FTRAIN_API FTrainStatus ftrainPatternAddGroupedABGemm(FTrainPattern pattern, FTr
  * independent sequences. Ports a Primitive does not use for a call (a_log, dt_bias without
  * gate_in_kernel; cu_seqlens for one sequence; q_rstd, k_rstd without l2norm_qk) take
  * Tensors with null memory. qn, kn, h and state are optional outputs (null memory: not
- * written) the backward can consume instead of recomputing, see FTrainKdaForwardTensors.
+ * written) the backward can consume instead of recomputing; initial_state (optional input) and
+ * final_state (optional output) are the per-sequence start and end states, see
+ * FTrainKdaForwardTensors.
  *
  * @return Status of the operation. All role IDs must belong to pattern.
  */
@@ -343,7 +345,8 @@ FTRAIN_API FTrainStatus ftrainPatternAddKdaForward(FTrainPattern pattern, FTrain
                                                    FTrainTensorId cu_seqlens, FTrainTensorId o, FTrainTensorId q_rstd,
                                                    FTrainTensorId k_rstd, FTrainTensorId aqk, FTrainTensorId akk,
                                                    FTrainTensorId qn, FTrainTensorId kn, FTrainTensorId h,
-                                                   FTrainTensorId state);
+                                                   FTrainTensorId state, FTrainTensorId initial_state,
+                                                   FTrainTensorId final_state);
 
 /**
  * @brief Adds a KDA backward topology operation to a Pattern.
@@ -353,6 +356,8 @@ FTRAIN_API FTrainStatus ftrainPatternAddKdaForward(FTrainPattern pattern, FTrain
  * dbeta, da_log, ddt_bias (da_log/ddt_bias take null memory without gate_in_kernel). h and
  * state (inputs, last) are the forward's optional h / state outputs; null memory makes the
  * backward recompute the recurrent state. With qn/kn given, q/k may take null memory.
+ * initial_state, dht (inputs) and dh0 (output) are the optional recurrent-state ports, see
+ * FTrainKdaBackwardTensors.
  *
  * @return Status of the operation. All role IDs must belong to pattern.
  */
@@ -361,7 +366,8 @@ FTRAIN_API FTrainStatus ftrainPatternAddKdaBackward(
     FTrainTensorId v, FTrainTensorId g, FTrainTensorId beta, FTrainTensorId a_log, FTrainTensorId dt_bias,
     FTrainTensorId cu_seqlens, FTrainTensorId q_rstd, FTrainTensorId k_rstd, FTrainTensorId aqk, FTrainTensorId akk,
     FTrainTensorId qn, FTrainTensorId kn, FTrainTensorId dq, FTrainTensorId dk, FTrainTensorId dv, FTrainTensorId dg,
-    FTrainTensorId dbeta, FTrainTensorId da_log, FTrainTensorId ddt_bias, FTrainTensorId h, FTrainTensorId state);
+    FTrainTensorId dbeta, FTrainTensorId da_log, FTrainTensorId ddt_bias, FTrainTensorId h, FTrainTensorId state,
+    FTrainTensorId initial_state, FTrainTensorId dht, FTrainTensorId dh0);
 
 /* Ops matching. */
 
