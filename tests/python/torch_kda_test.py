@@ -338,15 +338,31 @@ def test_chunk_kda_matches_kimi_delta_attention(B, T, H, cu):
         assert torch.equal(g[name].reshape(rg[name].shape), rg[name]), name
 
 
+def test_chunk_kda_passes_the_states_through():
+    """chunk_kda's initial_state / output_final_state (FLA's [N, H, K, V], or [N, H, V, K] with
+    transpose_state_layout) are kimi_delta_attention's."""
+    x = _fla_inputs(1, 256, 2, seed=7)
+    h0 = torch.randn(1, 2, 128, 128, device="cuda") * 0.1
+    k3 = dict(A_log=x["A_log"], dt_bias=x["dt_bias"], use_qk_l2norm_in_kernel=True, use_gate_in_kernel=True,
+              safe_gate=True, lower_bound=-5.0)
+    args = (x["q"], x["k"], x["v"], x["g"], x["beta"])
+    thd = [t[0] for t in args]
+    ro, rht = ft.kimi_delta_attention(*thd, A_log=x["A_log"], dt_bias=x["dt_bias"], initial_state=h0,
+                                      output_final_state=True)
+    o, ht = ft.chunk_kda(*args, initial_state=h0, output_final_state=True, **k3)
+    assert torch.equal(o[0], ro) and torch.equal(ht, rht)
+    o, ht = ft.chunk_kda(*args, initial_state=h0.transpose(-1, -2), output_final_state=True,
+                         transpose_state_layout=True, **k3)
+    assert torch.equal(o[0], ro) and torch.equal(ht, rht.transpose(-1, -2))
+
+
 def test_chunk_kda_rejects_unsupported_arguments():
     x = _fla_inputs(1, 64, 2, seed=1)
     args = (x["q"], x["k"], x["v"], x["g"], x["beta"])
     k3 = dict(A_log=x["A_log"], dt_bias=x["dt_bias"], use_qk_l2norm_in_kernel=True, use_gate_in_kernel=True,
               safe_gate=True, lower_bound=-5.0)
-    with pytest.raises(NotImplementedError):
-        ft.chunk_kda(*args, output_final_state=True, **k3)
-    with pytest.raises(NotImplementedError):
-        ft.chunk_kda(*args, initial_state=torch.zeros(1, 2, 128, 128, device="cuda"), **k3)
+    with pytest.raises(ValueError):
+        ft.chunk_kda(*args, output_final_state=True, cp_context=object(), **k3)
     with pytest.raises(NotImplementedError):  # FLA's softplus gate (no lower_bound)
         ft.chunk_kda(*args, A_log=x["A_log"], dt_bias=x["dt_bias"], use_gate_in_kernel=True)
     with pytest.raises(TypeError):
