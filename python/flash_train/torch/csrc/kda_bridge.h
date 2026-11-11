@@ -25,6 +25,7 @@ struct KdaBridgeAttributes {
     float lower_bound;
     std::int32_t gate_in_kernel;
     std::int32_t l2norm_qk;
+    std::int32_t cp_phase;
 };
 
 // Elements of the optional state / h ports (ftrainKdaStateElements / ftrainKdaSavedHElements).

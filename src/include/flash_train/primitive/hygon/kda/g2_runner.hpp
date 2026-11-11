@@ -32,6 +32,17 @@ struct Shape {
                                   //   lower_bound * sigmoid(exp(A_log) * (g + dt_bias));
                                   // false: g is the per-token log decay (fp32), as given
 
+    // Chunkwise CP phases of one forward (FTrainKdaAttributes::cp_phase): 0 = the whole forward;
+    // 1 = prep + a state-only recurrence (the local summary); 2 = that recurrence again on the
+    // phase-1 workspace with the value term zeroed (the transition matrix); 3 = the full
+    // recurrence on that workspace. Phases 2 / 3 reuse the prep, so the caller keeps the
+    // workspace and o alive and unchanged since phase 1.
+    int cp_phase = 0;
+
+    bool reusePrep() const noexcept { return cp_phase == 2 || cp_phase == 3; }
+    bool stateOnly() const noexcept { return cp_phase == 1 || cp_phase == 2; }
+    bool zeroU() const noexcept { return cp_phase == 2; }
+
     // Dense: no cu_seqlens and T % 64 == 0 (identity chunk map). Otherwise the varlen path:
     // chunk tables are built on the device with capacity ceil(T / 64) + N chunks.
     bool isDense() const noexcept { return !has_cu_seqlens && tokens % 64 == 0; }

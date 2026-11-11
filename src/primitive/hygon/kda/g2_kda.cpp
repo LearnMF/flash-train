@@ -74,6 +74,7 @@ kda_g2::Shape makeShape(const KdaShape& shape, const KdaAttributes& attributes, 
     s.has_cu_seqlens = has_cu;
     s.l2norm_qk      = attributes.isL2NormQk();
     s.gate_in_kernel = attributes.isGateInKernel();
+    s.cp_phase       = attributes.getCpPhase();
     return s;
 }
 

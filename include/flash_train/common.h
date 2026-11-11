@@ -155,6 +155,16 @@ typedef struct {
     float lower_bound;
     int32_t gate_in_kernel;
     int32_t l2norm_qk;
+    /* Chunkwise context-parallel phases of one forward, for the local state summary a CP rank
+       needs before its h0 is known (0 = the whole forward, the only value a non-CP caller uses):
+       1 -- the block-local preprocessing plus a state-only recurrence (no o), leaving its
+            intermediates in the workspace; final_state receives the rank's state from h0 = 0.
+       2 -- that recurrence again on the phase-1 workspace, with the value term zeroed, so
+            final_state receives the rank's 128x128 transition matrix (initial_state = identity).
+       3 -- the full recurrence on the same workspace, writing o from the merged h0.
+       Phases 2 and 3 skip the preprocessing, so the caller must keep the workspace and o (the
+       preprocessing stages one hand-off there) unchanged since phase 1, with the same inputs. */
+    int32_t cp_phase;
 } FTrainKdaAttributes;
 
 /** @} */

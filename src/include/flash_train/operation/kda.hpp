@@ -21,6 +21,7 @@ class KdaAttributes final {
     float getLowerBound() const noexcept { return attributes_.lower_bound; }
     bool isGateInKernel() const noexcept { return attributes_.gate_in_kernel != 0; }
     bool isL2NormQk() const noexcept { return attributes_.l2norm_qk != 0; }
+    int getCpPhase() const noexcept { return attributes_.cp_phase; }
 
   private:
     FTrainKdaAttributes attributes_;

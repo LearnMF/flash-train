@@ -49,7 +49,7 @@ FTrainStorageView makeKdaView(const KdaBridgeView& v) {
 }
 
 FTrainKdaAttributes makeKdaAttributes(const KdaBridgeAttributes& a) {
-    return FTrainKdaAttributes{a.scale, a.lower_bound, a.gate_in_kernel, a.l2norm_qk};
+    return FTrainKdaAttributes{a.scale, a.lower_bound, a.gate_in_kernel, a.l2norm_qk, a.cp_phase};
 }
 
 template<typename Tensors, std::size_t N, typename Query, typename Exec>
