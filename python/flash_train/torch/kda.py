@@ -285,13 +285,17 @@ class _KdaCpFunction(torch.autograd.Function):
         H, K, V = q.shape[1], q.shape[2], v.shape[2]
         if K != V:
             raise NotImplementedError("chunk_kda: cp_context needs K == V")
-        world, rank = dist.get_world_size(group=group), dist.get_rank(group=group)
         args = (q, k, v, g, beta, a_log, dt_bias, cu_seqlens)
         base = dict(scale=scale, lower_bound=lower_bound, gate_in_kernel=gate, l2norm_qk=l2norm)
-        # Phase 1: the preprocessing (which phases 2 and 3 reuse) plus a state-only recurrence.
-        f1 = _kda_forward(*args, **base, save_qkn=save_qkn, output_final_state=True, cp_phase=1)
+        # Phase 1: the preprocessing (which phases 2 and 3 reuse) plus a state-only recurrence --
+        # or phase 4, the preprocessing alone, on the last rank, whose summary no rank reads.
+        world, rank = dist.get_world_size(group=group), dist.get_rank(group=group)
+        wants_summary = rank < world - 1
+        f1 = _kda_forward(*args, **base, save_qkn=save_qkn, output_final_state=wants_summary,
+                          cp_phase=1 if wants_summary else 4)
         o_buf, q_rstd, k_rstd, aqk, akk, qn, kn = f1[0], f1[1], f1[2], f1[3], f1[4], f1[5], f1[6]
-        s_loc, ws = f1[9], f1[10]
+        ws = f1[10]
+        s_loc = f1[9] if wants_summary else q.new_zeros(1, H, K, V, dtype=torch.float32)
         # Phase 2: the transition matrix, only on the ranks a later rank composes it from (the
         # first summary of a composition multiplies a zero state, the last rank's is never read).
         reuse = dict(cp_workspace=ws, cp_out=o_buf)
@@ -329,14 +333,19 @@ class _KdaCpFunction(torch.autograd.Function):
                 saved_h, state)
         base = dict(scale=ctx.scale, lower_bound=ctx.lower_bound, gate_in_kernel=ctx.gate, l2norm_qk=ctx.l2norm,
                     initial_state=h0)
-        # Phase 1: the preprocessing plus the state recurrence from a zero dht -> this rank's D.
-        b1 = _kda_backward(*args, **base, dht=None, output_dh0=True, cp_phase=1)
-        d_loc, ws, dqk = b1[7], b1[8], b1[9]
+        # Phase 1: the preprocessing plus the state recurrence from a zero dht -> this rank's D --
+        # or phase 4, the preprocessing alone, on the first rank, whose D no rank reads.
         rank, world = ctx.rank, ctx.world
+        wants_summary = rank > 0
+        b1 = _kda_backward(*args, **base, dht=None, output_dh0=wants_summary,
+                           cp_phase=1 if wants_summary else 4)
+        ws, dqk = b1[8], b1[9]
         K = gathered.shape[2]
-        dgath = d_loc.new_empty(world, *d_loc.shape[1:])
-        dist.all_gather_into_tensor(dgath, d_loc[0].contiguous(), group=ctx.group)
-        x = d_loc.new_zeros(d_loc.shape[1:])
+        shape = (gathered.shape[1], K, gathered.shape[3] - K)
+        d_loc = b1[7][0] if wants_summary else gathered.new_zeros(shape)
+        dgath = gathered.new_empty(world, *shape)
+        dist.all_gather_into_tensor(dgath, d_loc.contiguous(), group=ctx.group)
+        x = gathered.new_zeros(shape)
         for j in range(world - 1, rank, -1):   # dht_r = M_{r+1}^T dht_{r+1} + D_{r+1}
             x = torch.matmul(gathered[j, ..., :K].transpose(-1, -2), x) + dgath[j]
         dht = None if rank == world - 1 else x.unsqueeze(0).contiguous()

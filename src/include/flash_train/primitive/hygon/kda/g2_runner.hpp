@@ -35,12 +35,14 @@ struct Shape {
     // Chunkwise CP phases of one forward (FTrainKdaAttributes::cp_phase): 0 = the whole forward;
     // 1 = prep + a state-only recurrence (the local summary); 2 = that recurrence again on the
     // phase-1 workspace with the value term zeroed (the transition matrix); 3 = the full
-    // recurrence on that workspace. Phases 2 / 3 reuse the prep, so the caller keeps the
-    // workspace and o alive and unchanged since phase 1.
+    // recurrence on that workspace; 4 = the prep alone, for a rank whose summary no later rank
+    // reads. Phases 2 / 3 reuse the prep, so the caller keeps the workspace and o alive and
+    // unchanged since phase 1 (or 4).
     int cp_phase = 0;
 
     bool reusePrep() const noexcept { return cp_phase == 2 || cp_phase == 3; }
     bool stateOnly() const noexcept { return cp_phase == 1 || cp_phase == 2; }
+    bool prepOnly() const noexcept { return cp_phase == 4; }
     bool zeroU() const noexcept { return cp_phase == 2; }
 
     // Dense: no cu_seqlens and T % 64 == 0 (identity chunk map). Otherwise the varlen path:

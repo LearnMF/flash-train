@@ -130,7 +130,7 @@ std::vector<at::Tensor> kdaForward(const at::Tensor& q, const at::Tensor& k, con
                                    int64_t cp_phase, const std::optional<at::Tensor>& cp_workspace,
                                    const std::optional<at::Tensor>& cp_out) {
     TORCH_CHECK(q.dim() == 3 && v.dim() == 3, "kda: q/k/v must be [T, H, D]");
-    TORCH_CHECK(cp_phase >= 0 && cp_phase <= 3, "kda: cp_phase must be 0..3");
+    TORCH_CHECK(cp_phase >= 0 && cp_phase <= 4, "kda: cp_phase must be 0..4");
     TORCH_CHECK(!(keep_state && save_h), "kda: keep_state and save_h are exclusive");
     const int64_t T = q.size(0), H = q.size(1);
     // The prep stages one hand-off in o, so the phases that reuse it get the same buffer back.
@@ -184,7 +184,8 @@ std::vector<at::Tensor> kdaBackward(const at::Tensor& d_o, const std::optional<a
     const at::Tensor& qs = has_qk ? *q : *qn;  // the [T, H, K] shape and options of q / k
     // dq | dk as one buffer: with qn / kn saved the backward stages its fp32 gate scratch there
     // (it would otherwise sit in the workspace beside the two idle outputs).
-    TORCH_CHECK(cp_phase == 0 || cp_phase == 1 || cp_phase == 3, "kda: backward cp_phase must be 0, 1 or 3");
+    TORCH_CHECK(cp_phase == 0 || cp_phase == 1 || cp_phase == 3 || cp_phase == 4,
+                "kda: backward cp_phase must be 0, 1, 3 or 4");
     std::vector<int64_t> dqk_shape = {2};
     dqk_shape.insert(dqk_shape.end(), qs.sizes().begin(), qs.sizes().end());
     auto fopt = qs.options().dtype(at::kFloat);

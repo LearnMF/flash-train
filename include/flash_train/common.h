@@ -161,7 +161,9 @@ typedef struct {
             intermediates in the workspace; final_state receives the rank's state from h0 = 0.
        2 -- that recurrence again on the phase-1 workspace, with the value term zeroed, so
             final_state receives the rank's 128x128 transition matrix (initial_state = identity).
-       3 -- the full recurrence on the same workspace, writing o from the merged h0.
+       3 -- the full recurrence on the same workspace, writing o from the merged h0;
+       4 -- the preprocessing alone, for a rank whose summary no other rank reads (the last rank
+            in the forward, the first in the backward).
        Phases 2 and 3 skip the preprocessing, so the caller must keep the workspace and o (the
        preprocessing stages one hand-off there) unchanged since phase 1, with the same inputs. */
     int32_t cp_phase;
