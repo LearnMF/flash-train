@@ -252,6 +252,8 @@ Tables takeTables(Arena& arena, const Shape& shape, const Sizes& z) {
 struct ForwardLayout {
     Tables tab;
     void *g, *Wn, *Kn, *Un, *QgA, *AqkA, *R, *Gn;
+    void* Uz = nullptr;  // CP phases: phase 2 zeroes it and runs on it instead of Un; appended last
+                         // so the regions the phases share keep their offsets
 };
 
 ForwardLayout layoutForward(const Shape& shape, void* base, std::uint64_t* used) {
@@ -270,6 +272,7 @@ ForwardLayout layoutForward(const Shape& shape, void* base, std::uint64_t* used)
     L.AqkA = a.take(z.CH * 4096 * 2);
     L.R    = a.take(z.CH * 5120 * 4);
     L.Gn   = a.take(z.CH * 128 * 4);
+    if (shape.cp_phase != 0) { L.Uz = a.take(blk); }  // every CP phase: one workspace for all of them
     if (used != nullptr) { *used = a.used(); }
     return L;
 }
@@ -370,11 +373,13 @@ void forward(const Shape& shape, const ForwardArgs& p, void* workspace, FTrainSt
     const ForwardLayout L = layoutForward(shape, workspace, nullptr);
     const int T = static_cast<int>(z.T), H = static_cast<int>(z.H), NT = static_cast<int>(z.NT);
     const int nseg = shape.isDense() ? 1 : static_cast<int>(z.N);
-    if (!shape.isDense()) {
+    if (!shape.isDense() && !shape.reusePrep()) {
         check(g2_kda_tables(p.cu_seqlens, static_cast<int>(z.N), T, NT, L.tab.ctok, L.tab.clen, L.tab.seg, stream),
               "tables");
     }
-    if (g2UsePrep(shape)) {  // R4: [l2norm +] gate + fwd_intra2 + to_gn in two kernels, bitwise the X1 chain
+    if (shape.reusePrep()) {
+        // The phase-1 call left the prep's hand-offs (and the chunk tables) in the workspace.
+    } else if (g2UsePrep(shape)) {  // R4: [l2norm +] gate + fwd_intra2 + to_gn in two kernels, bitwise the X1 chain
         // kra P-77b: with p.qn / p.kn set, prep_a also writes the l2-normalized q / k for the backward.
         // kra P-94: without in-kernel l2norm the prep reads the (already normalized) q / k as qn / kn.
         const bool l2 = shape.l2norm_qk;
@@ -407,7 +412,16 @@ void forward(const Shape& shape, const ForwardArgs& p, void* workspace, FTrainSt
     // (bN(h), v_new native and A-natural) -- bit-identical to the backward's own recompute.
     // kra P-82 saved-h: with p.saved_h set it emits bN(h) only (MODE 5 = o + h).
     void* hbn = p.state_hbn != nullptr ? p.state_hbn : p.saved_h;
-    check(g2_fwd_h_v8o(L.Wn, L.Kn, L.Un, L.Gn, L.QgA, L.AqkA, nullptr, p.o, p.state_vn, hbn, p.state_anv, p.scale, 1,
+    // CP summary phases: no o (and no bN state), so the recurrence only carries the state. Phase
+    // 2 feeds it a zeroed value term, which turns the state it carries into the transition matrix.
+    const void* un = L.Un;
+    if (shape.zeroU()) {
+        check(hipMemsetAsync(L.Uz, 0, z.CH * 8192 * 2, static_cast<hipStream_t>(stream)) == hipSuccess ? 0 : -1,
+              "u_zeros");
+        un = L.Uz;
+    }
+    void* ob = shape.stateOnly() ? nullptr : p.o;
+    check(g2_fwd_h_v8o(L.Wn, L.Kn, un, L.Gn, L.QgA, L.AqkA, nullptr, ob, p.state_vn, hbn, p.state_anv, p.scale, 1,
                        NT * 64, H, L.tab.seg, nseg, L.tab.ctok, L.tab.clen, nullptr, p.initial_state,
                        p.final_state, stream),
           "fwd_h_o");
@@ -423,14 +437,22 @@ void backward(const Shape& shape, const BackwardArgs& p, void* workspace, FTrain
     const int T = static_cast<int>(z.T), H = static_cast<int>(z.H), NT = static_cast<int>(z.NT);
     const int nseg  = shape.isDense() ? 1 : static_cast<int>(z.N);
     const int *ctok = L.tab.ctok, *clen = L.tab.clen;
-    if (!shape.isDense()) {
+    // CP phases (as in the forward): 1 = everything up to the state recurrence, which runs from a
+    // zero dht and writes dh0 -- the rank's local reverse summary; 3 = the recurrence again from
+    // the merged dht on the same workspace, then the input gradients. The caller keeps the
+    // workspace and the gradient buffers (which stage the preprocessing's hand-offs) across both.
+    const bool reuse = shape.reusePrep(), summary = shape.stateOnly();
+    if (!shape.isDense() && !reuse) {
         check(g2_kda_tables(p.cu_seqlens, static_cast<int>(z.N), T, NT, L.tab.ctok, L.tab.clen, L.tab.seg, stream),
               "tables");
     }
     void* dA       = p.dg;  // staged: fp32 [T, H, 64] fits g's-dtype [T, H, 128]; dead before the tail writes dg
     const void* qn = p.q;
     const void* kn = p.k;
-    if (p.qn != nullptr) {  // kra P-77b: the forward saved qn / kn -> no l2n_apply
+    if (reuse && p.qn == nullptr && shape.l2norm_qk) {   // phase 1 staged them in dq | dk
+        qn = p.dq;
+        kn = p.dk;
+    } else if (p.qn != nullptr) {  // kra P-77b: the forward saved qn / kn -> no l2n_apply
         qn = p.qn;
         kn = p.kn;
     } else if (shape.l2norm_qk) {  // V1: bf16(x * rstd) from the saved rstd == the forward's qn/kn bit for bit
@@ -439,18 +461,22 @@ void backward(const Shape& shape, const BackwardArgs& p, void* workspace, FTrain
         qn = p.dq;
         kn = p.dk;
     }
-    check(g2_head_gate(p.g, shape.gate_in_kernel ? p.a_log : nullptr, shape.gate_in_kernel ? p.dt_bias : nullptr, L.g,
-                       p.lower_bound, kRcpLn2, shape.gate_in_kernel ? 1 : 0, NT, H, ctok, clen, stream),
-          "gate");
-    // R5 keep-state: the forward handed over the B2 state -> wu skips Wn/Un/Kn (fwd_h_bn's inputs
-    // only) and the bN recompute does not run.  kra P-82 saved-h: the forward handed over h only ->
-    // wu also skips Wn/Un/Kn and forms v_new = bf_rne(u - W h) into Vn; no recompute either.
     const bool kept  = p.state_hbn != nullptr;  // == shape.has_state (the workspace was laid out for it)
     const bool hsave = !kept && p.saved_h != nullptr;  // == shape.has_saved_h
     const bool p1    = !kept && !hsave;                // wu emits the recompute's Wn/Un/Kn
     const void* Vn   = kept ? p.state_vn : L.Vn;
     const void* HbN  = kept ? p.state_hbn : (hsave ? p.saved_h : L.HbN);
     const void* ANv  = kept ? p.state_anv : nullptr;  // kra P-22a: s4b rebuilds aN(v_new) from Vn
+    // kra P-938va (gfx938): dav re-emits the workspace v_new in A form in place, s4b reads it without its C -> A
+    // transpose.  Not on the kept-state route (state_vn is retained; s4b reads state_anv there).
+    const bool vna = !kept && g2Vna();
+    if (!reuse) {
+    check(g2_head_gate(p.g, shape.gate_in_kernel ? p.a_log : nullptr, shape.gate_in_kernel ? p.dt_bias : nullptr, L.g,
+                       p.lower_bound, kRcpLn2, shape.gate_in_kernel ? 1 : 0, NT, H, ctok, clen, stream),
+          "gate");
+    // R5 keep-state: the forward handed over the B2 state -> wu skips Wn/Un/Kn (fwd_h_bn's inputs
+    // only) and the bN recompute does not run.  kra P-82 saved-h: the forward handed over h only ->
+    // wu also skips Wn/Un/Kn and forms v_new = bf_rne(u - W h) into Vn; no recompute either.
     check(g2_wu(kn, p.v, qn, p.beta, p.akk, L.g, p1 ? L.Wn : nullptr, L.Wb, p1 ? L.Un : nullptr, L.KgA,
                 p1 ? L.Kn : nullptr, L.Qn, L.kgB, nullptr /* kra P-17: no vB */, 1, NT * 64, H, ctok, clen,
                 hsave ? p.saved_h : nullptr, hsave ? L.Vn : nullptr, stream),
@@ -465,15 +491,14 @@ void backward(const Shape& shape, const BackwardArgs& p, void* workspace, FTrain
                            NT * 64, H, L.tab.seg, nseg, nullptr, nullptr, L.GnRaw, p.initial_state, nullptr, stream),
               "fwd_h_bn");
     }
-    // kra P-938va (gfx938): dav re-emits the workspace v_new in A form in place, s4b reads it without its C -> A
-    // transpose.  Not on the kept-state route (state_vn is retained; s4b reads state_anv there).
-    const bool vna = !kept && g2Vna();
     check(g2_dav(p.d_o, Vn, p.aqk, dA, L.dVn, L.dOT, nullptr /* kra P-20: no aN_do */, p.scale, 1, NT * 64, H,
                  ctok, clen, vna ? const_cast<void*>(Vn) : nullptr, stream),
           "dav");
+    }  // !reuse
     check(g2_dhu_v8b(L.KgA, L.Qn, L.Wb, L.dOT, L.dVn, L.Gn, nullptr, L.HbNdh, L.ANv2, p.scale, 1, NT * 64, H, L.tab.seg,
                      nseg, p.dht, p.dh0, stream),
           "dhu");
+    if (summary) { return; }  // the summary phase stops at the recurrence: dh0 is its only output
     // kra P-938q: gfx938 without in-kernel l2norm -- s4b writes the final bf16 dq / dk, bwd_tail skips its cast
     const bool s4bq = g2S4bBf16(shape);
     check(g2_wy_s4_split_r2(L.kgB, kn, nullptr, ANv, L.g, p.beta, p.akk, HbN, nullptr, L.HbNdh, L.ANv2, dA, L.dq,

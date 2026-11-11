@@ -94,18 +94,27 @@ KdaBridgeView kdaView(const std::optional<at::Tensor>& t) {
 }
 
 template<typename Call>
-void runKda(Call call, const std::vector<KdaBridgeView>& views, KdaBridgeAttributes attributes, const at::Tensor& like,
-            const char* name) {
+at::Tensor runKda(Call call, const std::vector<KdaBridgeView>& views, KdaBridgeAttributes attributes,
+                  const at::Tensor& like, const char* name, const std::optional<at::Tensor>& reuse_workspace) {
     std::uint64_t bytes  = 0;
     const char* message  = "";
     void* stream         = currentStream();
     unsigned char status = call(views.data(), attributes, nullptr, 0, &bytes, stream, &message);
     TORCH_CHECK(status == 0, name, " workspace query failed (status ", static_cast<unsigned int>(status),
                 "): ", message);
-    // The workspace comes from torch's caching allocator on the current stream.
-    at::Tensor workspace = torch::empty({static_cast<int64_t>(bytes)}, like.options().dtype(at::kByte));
+    // The workspace comes from torch's caching allocator on the current stream; a CP phase that
+    // reuses the preprocessing is handed the workspace of the phase that produced it.
+    at::Tensor workspace;
+    if (reuse_workspace.has_value() && reuse_workspace->defined()) {
+        workspace = *reuse_workspace;
+        TORCH_CHECK(static_cast<std::uint64_t>(workspace.numel()) >= bytes, name, " needs a ", bytes,
+                    "-byte workspace, got ", workspace.numel());
+    } else {
+        workspace = torch::empty({static_cast<int64_t>(bytes)}, like.options().dtype(at::kByte));
+    }
     status = call(views.data(), attributes, bytes ? workspace.data_ptr() : nullptr, bytes, nullptr, stream, &message);
     TORCH_CHECK(status == 0, name, " failed (status ", static_cast<unsigned int>(status), "): ", message);
+    return workspace;
 }
 
 // o, q_rstd, k_rstd, aqk, akk, qn, kn, h, state. q_rstd/k_rstd are empty without l2norm_qk; the
@@ -117,11 +126,15 @@ std::vector<at::Tensor> kdaForward(const at::Tensor& q, const at::Tensor& k, con
                                    const std::optional<at::Tensor>& dt_bias,
                                    const std::optional<at::Tensor>& cu_seqlens, double scale, double lower_bound,
                                    bool gate_in_kernel, bool l2norm_qk, bool keep_state, bool save_qkn, bool save_h,
-                                   const std::optional<at::Tensor>& initial_state, bool output_final_state) {
+                                   const std::optional<at::Tensor>& initial_state, bool output_final_state,
+                                   int64_t cp_phase, const std::optional<at::Tensor>& cp_workspace,
+                                   const std::optional<at::Tensor>& cp_out) {
     TORCH_CHECK(q.dim() == 3 && v.dim() == 3, "kda: q/k/v must be [T, H, D]");
+    TORCH_CHECK(cp_phase >= 0 && cp_phase <= 3, "kda: cp_phase must be 0..3");
     TORCH_CHECK(!(keep_state && save_h), "kda: keep_state and save_h are exclusive");
     const int64_t T = q.size(0), H = q.size(1);
-    at::Tensor o      = torch::empty_like(v);
+    // The prep stages one hand-off in o, so the phases that reuse it get the same buffer back.
+    at::Tensor o = cp_out.has_value() && cp_out->defined() ? *cp_out : torch::empty_like(v);
     auto fopt         = q.options().dtype(at::kFloat);
     at::Tensor q_rstd = l2norm_qk ? torch::empty({T, H}, fopt) : torch::empty({0}, fopt);
     at::Tensor k_rstd = l2norm_qk ? torch::empty({T, H}, fopt) : torch::empty({0}, fopt);
@@ -143,11 +156,12 @@ std::vector<at::Tensor> kdaForward(const at::Tensor& q, const at::Tensor& k, con
         kdaView(dt_bias), kdaView(cu_seqlens), kdaView(o), kdaView(q_rstd), kdaView(k_rstd), kdaView(aqk),
         kdaView(akk), kdaView(qn),     kdaView(kn),     kdaView(h),   kdaView(state),
         kdaView(initial_state), kdaView(final_state)};
-    runKda(flash_train_torch::callKdaForward, views,
-           KdaBridgeAttributes{static_cast<float>(scale), static_cast<float>(lower_bound), gate_in_kernel ? 1 : 0,
-                               l2norm_qk ? 1 : 0},
-           q, "ftrainKdaForward");
-    return {o, q_rstd, k_rstd, aqk, akk, qn, kn, h, state, final_state};
+    at::Tensor workspace = runKda(
+        flash_train_torch::callKdaForward, views,
+        KdaBridgeAttributes{static_cast<float>(scale), static_cast<float>(lower_bound), gate_in_kernel ? 1 : 0,
+                            l2norm_qk ? 1 : 0, static_cast<std::int32_t>(cp_phase)},
+        q, "ftrainKdaForward", cp_workspace);
+    return {o, q_rstd, k_rstd, aqk, akk, qn, kn, h, state, final_state, workspace};
 }
 
 // dq, dk, dv, dg, dbeta, da_log, ddt_bias (the last two are empty without gate_in_kernel). q / k
@@ -162,20 +176,32 @@ std::vector<at::Tensor> kdaBackward(const at::Tensor& d_o, const std::optional<a
                                     const std::optional<at::Tensor>& h, const std::optional<at::Tensor>& state,
                                     double scale, double lower_bound, bool gate_in_kernel, bool l2norm_qk,
                                     const std::optional<at::Tensor>& initial_state,
-                                    const std::optional<at::Tensor>& dht, bool output_dh0) {
+                                    const std::optional<at::Tensor>& dht, bool output_dh0, int64_t cp_phase,
+                                    const std::optional<at::Tensor>& cp_workspace,
+                                    const std::optional<std::vector<at::Tensor>>& cp_outs) {
     const bool has_qk = q.has_value() && q->defined() && q->numel() > 0;
     TORCH_CHECK(has_qk || (qn.has_value() && qn->defined() && qn->numel() > 0), "kda: backward needs q/k or qn/kn");
     const at::Tensor& qs = has_qk ? *q : *qn;  // the [T, H, K] shape and options of q / k
     // dq | dk as one buffer: with qn / kn saved the backward stages its fp32 gate scratch there
     // (it would otherwise sit in the workspace beside the two idle outputs).
+    TORCH_CHECK(cp_phase == 0 || cp_phase == 1 || cp_phase == 3, "kda: backward cp_phase must be 0, 1 or 3");
     std::vector<int64_t> dqk_shape = {2};
     dqk_shape.insert(dqk_shape.end(), qs.sizes().begin(), qs.sizes().end());
-    at::Tensor dqk = torch::empty(dqk_shape, qs.options());
-    at::Tensor dq = dqk[0], dk = dqk[1], dv = torch::empty_like(v);
-    at::Tensor dg = torch::empty_like(g), dbeta = torch::empty_like(beta);
-    auto fopt                              = qs.options().dtype(at::kFloat);
-    at::Tensor da_log                      = gate_in_kernel ? torch::empty_like(*a_log) : torch::empty({0}, fopt);
-    at::Tensor ddt_bias                    = gate_in_kernel ? torch::empty_like(*dt_bias) : torch::empty({0}, fopt);
+    auto fopt = qs.options().dtype(at::kFloat);
+    // The preprocessing stages hand-offs in the gradient buffers, so the phase that reuses it
+    // writes its gradients into the buffers of the phase that produced them.
+    const bool reuse_outs = cp_outs.has_value() && !cp_outs->empty();
+    TORCH_CHECK(!reuse_outs || cp_outs->size() == 6,
+                "kda: cp_outs must be (dqk, dv, dg, dbeta, da_log, ddt_bias)");
+    at::Tensor dqk = reuse_outs ? (*cp_outs)[0] : torch::empty(dqk_shape, qs.options());
+    at::Tensor dq = dqk[0], dk = dqk[1];
+    at::Tensor dv       = reuse_outs ? (*cp_outs)[1] : torch::empty_like(v);
+    at::Tensor dg       = reuse_outs ? (*cp_outs)[2] : torch::empty_like(g);
+    at::Tensor dbeta    = reuse_outs ? (*cp_outs)[3] : torch::empty_like(beta);
+    at::Tensor da_log   = reuse_outs ? (*cp_outs)[4]
+                                     : (gate_in_kernel ? torch::empty_like(*a_log) : torch::empty({0}, fopt));
+    at::Tensor ddt_bias = reuse_outs ? (*cp_outs)[5]
+                                     : (gate_in_kernel ? torch::empty_like(*dt_bias) : torch::empty({0}, fopt));
     const bool has_cu = cu_seqlens.has_value() && cu_seqlens->defined();
     const int64_t N   = has_cu ? cu_seqlens->numel() - 1 : 1;
     at::Tensor dh0    = output_dh0 ? torch::empty({N, qs.size(1), qs.size(2), v.size(2)}, fopt) : torch::empty({0}, fopt);
@@ -185,11 +211,12 @@ std::vector<at::Tensor> kdaBackward(const at::Tensor& d_o, const std::optional<a
         kdaView(akk),     kdaView(qn),         kdaView(kn),     kdaView(dq),     kdaView(dk),    kdaView(dv),
         kdaView(dg),      kdaView(dbeta),      kdaView(da_log), kdaView(ddt_bias), kdaView(h),   kdaView(state),
         kdaView(initial_state), kdaView(dht), kdaView(dh0)};
-    runKda(flash_train_torch::callKdaBackward, views,
-           KdaBridgeAttributes{static_cast<float>(scale), static_cast<float>(lower_bound), gate_in_kernel ? 1 : 0,
-                               l2norm_qk ? 1 : 0},
-           qs, "ftrainKdaBackward");
-    return {dq, dk, dv, dg, dbeta, da_log, ddt_bias, dh0};
+    at::Tensor workspace = runKda(
+        flash_train_torch::callKdaBackward, views,
+        KdaBridgeAttributes{static_cast<float>(scale), static_cast<float>(lower_bound), gate_in_kernel ? 1 : 0,
+                            l2norm_qk ? 1 : 0, static_cast<std::int32_t>(cp_phase)},
+        qs, "ftrainKdaBackward", cp_workspace);
+    return {dq, dk, dv, dg, dbeta, da_log, ddt_bias, dh0, workspace, dqk};
 }
 
 }  // namespace
@@ -199,16 +226,18 @@ PYBIND11_MODULE(_flash_train_torch, m) {
     m.def("gemm", &gemm, "d = alpha * (a @ b) + beta * c on the current stream", py::arg("a"), py::arg("b"),
           py::arg("c") = std::nullopt, py::arg("alpha") = 1.0, py::arg("beta") = 0.0);
     m.def("kda_forward", &kdaForward,
-          "KDA forward on the current stream -> (o, q_rstd, k_rstd, aqk, akk, qn, kn, h, state, final_state)", py::arg("q"),
+          "KDA forward on the current stream -> (o, q_rstd, k_rstd, aqk, akk, qn, kn, h, state, final_state, workspace)", py::arg("q"),
           py::arg("k"), py::arg("v"), py::arg("g"), py::arg("beta"), py::arg("a_log"), py::arg("dt_bias"),
           py::arg("cu_seqlens"), py::arg("scale"), py::arg("lower_bound"), py::arg("gate_in_kernel"),
           py::arg("l2norm_qk"), py::arg("keep_state") = false, py::arg("save_qkn") = false, py::arg("save_h") = false,
-          py::arg("initial_state") = std::nullopt, py::arg("output_final_state") = false);
+          py::arg("initial_state") = std::nullopt, py::arg("output_final_state") = false, py::arg("cp_phase") = 0,
+          py::arg("cp_workspace") = std::nullopt, py::arg("cp_out") = std::nullopt);
     m.def("kda_backward", &kdaBackward,
-          "KDA backward on the current stream -> (dq, dk, dv, dg, dbeta, da_log, ddt_bias, dh0)", py::arg("d_o"),
+          "KDA backward on the current stream -> (dq, dk, dv, dg, dbeta, da_log, ddt_bias, dh0, workspace, dqk)", py::arg("d_o"),
           py::arg("q"), py::arg("k"), py::arg("v"), py::arg("g"), py::arg("beta"), py::arg("a_log"), py::arg("dt_bias"),
           py::arg("cu_seqlens"), py::arg("q_rstd"), py::arg("k_rstd"), py::arg("aqk"), py::arg("akk"), py::arg("qn"),
           py::arg("kn"), py::arg("h"), py::arg("state"), py::arg("scale"), py::arg("lower_bound"),
           py::arg("gate_in_kernel"), py::arg("l2norm_qk"), py::arg("initial_state") = std::nullopt,
-          py::arg("dht") = std::nullopt, py::arg("output_dh0") = false);
+          py::arg("dht") = std::nullopt, py::arg("output_dh0") = false, py::arg("cp_phase") = 0,
+          py::arg("cp_workspace") = std::nullopt, py::arg("cp_outs") = std::nullopt);
 }
