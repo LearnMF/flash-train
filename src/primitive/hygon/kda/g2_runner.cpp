@@ -411,6 +411,7 @@ void forward(const Shape& shape, const ForwardArgs& p, void* workspace, FTrainSt
     // R5 keep-state: with p.state_* set, the recurrence also emits the backward's B2 state
     // (bN(h), v_new native and A-natural) -- bit-identical to the backward's own recompute.
     // kra P-82 saved-h: with p.saved_h set it emits bN(h) only (MODE 5 = o + h).
+    if (shape.prepOnly()) { return; }  // the summary of this rank is never read
     void* hbn = p.state_hbn != nullptr ? p.state_hbn : p.saved_h;
     // CP summary phases: no o (and no bN state), so the recurrence only carries the state. Phase
     // 2 feeds it a zeroed value term, which turns the state it carries into the transition matrix.
@@ -495,6 +496,7 @@ void backward(const Shape& shape, const BackwardArgs& p, void* workspace, FTrain
                  ctok, clen, vna ? const_cast<void*>(Vn) : nullptr, stream),
           "dav");
     }  // !reuse
+    if (shape.prepOnly()) { return; }  // no other rank reads this rank's dh0
     check(g2_dhu_v8b(L.KgA, L.Qn, L.Wb, L.dOT, L.dVn, L.Gn, nullptr, L.HbNdh, L.ANv2, p.scale, 1, NT * 64, H, L.tab.seg,
                      nseg, p.dht, p.dh0, stream),
           "dhu");
