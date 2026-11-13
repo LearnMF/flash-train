@@ -150,7 +150,7 @@ python3 -c "import flash_train.torch as ft; print(ft.__file__, ft.chunk_kda)"
 **1b. 源码编译**
 
 ```bash
-git clone -b feat/kda-mk3 https://github.com/LearnMF/flash-train.git
+git clone -b feat/kda-gfx936-mk3 https://github.com/LearnMF/flash-train.git
 cd flash-train
 git checkout <commit>                         # 如果拿到的是指定版本（例如 e9eb1ef），先切到该提交
 git rev-parse --short HEAD                    # 记下实际使用的版本，反馈问题时附上
