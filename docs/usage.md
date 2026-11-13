@@ -130,7 +130,7 @@ q / k / v / g 都是 `[B, T, H, 128]`，beta 是 `[B, T, H]`，A_log 是 `[H]`�
 在训练用的镜像（容器）里执行。wheel 绑定编译时的 DTK、torch 和 Python 版本，所以要在同一个镜像里编译；换了镜像要重新编译。
 
 ```bash
-git clone -b feat/kda https://github.com/LearnMF/flash-train.git
+git clone -b feat/kda-gfx938-mk3 https://github.com/LearnMF/flash-train.git
 cd flash-train
 git checkout <commit>                         # 如果拿到的是指定版本（例如 7aeab8c），先切到该提交
 git rev-parse --short HEAD                    # 记下实际使用的版本，反馈问题时附上
