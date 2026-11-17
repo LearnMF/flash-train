@@ -19,6 +19,8 @@ if os.path.exists(_native_library):
 
 try:
     from ._flash_train_torch import gemm
+    from .gdn2 import chunk_gdn2
+    from .gdn2_reference import gdn2_reference
     from .kda import chunk_kda, kda_reference, kimi_delta_attention
     from .gdn import chunk_gated_delta_rule, gdn_reference
 except ModuleNotFoundError as exc:
@@ -31,4 +33,4 @@ except ModuleNotFoundError as exc:
         "FTRAIN_BUILD_TORCH_BINDINGS=ON"
     ) from exc
 
-__all__ = ["gemm", "chunk_kda", "kimi_delta_attention", "kda_reference", "chunk_gated_delta_rule", "gdn_reference"]
+__all__ = ["gemm", "chunk_kda", "kimi_delta_attention", "kda_reference", "chunk_gated_delta_rule", "gdn_reference", "chunk_gdn2", "gdn2_reference"]

@@ -72,19 +72,15 @@ __global__ void __launch_bounds__(256) g2_bwd_tail_kernel(TailParams p) {
         // each warp adds the carry (suffix of the blocks ABOVE it, fixed order)
         // and does the gate math.
         if constexpr (SCALAR_GATE) {
-            // d(g_scalar) = sum_k d(g_vector[k]); reduce before the reverse scan.
+            // d(g_scalar): reverse chunk cumsum of the per-row scalar (lane 0 carries it).
             float loc[16], run = 0.f, comp = 0.f;
             const int tb = wv * 16;
             #pragma unroll
             for (int u = 0; u < 16; ++u) {
                 const int t = tb + 15 - u;
                 float x = 0.f;
-                if (g2_row_ok<M>(t, cl)) {
-                    const size_t off = ((size_t)(t0 + t) * p.H + hh) * kK + l;
-                    x = p.dg[off] + p.dg[off + 64];
-                }
-                #pragma unroll
-                for (int d = 32; d > 0; d >>= 1) x += __shfl_down(x, d, 64);
+                // s4b's SG form already reduced dg over the 128 channels: fp32 [T,H] at the head of dg.
+                if (l == 0 && g2_row_ok<M>(t, cl)) x = p.dg[(size_t)(t0 + t) * p.H + hh];
                 const float y = x - comp, next = run + y;
                 comp = (next - run) - y;
                 run = next;
@@ -100,7 +96,6 @@ __global__ void __launch_bounds__(256) g2_bwd_tail_kernel(TailParams p) {
                 if (l == 0 && g2_row_ok<M>(t, cl))
                     reinterpret_cast<float*>(p.dg_raw)[(size_t)(t0 + t) * p.H + hh] = loc[u] + carry;
             }
-            __syncthreads();
         } else if (p.gate_none) {                                  // uniform: reverse cumsum only
             const int tb = wv * 16;
             #pragma unroll
@@ -222,7 +217,7 @@ __global__ void __launch_bounds__(256) g2_bwd_tail_kernel(TailParams p) {
             sDA[slot(d0, wv)] = dAs0;
             sDA[slot(d0 + 1, wv)] = dAs1;
         }
-        __syncthreads();
+        if constexpr (!SCALAR_GATE) __syncthreads();        // SG: no partials to merge, sBlk is not reused
         if (!p.gate_none && tid < kK) {                     // fixed-order per-column
             const int c = tid >> 6, l2 = tid & 63;           // merge of the 4 warps
             float sd = 0.f;

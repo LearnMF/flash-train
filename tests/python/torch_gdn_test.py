@@ -192,6 +192,33 @@ def test_native_against_fp64(B, T, H, HV, norm, save_h):
 
 
 @pytest.mark.skipif(not gfx936(), reason="native GDN requires gfx936")
+@pytest.mark.parametrize("tp", [1, 2, 4, 8])
+@pytest.mark.parametrize("save_h", [False, True])
+def test_native_head_sharding_forward_and_backward(tp, save_h):
+    from flash_train.torch import chunk_gated_delta_rule
+
+    raw = inputs(1, 130, 32, 32, 128, 128, device="cuda")
+    xs = [t.detach().to(torch.bfloat16 if i < 3 else torch.float32).requires_grad_()
+          for i, t in enumerate(raw)]
+    kwargs = dict(use_qk_l2norm_in_kernel=True, disable_recompute=save_h)
+    full, _ = chunk_gated_delta_rule(*xs, **kwargs)
+    do = torch.randn_like(full)
+    full_grads = torch.autograd.grad(full, xs, do)
+    outputs, gradients = [], [[] for _ in xs]
+    for rank in range(tp):
+        start, end = rank * 32 // tp, (rank + 1) * 32 // tp
+        shard = [x[:, :, start:end].detach().contiguous().requires_grad_() for x in xs]
+        out, _ = chunk_gated_delta_rule(*shard, **kwargs)
+        grads = torch.autograd.grad(out, shard, do[:, :, start:end].contiguous())
+        outputs.append(out.detach())
+        for values, grad in zip(gradients, grads):
+            values.append(grad)
+    assert rel_rms(torch.cat(outputs, dim=2), full) < 0.02
+    for values, expected, budget in zip(gradients, full_grads, (0.04, 0.04, 0.04, 0.06, 0.06)):
+        assert rel_rms(torch.cat(values, dim=2), expected) < budget
+
+
+@pytest.mark.skipif(not gfx936(), reason="native GDN requires gfx936")
 def test_native_packed_and_empty():
     from flash_train.torch import chunk_gated_delta_rule
 

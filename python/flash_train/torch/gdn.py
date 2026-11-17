@@ -145,13 +145,18 @@ def _native_tiles(q, k, v, g, beta, cu, scale, l2norm, save_h, op):
     """
     B, T, _, K, HV = _shape(q, k, v, g, beta)
     V = v.shape[-1]
-    q, k = (F.pad(_expand_heads(x, HV), (0, _TILE - K)) for x in (q, k))
+    q, k = (_expand_heads(x, HV) for x in (q, k))
+    if K < _TILE:
+        q, k = (F.pad(x, (0, _TILE - K)) for x in (q, k))
     flat = lambda x: x.reshape(B * T, *x.shape[2:]).contiguous()  # noqa: E731
     q, k, g, beta = (flat(x) for x in (q, k, g, beta))
     tiles = []
     for start in range(0, V, _TILE):
         width = min(_TILE, V - start)
-        tile = flat(F.pad(v[..., start:start + width], (0, _TILE - width)))
+        tile = v[..., start:start + width]
+        if width < _TILE:
+            tile = F.pad(tile, (0, _TILE - width))
+        tile = flat(tile)
         needs_bwd = torch.is_grad_enabled() and any(x.requires_grad for x in (q, k, tile, g, beta))
         tiles.append(op(q, k, tile, g, beta, cu, scale, l2norm, save_h, needs_bwd)[..., :width])
     o = tiles[0] if len(tiles) == 1 else torch.cat(tiles, dim=-1)

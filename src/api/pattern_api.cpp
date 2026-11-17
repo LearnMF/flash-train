@@ -173,3 +173,17 @@ extern "C" FTrainStatus ftrainPatternAddKdaBackward(
             da_log, ddt_bias, h, state);
     });
 }
+
+extern "C" FTrainStatus ftrainPatternAddGdn2Forward(FTrainPattern pattern,FTrainGdn2ForwardOpId* op,FTrainTensorId q, FTrainTensorId k, FTrainTensorId v, FTrainTensorId g, FTrainTensorId b, FTrainTensorId w, FTrainTensorId o, FTrainTensorId cache) {
+    return ftrain::invokeApi([&] {
+        if(!pattern || !op) throw ftrain::Exception(FTRAIN_STATUS_INVALID_ARGUMENT,"GDN2: null pattern/op");
+        *op=pattern->builder.addOperation<ftrain::OperationKind::kGdn2Forward>(q, k, v, g, b, w, o, cache);
+    });
+}
+
+extern "C" FTrainStatus ftrainPatternAddGdn2Backward(FTrainPattern pattern,FTrainGdn2BackwardOpId* op,FTrainTensorId q, FTrainTensorId k, FTrainTensorId v, FTrainTensorId g, FTrainTensorId b, FTrainTensorId w, FTrainTensorId cache, FTrainTensorId d_o, FTrainTensorId dq, FTrainTensorId dk, FTrainTensorId dv, FTrainTensorId dg, FTrainTensorId db, FTrainTensorId dw) {
+    return ftrain::invokeApi([&] {
+        if(!pattern || !op) throw ftrain::Exception(FTRAIN_STATUS_INVALID_ARGUMENT,"GDN2: null pattern/op");
+        *op=pattern->builder.addOperation<ftrain::OperationKind::kGdn2Backward>(q, k, v, g, b, w, cache, d_o, dq, dk, dv, dg, db, dw);
+    });
+}

@@ -112,7 +112,9 @@ __device__ __forceinline__ void wu_emit16s(short* dst, const short* tile, int ti
     }
 }
 
-template <bool VL, bool KS = false, bool QS = false>   // kra P-84b: KS; P-84c: QS
+// SG (GDN): g is one scalar per row (broadcast in the [T,H,128] tile) -> one 4 B g load and one exp2 pair
+// per quad instead of 16 B and four pairs; values are bit-identical to the vector expressions.
+template <bool VL, bool KS = false, bool QS = false, bool SG = false>   // kra P-84b: KS; P-84c: QS
 __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p_) {
     // kra P-35: field-wise copy, pointers stamped global (global_* ops, not flat)
     const WuParams p{g2_glb(p_.k), g2_glb(p_.v), g2_glb(p_.q), g2_glb(p_.beta), g2_glb(p_.A), g2_glb(p_.g), g2_glb(p_.Wn), g2_glb(p_.Wb), g2_glb(p_.Un), g2_glb(p_.KgA), g2_glb(p_.Kn), g2_glb(p_.Qn), g2_glb(p_.kgB), g2_glb(p_.vB), p_.H, p_.NT, g2_glb(p_.ctok), g2_glb(p_.clen), p_.stop, p_.kp, g2_glb(p_.HbN), g2_glb(p_.VnOut), p_.order, p_.order_m};   // kra P-82, P-95
@@ -149,6 +151,12 @@ __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p_) {
         if (tid < kBT)
             sBeta[tid] = g2_row_ok<M>(tid, cl)
                 ? p.beta[(size_t)(g2_row_tok<VL>(p.ctok, i) + tid) * p.H + hh] : 0.f;
+        if constexpr (SG) {            // SG: p.g is fp32 [T,H]; a [T,H,128] offset >> 7 is its index
+            if (tid < 32) {
+                const float gl1 = p.g[(sbase + g2_row_g<M>(63, cl) * rstride) >> 7];
+                reinterpret_cast<f4*>(sGl)[tid] = f4{gl1, gl1, gl1, gl1};
+            }
+        } else
         if (tid < 32)                  // 128 floats = 32 f4 quads
             reinterpret_cast<f4*>(sGl)[tid] =
                 ld16f(p.g + sbase + g2_row_g<M>(63, cl) * rstride + 4 * tid);
@@ -285,7 +293,12 @@ __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p_) {
                 const int j = t >> 5, vq = (t & 31) << 2;
                 const size_t so = sbase + (size_t)j * rstride + vq;
                 kgr[it] = g2_row_ok<M>(j, cl) ? *reinterpret_cast<const v4bh*>(p.k + so) : v4bh{0, 0, 0, 0};
+                if constexpr (SG) {
+                    const float g1 = p.g[(sbase + (size_t)g2_row_g<M>(j, cl) * rstride) >> 7];
+                    egr[it] = f4{g1, g1, g1, g1};
+                } else {
                 egr[it] = ld16f(p.g + sbase + (size_t)g2_row_g<M>(j, cl) * rstride + vq);
+                }
             }
         }
         #pragma unroll
@@ -301,8 +314,15 @@ __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p_) {
             // T7: one exp2f(gf) per element serves both kb and kgB (identical
             // value; the multiply associations below are unchanged).
             f4 eg;
+            float egl = 0.f;
+            if constexpr (SG) {
+                const float e1 = __builtin_amdgcn_exp2f(gf[0]);
+                eg = f4{e1, e1, e1, e1};
+                egl = __builtin_amdgcn_exp2f(gl[0] - gf[0]);
+            } else {
             #pragma unroll
             for (int dv = 0; dv < 4; ++dv) eg[dv] = __builtin_amdgcn_exp2f(gf[dv]);
+            }
             #pragma unroll
             for (int dv = 0; dv < 4; ++dv) {
                 // kbT staged with pi16-permuted rows (C-pi): the w-MMAC C
@@ -316,7 +336,7 @@ __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p_) {
             #pragma unroll
             for (int dv = 0; dv < 4; ++dv) {
                 gv[dv] = bf_rne(bf2f(kv[dv]) * eg[dv]);
-                gkv[dv] = bf_rne(bf2f(kv[dv]) * __builtin_amdgcn_exp2f(gl[dv] - gf[dv]));
+                gkv[dv] = bf_rne(bf2f(kv[dv]) * (SG ? egl : __builtin_amdgcn_exp2f(gl[dv] - gf[dv])));
             }
             kgr[it] = *reinterpret_cast<const v4bh*>(gkv);
             egr[it] = eg;
@@ -379,6 +399,13 @@ __global__ void __launch_bounds__(256) g2_wu_kernel(WuParams p_) {
                 const size_t so = sbase + (size_t)j * rstride + vq;
                 const v4bh qv = g2_row_ok<M>(j, cl) ? *reinterpret_cast<const v4bh*>(p.q + so)
                                                      : v4bh{0, 0, 0, 0};
+                if constexpr (SG) {
+                    const float g1 = p.g[(sbase + (size_t)g2_row_g<M>(j, cl) * rstride) >> 7];
+                    const float e1 = __builtin_amdgcn_exp2f(g1);
+                    #pragma unroll
+                    for (int dv = 0; dv < 4; ++dv) qgv[dv] = bf_rne(bf2f(qv[dv]) * e1);
+                    return f4{g1, g1, g1, g1};
+                }
                 const f4 gf = ld16f(p.g + sbase + (size_t)g2_row_g<M>(j, cl) * rstride + vq);
                 #pragma unroll
                 for (int dv = 0; dv < 4; ++dv) qgv[dv] = bf_rne(bf2f(qv[dv]) * __builtin_amdgcn_exp2f(gf[dv]));
@@ -452,7 +479,7 @@ extern "C" int g2_wu(const void* k, const void* v, const void* q, const void* be
                      void* Wn, void* Wb, void* Un, void* KgA, void* Kn, void* Qn,
                      void* kgB, void* vB,
                      int B, int T, int H, const int* ctok, const int* clen,
-                     const void* hbn, void* vn_out, hipStream_t s) {   // kra P-82
+                     const void* hbn, void* vn_out, int scalar_gate, hipStream_t s) {   // kra P-82
     // T = chunk-padded rows (NT = T/64); with ctok/clen the row inputs are packed.
     if (B != 1 || T % 64 || ((ctok == nullptr) != (clen == nullptr))) return -1;
     int stop = 0;
@@ -474,7 +501,10 @@ extern "C" int g2_wu(const void* k, const void* v, const void* q, const void* be
     if (p.order == 3 && (p.order_m < 1 || H % p.order_m)) p.order = 0;
     constexpr bool ks = true;   // kra P-84b
     constexpr bool qs = true;   // kra P-84c
-    if (ctok) {
+    if (scalar_gate) {   // GDN
+        if (ctok) hipLaunchKernelGGL((g2::g2_wu_kernel<true, true, true, true>), dim3(T / 64, H), dim3(256), 0, s, p);
+        else      hipLaunchKernelGGL((g2::g2_wu_kernel<false, true, true, true>), dim3(T / 64, H), dim3(256), 0, s, p);
+    } else if (ctok) {
         if (ks && qs) hipLaunchKernelGGL((g2::g2_wu_kernel<true, true, true>), dim3(T / 64, H), dim3(256), 0, s, p);
         else if (ks)  hipLaunchKernelGGL((g2::g2_wu_kernel<true, true>), dim3(T / 64, H), dim3(256), 0, s, p);
         else          hipLaunchKernelGGL(g2::g2_wu_kernel<true>, dim3(T / 64, H), dim3(256), 0, s, p);

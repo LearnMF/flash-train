@@ -91,9 +91,8 @@ __global__ void __launch_bounds__(256) g2_gate_kernel(GateParams p) {
                     reinterpret_cast<const short*>(p.g_raw) + base + (size_t)r * step);
                 x = float2{bf2f(s2.x) + dt0, bf2f(s2.y) + dt1};
             } else if constexpr (GATE == 2) {
-                float g = c == 0 ? static_cast<const float*>(p.g_raw)[(t0 + r) * p.H + hh] : 0.f;
-                g = __shfl(g, 0, 64);
-                x = float2{g, g};
+                // GDN: the cumulative g stays one fp32 per row ([T,H]); lane 0 carries the scan.
+                if (c == 0) x.x = static_cast<const float*>(p.g_raw)[(t0 + r) * p.H + hh];
             } else {
                 x = *reinterpret_cast<const float2*>(
                     reinterpret_cast<const float*>(p.g_raw) + base + (size_t)r * step);
@@ -134,6 +133,9 @@ __global__ void __launch_bounds__(256) g2_gate_kernel(GateParams p) {
     #pragma unroll
     for (int u = 0; u < 16; ++u) {
         const int r = r0 + u;
+        if constexpr (GATE == 2) {
+            if (c == 0 && (!VL || r < cl)) p.g_out[(size_t)(t0 + r) * p.H + hh] = (v[u].x + carry.x) * p.scale;
+        } else
         if (!VL || r < cl)
             *reinterpret_cast<float2*>(p.g_out + base + (size_t)r * step) =
                 float2{(v[u].x + carry.x) * p.scale, (v[u].y + carry.y) * p.scale};

@@ -7,12 +7,14 @@ add_executable(
   api/gemm_api_test.cpp
   api/gemm_numerics_test.cpp
   api/kda_api_test.cpp
+  api/gdn2_api_test.cpp
   api/pattern_api_test.cpp
   api/runtime_api_test.cpp
   cache/cache_test.cpp
   engine/engine_test.cpp
   family/gemm/gemm_test.cpp
   family/kda/kda_test.cpp
+  family/gdn2/gdn2_test.cpp
   handle/handle_test.cpp
   operation/op_definitions_test.cpp
   operation/op_schema_test.cpp

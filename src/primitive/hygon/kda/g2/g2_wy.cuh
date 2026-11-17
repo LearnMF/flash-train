@@ -1109,7 +1109,10 @@ struct S4BSmem {
     bf16 dwTs[16 * 64];          // kra P-29: dwT tile of step kt, column groups XOR-swizzled by row
 };
 
-template <int A, int M>
+// SG (GDN): g is one scalar per row (the [T,H,128] tile holds it broadcast), so every gate factor is
+// loop-invariant over the 8 key tiles: g is read once, the exps are formed once, and dg is reduced over
+// the 128 channels here and stored as fp32 [T,H] at the head of the dg buffer.
+template <int A, int M, bool SG = false>
 __device__ __forceinline__ void s4b_tail(const WyS4BParams& p, S4BSmem& sm, const v4bh (&aa)[4],
                                          float db, float beta_t, long tok0, int cl) {
     using namespace ipi;
@@ -1192,9 +1195,33 @@ __device__ __forceinline__ void s4b_tail(const WyS4BParams& p, S4BSmem& sm, cons
         stg4[(t0 * 2 + 0) * 256 + threadIdx.x] = hg4[t0 * 256 + threadIdx.x];
         stg4[(t0 * 2 + 1) * 256 + threadIdx.x] = dhg4[t0 * 256 + threadIdx.x];
     }
+    float sgG = 0.f, sgN = 0.f, sgEp = 0.f, sgEn = 0.f, sgEg = 0.f, sgEnG = 0.f, sgEgn = 0.f, sgM = 0.f;
+    if constexpr (SG) {
+        sgG = p.g[(cb + rog) >> 7];                      // p.g: fp32 [T,H] (the scalar gate kernel)
+        sgN = p.g[(cb + rgn) >> 7];
+        const float g8 = __shfl(sgG, 16 * q + 8, 64);
+        const float d = sgG - g8;
+        sgEp = ex2(d);
+        sgEn = ex2(-d);
+        sgEg = ex2(sgG);
+        sgEnG = ex2(sgN - sgG);
+        sgEgn = ex2(sgN);
+        sgM = g8;
+        #pragma unroll
+        for (int e = 0; e < 4; ++e) sm.gM[A][4 * e + q] = g8;
+    }
     lds_barrier();
+    float sgF0 = 1.f, sgF1 = 1.f, sgF2 = 1.f, sgF3 = 1.f;   // block factors vs block b (b != A)
+    if constexpr (SG) {
+        if (A != 0) sgF0 = A > 0 ? ex2_diff(sgM, sm.gM[0][m]) : ex2_diff(sm.gM[0][m], sgM);
+        if (A != 1) sgF1 = A > 1 ? ex2_diff(sgM, sm.gM[1][m]) : ex2_diff(sm.gM[1][m], sgM);
+        if (A != 2) sgF2 = A > 2 ? ex2_diff(sgM, sm.gM[2][m]) : ex2_diff(sm.gM[2][m], sgM);
+        if (A != 3) sgF3 = A > 3 ? ex2_diff(sgM, sm.gM[3][m]) : ex2_diff(sm.gM[3][m], sgM);
+    }
+    auto sgF = [=](int b) { return b == 0 ? sgF0 : (b == 1 ? sgF1 : (b == 2 ? sgF2 : sgF3)); };
 
     float dbacc = 0.f;
+    [[maybe_unused]] float dgacc = 0.f;
     #pragma unroll 1
     for (int kt = 0; kt < 8; ++kt) {
         const int buf = kt & 1, kc = 16 * kt;
@@ -1210,10 +1237,16 @@ __device__ __forceinline__ void s4b_tail(const WyS4BParams& p, S4BSmem& sm, cons
             pfh = hg4[(kt + 2) * 256 + threadIdx.x];
             pfd = dhg4[(kt + 2) * 256 + threadIdx.x];
         }
-        const f4 gv = ld16f(g_ + rog + kc);
+        f4 gv, gn;
+        if constexpr (SG) {
+            gv = f4{sgG, sgG, sgG, sgG};
+            gn = f4{sgN, sgN, sgN, sgN};
+        } else {
+            gv = ld16f(g_ + rog + kc);
+        }
         const v4bh kk = rok ? ld8(k_ + ro + kc) : v4bh{0, 0, 0, 0};
         const v4bh qq = rok ? ld8(q_ + ro + kc) : v4bh{0, 0, 0, 0};
-        const f4 gn = ld16f(g_ + rgn + kc);
+        if constexpr (!SG) gn = ld16f(g_ + rgn + kc);
         f4 dkp, dgK;
         {   // pass K tile kt  [verbatim; cs partials replace the fused kernel's atomics]
             #pragma clang fp contract(off)
@@ -1226,7 +1259,7 @@ __device__ __forceinline__ void s4b_tail(const WyS4BParams& p, S4BSmem& sm, cons
             float kd[4];
             #pragma unroll
             for (int e = 0; e < 4; ++e) {
-                dkp[e] = acck[e] * ex2(gn[e] - gv[e]);
+                dkp[e] = acck[e] * (SG ? sgEnG : ex2(gn[e] - gv[e]));
                 kd[e] = bf2f(kk[e]) * dkp[e];
                 dgK[e] = -kd[e];
             }
@@ -1258,15 +1291,21 @@ __device__ __forceinline__ void s4b_tail(const WyS4BParams& p, S4BSmem& sm, cons
             for (int vt = 0; vt < 8; ++vt) a4[vt & 3] = mmac(ado[vt], HB(vt), a4[vt & 3]);
             const f4 accq = (a4[0] + a4[1]) + (a4[2] + a4[3]);
             #pragma unroll
-            for (int e = 0; e < 4; ++e) dqiE[e] = accq[e] * ex2(gv[e]) * p.scale;
+            for (int e = 0; e < 4; ++e) dqiE[e] = accq[e] * (SG ? sgEg : ex2(gv[e])) * p.scale;
         }
         f4 ep, en, g8;
         #pragma unroll
         for (int e = 0; e < 4; ++e) {
+            if constexpr (SG) {
+                g8[e] = sgM;
+                ep[e] = sgEp;
+                en[e] = sgEn;
+            } else {
             g8[e] = __shfl(gv[e], 16 * q + 8, 64);        // kra P-40: row 16A+8's g (== m==8 lane's gv)
             const float d = gv[e] - g8[e];
             ep[e] = ex2(d);
             en[e] = ex2(-d);
+            }
         }
         #pragma unroll
         for (int e = 0; e < 4; ++e) {
@@ -1276,8 +1315,10 @@ __device__ __forceinline__ void s4b_tail(const WyS4BParams& p, S4BSmem& sm, cons
             sm.TQ[o] = qf * ep[e];
             sm.TK[o] = kf * beta_t * ep[e];
         }
+        if constexpr (!SG) {
         #pragma unroll
         for (int e = 0; e < 4; ++e) sm.gM[A][4 * e + q] = g8[e];   // kra P-40: every lane, same value
+        }
         *reinterpret_cast<v4bh*>(&sm.dwTs[dwr * 64 + 4 * (dwc ^ dwr)]) = dwv;   // kra P-29
         lds_barrier();
         if (kt + 2 < 8) {                          // tile kt+2 -> the buffer tile kt freed
@@ -1292,11 +1333,11 @@ __device__ __forceinline__ void s4b_tail(const WyS4BParams& p, S4BSmem& sm, cons
 
         f4 cq0 = {0.f, 0.f, 0.f, 0.f}, cq1 = cq0, ck0 = cq0, ck1 = cq0, ct0 = cq0, ct1 = cq0;
         {
-        const float gm_n = sm.gM[A][m];
+        const float gm_n = SG ? sgM : sm.gM[A][m];
         #pragma unroll
         for (int b = 0; b <= A; ++b) {
             f4 t = *reinterpret_cast<const f4*>(&sm.TA[m * TS + 16 * b + 4 * q]);
-            if (b < A) t *= ex2_diff(gm_n, sm.gM[b][m]);
+            if (b < A) t *= SG ? sgF(b) : ex2_diff(gm_n, sm.gM[b][m]);
             cq0 = mm8(lo2(aqA[b]), lo2(t), cq0);
             ck0 = mm8(lo2(dak[b]), lo2(t), ck0);
             cq1 = mm8(hi2(aqA[b]), hi2(t), cq1);
@@ -1307,7 +1348,7 @@ __device__ __forceinline__ void s4b_tail(const WyS4BParams& p, S4BSmem& sm, cons
             f4 tq = *reinterpret_cast<const f4*>(&sm.TQ[m * TS + 16 * b + 4 * q]);
             f4 tk = *reinterpret_cast<const f4*>(&sm.TK[m * TS + 16 * b + 4 * q]);
             if (b > A) {
-                const float s = ex2_diff(sm.gM[b][m], gm_n);
+                const float s = SG ? sgF(b) : ex2_diff(sm.gM[b][m], gm_n);
                 tq *= s;
                 tk *= s;
             }
@@ -1323,7 +1364,7 @@ __device__ __forceinline__ void s4b_tail(const WyS4BParams& p, S4BSmem& sm, cons
         for (int e = 0; e < 4; ++e) {
             #pragma clang fp contract(off)
             const float kf = bf2f(kk[e]), qf = bf2f(qq[e]);
-            const float eg = ex2(gv[e]);
+            const float eg = SG ? sgEg : ex2(gv[e]);
             const float kg = kf * eg;
             float dk = dki[e] + acc[e] * (eg * beta_t);
             float dg = dgi[e] + kg * acc[e] * beta_t;
@@ -1332,7 +1373,7 @@ __device__ __forceinline__ void s4b_tail(const WyS4BParams& p, S4BSmem& sm, cons
                 const int c = 4 * q + e;
                 const float s1 = ((sm.cs1[buf][0][c] + sm.cs1[buf][1][c]) + sm.cs1[buf][2][c]) + sm.cs1[buf][3][c];
                 const float s2 = ((sm.cs2[buf][0][c] + sm.cs2[buf][1][c]) + sm.cs2[buf][2][c]) + sm.cs2[buf][3][c];
-                const float dgc = dg + (s1 * ex2(gn[e]) + s2);
+                const float dgc = dg + (s1 * (SG ? sgEgn : ex2(gn[e])) + s2);
                 dg = row == rlast ? dgc : dg;
             }
             const float dq2 = (cq0[e] + cq1[e]) * ep[e];
@@ -1346,18 +1387,23 @@ __device__ __forceinline__ void s4b_tail(const WyS4BParams& p, S4BSmem& sm, cons
             og[e] = dg + qf * dqf + (dk2b - dkt) * kf;
         }
         dbacc += (dbp[0] + dbp[1]) + (dbp[2] + dbp[3]);
+        if constexpr (SG) dgacc += (og[0] + og[1]) + (og[2] + og[3]);
         if (rok) {
             *reinterpret_cast<f4*>(dq_ + ro + kc) = oq;
             *reinterpret_cast<f4*>(dk_ + ro + kc) = ok;
-            *reinterpret_cast<f4*>(dg_ + ro + kc) = og;
+            if constexpr (!SG) *reinterpret_cast<f4*>(dg_ + ro + kc) = og;
         }
         lds_barrier();                             // table WAR: kt's reads done before kt+1 writes
     }
     db = xsum16(db) + xsum16(dbacc);
     if (q == 0 && rok) p.db[(size_t)(tok0 + row) * H + hh] = db;
+    if constexpr (SG) {
+        dgacc = xsum16(dgacc);
+        if (q == 0 && rok) p.dg[(size_t)(tok0 + row) * H + hh] = dgacc;
+    }
 }
 
-template <bool VL>
+template <bool VL, bool SG = false>
 __global__ void __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(1, 3)))
 p3_wy_s4b_kernel(WyS4BParams p) {
     __shared__ __align__(16) S4BSmem sm;
@@ -1402,10 +1448,10 @@ p3_wy_s4b_kernel(WyS4BParams p) {
         const float beta_t = g2_row_ok<M>(tr, cl) ? beta_[tr * H] : 0.f;
         const float db0 = p.db_part[g2_nat_blk(i, hh, H, 0, true, 256) + tid];
         switch (__builtin_amdgcn_readfirstlane(r)) {
-            case 0: s4b_tail<0, M>(p, sm, aa, db0, beta_t, tok0, cl); break;
-            case 1: s4b_tail<1, M>(p, sm, aa, db0, beta_t, tok0, cl); break;
-            case 2: s4b_tail<2, M>(p, sm, aa, db0, beta_t, tok0, cl); break;
-            default: s4b_tail<3, M>(p, sm, aa, db0, beta_t, tok0, cl); break;
+            case 0: s4b_tail<0, M, SG>(p, sm, aa, db0, beta_t, tok0, cl); break;
+            case 1: s4b_tail<1, M, SG>(p, sm, aa, db0, beta_t, tok0, cl); break;
+            case 2: s4b_tail<2, M, SG>(p, sm, aa, db0, beta_t, tok0, cl); break;
+            default: s4b_tail<3, M, SG>(p, sm, aa, db0, beta_t, tok0, cl); break;
         }
     });
 }
@@ -1419,7 +1465,7 @@ extern "C" int g2_wy_s4_split_r(const void* q_kgb, const void* k, const void* v_
                                 void* db_part, float scale, int T, int H, int NT,
                                 const void* q_row, const void* v_row, const int* ctok,
                                 const int* clen, const void* do_row, const void* dv2c,
-                                const void* vnc, hipStream_t s) {
+                                const void* vnc, int scalar_gate, hipStream_t s) {
     // T = chunk-padded rows (NT = T/64); with ctok/clen the row tensors are packed.
     if (T % kBT || NT != T / kBT || ((ctok == nullptr) != (clen == nullptr))) return -1;
     {
@@ -1450,7 +1496,10 @@ extern "C" int g2_wy_s4_split_r(const void* q_kgb, const void* k, const void* v_
                        ctok, clen, (const bf16*)do_row, (const bf16*)vnc};
         const dim3 s4grd = dim3(H, NT);   // kra P-88: head-fastest grid
         pb.hf = true;   // kra P-96
-        if (ctok) hipLaunchKernelGGL(p3_wy_s4b_kernel<true>, s4grd, dim3(256), 0, s, pb);
+        if (scalar_gate) {   // GDN
+            if (ctok) hipLaunchKernelGGL((p3_wy_s4b_kernel<true, true>), s4grd, dim3(256), 0, s, pb);
+            else hipLaunchKernelGGL((p3_wy_s4b_kernel<false, true>), s4grd, dim3(256), 0, s, pb);
+        } else if (ctok) hipLaunchKernelGGL(p3_wy_s4b_kernel<true>, s4grd, dim3(256), 0, s, pb);
         else hipLaunchKernelGGL(p3_wy_s4b_kernel<false>, s4grd, dim3(256), 0, s, pb);
         return (int)hipGetLastError();
     }
@@ -1466,7 +1515,7 @@ extern "C" int g2_wy_s4_split(const void* q_kgb, const void* k, const void* v_vb
                               const int* clen, hipStream_t s) {
     return g2_wy_s4_split_r(q_kgb, k, v_vb, v_new, g, beta, A, h, do_, dh, dv, dAqk, dq, dk, dv2,
                             dg, db, dA, dwT, db_part, scale, T, H, NT, q_row, v_row, ctok, clen,
-                            nullptr, nullptr, nullptr, s);
+                            nullptr, nullptr, nullptr, 0, s);
 }
 
 // ================================================================ V1: l2n apply

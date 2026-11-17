@@ -241,3 +241,19 @@ extern "C" FTrainStatus ftrainArgsSetKdaBackward(FTrainArgs args, FTrainKdaBackw
                                                                      ftrain::KdaAttributes(attributes));
     });
 }
+
+extern "C" FTrainStatus ftrainArgsSetGdn2Forward(FTrainArgs args,FTrainGdn2ForwardOpId op,FTrainGdn2Attributes a) {
+    return ftrain::invokeApi([&] {
+        if(!args || !(a.scale>0 && a.scale<=3.0e38F) || (a.l2norm_qk!=0 && a.l2norm_qk!=1))
+            throw ftrain::Exception(FTRAIN_STATUS_INVALID_ARGUMENT,"GDN2: invalid args/scale/l2norm_qk");
+        args->args.setOperation<ftrain::OperationKind::kGdn2Forward>(ftrain::PatternOperationId{op.opaque},ftrain::Gdn2Attributes(a));
+    });
+}
+
+extern "C" FTrainStatus ftrainArgsSetGdn2Backward(FTrainArgs args,FTrainGdn2BackwardOpId op,FTrainGdn2Attributes a) {
+    return ftrain::invokeApi([&] {
+        if(!args || !(a.scale>0 && a.scale<=3.0e38F) || (a.l2norm_qk!=0 && a.l2norm_qk!=1))
+            throw ftrain::Exception(FTRAIN_STATUS_INVALID_ARGUMENT,"GDN2: invalid args/scale/l2norm_qk");
+        args->args.setOperation<ftrain::OperationKind::kGdn2Backward>(ftrain::PatternOperationId{op.opaque},ftrain::Gdn2Attributes(a));
+    });
+}

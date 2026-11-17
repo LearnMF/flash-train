@@ -166,6 +166,15 @@ typedef struct FTrainOpsStruct* FTrainOps;
 typedef struct FTrainArgsStruct* FTrainArgs;
 typedef struct FTrainPlanStruct* FTrainPlan;
 
+
+typedef struct { float scale; int32_t l2norm_qk; } FTrainGdn2Attributes;
+typedef struct { uint64_t opaque; } FTrainGdn2ForwardOpId;
+FTRAIN_API FTrainStatus ftrainPatternAddGdn2Forward(FTrainPattern pattern, FTrainGdn2ForwardOpId* op, FTrainTensorId q, FTrainTensorId k, FTrainTensorId v, FTrainTensorId g, FTrainTensorId b, FTrainTensorId w, FTrainTensorId o, FTrainTensorId cache);
+FTRAIN_API FTrainStatus ftrainArgsSetGdn2Forward(FTrainArgs args, FTrainGdn2ForwardOpId op, FTrainGdn2Attributes attributes);
+typedef struct { uint64_t opaque; } FTrainGdn2BackwardOpId;
+FTRAIN_API FTrainStatus ftrainPatternAddGdn2Backward(FTrainPattern pattern, FTrainGdn2BackwardOpId* op, FTrainTensorId q, FTrainTensorId k, FTrainTensorId v, FTrainTensorId g, FTrainTensorId b, FTrainTensorId w, FTrainTensorId cache, FTrainTensorId d_o, FTrainTensorId dq, FTrainTensorId dk, FTrainTensorId dv, FTrainTensorId dg, FTrainTensorId db, FTrainTensorId dw);
+FTRAIN_API FTrainStatus ftrainArgsSetGdn2Backward(FTrainArgs args, FTrainGdn2BackwardOpId op, FTrainGdn2Attributes attributes);
+
 /* Thread-local error queries. */
 
 /**

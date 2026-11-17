@@ -267,6 +267,35 @@ __global__ void __launch_bounds__(256) g2_fwd_prep_a_kernel(PrepAParams p) {
     float* const REF = lds + 4352;
     const int rj = threadIdx.x >> 5, rc4 = 4 * (threadIdx.x & 31);
     const int rrow = g2_row_g<M>(rj < 4 ? 16 * rj + 8 : (rj < 7 ? 16 * (rj - 3) : 63), cl);
+    // GATE == 2 (GDN): g is one scalar per row, so the 64 x 128 tile and the 8 reference rows collapse
+    // to 64 floats (GS, the head of the idle T2 area): one exchange instead of two 16 KB rounds, and
+    // every exponent below depends on (row, reference) only -- the 8 per-column exp2 of a lane share
+    // one argument and fold to one.  Values are those of the tile path bit for bit.
+    float sgv[4] = {0.f, 0.f, 0.f, 0.f}, sgr[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    if constexpr (GATE == 2) {
+        #pragma clang fp contract(off)
+        float* const GS = lds;
+        const int c = threadIdx.x & 63;
+        #pragma unroll
+        for (int u = 0; u < 16; ++u)
+            if (c == u) GS[16 * wv + u] = (graw[u].x + carry.x) * p.gscale;
+        __syncthreads();
+        #pragma unroll
+        for (int rb = 0; rb < 4; ++rb) sgv[rb] = GS[g2_row_g<M>(16 * rb + m, cl)];
+        #pragma unroll
+        for (int j = 0; j < 8; ++j)
+            sgr[j] = GS[g2_row_g<M>(j < 4 ? 16 * j + 8 : (j < 7 ? 16 * (j - 3) : 63), cl)];
+        if (rj == 7) {
+            float* gnp = p.Gn + g2_nat_blk(i, hh, p.H, p.NT, false, 128);
+            const float e63 = exp2f(sgr[7]);
+            #pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const int col = rc4 + e;
+                gnp[p.kp ? col : (col >> 4) * 16 + (col & 3) * 4 + ((col & 15) >> 2)] = e63;
+            }
+        }
+        lds_barrier();                                // GS read: T2 overwrites it
+    } else {
     #pragma unroll
     for (int hr = 0; hr < 2; ++hr) {
         if ((wv >> 1) == hr) {
@@ -312,11 +341,21 @@ __global__ void __launch_bounds__(256) g2_fwd_prep_a_kernel(PrepAParams p) {
                 gv[rb][1] = *reinterpret_cast<const f4*>(REF + 7 * 128 + cbase + 4);
             }
     }
+    }
     if (p.stop == 3) return;
     auto Q = [&](int rb, int s) { return bf2f(qv[rb][s >> 2][s & 3]); };
     auto K = [&](int rb, int s) { return bf2f(kv[rb][s >> 2][s & 3]); };
-    auto G_ = [&](int rb, int s) { return gv[rb][s >> 2][s & 3]; };
+    constexpr bool sg = GATE == 2;                    // the exp2 below: one per (row, reference), hoisted
+    auto G_ = [&](int rb, int s) {
+        if constexpr (GATE == 2) return sgv[rb];
+        else return gv[rb][s >> 2][s & 3];
+    };
     auto ldref = [&](int j, float* x) {               // slot j: rows 16rb+8 (0-3) | 16rb (4-6) | 63
+        if constexpr (GATE == 2) {
+            #pragma unroll
+            for (int e = 0; e < 8; ++e) x[e] = sgr[j];
+            return;
+        }
         const f4 a = *reinterpret_cast<const f4*>(REF + j * 128 + cbase);
         const f4 b = *reinterpret_cast<const f4*>(REF + j * 128 + cbase + 4);
         #pragma unroll
@@ -333,13 +372,15 @@ __global__ void __launch_bounds__(256) g2_fwd_prep_a_kernel(PrepAParams p) {
             const int row = 16 * rb + m;
             const bool rok = g2_row_ok<M>(row, cl);
             const float bta = rok ? p.beta[g2_rm_tok(tok0 + row, hh, p.H, 1)] : 0.f;
+            const float sEg = sg ? __builtin_amdgcn_exp2f(sgv[rb]) : 0.f;
+            const float sEn = sg ? __builtin_amdgcn_exp2f(sgr[7] - sgv[rb]) : 0.f;
             #pragma unroll
             for (int s = 0; s < 8; ++s) {
-                const float eg = __builtin_amdgcn_exp2f(G_(rb, s));    // shared by QgA and Kb (same argument)
+                const float eg = sg ? sEg : __builtin_amdgcn_exp2f(G_(rb, s));    // shared by QgA and Kb (same argument)
                 qg[s >> 2][s & 3] = bf_rne(Q(rb, s) * eg);
                 // Kb = bf16(kn * beta * 2^g): the T2 pass-0 value, row-major like kn
                 kb[s >> 2][s & 3] = bf_rne(K(rb, s) * bta * eg);
-                T2[(cbase + s) * kT2 + 16 * rb + m] = bf_rne(K(rb, s) * __builtin_amdgcn_exp2f(gn[s] - G_(rb, s)));
+                T2[(cbase + s) * kT2 + 16 * rb + m] = bf_rne(K(rb, s) * (sg ? sEn : __builtin_amdgcn_exp2f(gn[s] - G_(rb, s))));
             }
             if (rok) {
                 *reinterpret_cast<v4bh*>(p.Kb + cta0 + (size_t)row * rs + cbase) = kb[0];
@@ -374,11 +415,13 @@ __global__ void __launch_bounds__(256) g2_fwd_prep_a_kernel(PrepAParams p) {
         for (int rb = 0; rb < 4; ++rb) {
             float gm[8];
             ldref(rb, gm);
+            const float sEa = sg ? exp2_inrange(sgv[rb] - sgr[rb]) : 0.f;
+            const float sEb = sg ? exp2_inrange(sgr[rb] - sgv[rb]) : 0.f;
             #pragma unroll
             for (int kt = 0; kt < 4; ++kt) {
                 const int s0 = 2 * kt, s1 = 2 * kt + 1;
-                const f2 eA = f2{exp2_inrange(G_(rb, s0) - gm[s0]), exp2_inrange(G_(rb, s1) - gm[s1])};
-                const f2 eB = f2{exp2_inrange(gm[s0] - G_(rb, s0)), exp2_inrange(gm[s1] - G_(rb, s1))};
+                const f2 eA = sg ? f2{sEa, sEa} : f2{exp2_inrange(G_(rb, s0) - gm[s0]), exp2_inrange(G_(rb, s1) - gm[s1])};
+                const f2 eB = sg ? f2{sEb, sEb} : f2{exp2_inrange(gm[s0] - G_(rb, s0)), exp2_inrange(gm[s1] - G_(rb, s1))};
                 const f2 Bd = f2{K(rb, s0), K(rb, s1)} * eB;
                 acc[rb] = mmac32(f2{Q(rb, s0), Q(rb, s1)} * eA, Bd, acc[rb]);
                 acc[4 + rb] = mmac32(f2{K(rb, s0), K(rb, s1)} * eA, Bd, acc[4 + rb]);
@@ -407,15 +450,22 @@ __global__ void __launch_bounds__(256) g2_fwd_prep_a_kernel(PrepAParams p) {
                 if ((sp == 0) != (rb < 3)) continue;
                 float gr[8];
                 ldref(3 + rb, gr);
+                const float sEo = sg ? exp2_inrange(sgv[rb] - sgr[3 + rb]) : 0.f;
+                float sEc[3] = {0.f, 0.f, 0.f};
+                if constexpr (GATE == 2) {
+                    #pragma unroll
+                    for (int cb = 0; cb < rb; ++cb) sEc[cb] = __builtin_amdgcn_exp2f(sgr[3 + rb] - sgv[cb]);
+                }
                 #pragma unroll
                 for (int kt = 0; kt < 4; ++kt) {
                     const int s0 = 2 * kt, s1 = 2 * kt + 1;
-                    const f2 eO = f2{exp2_inrange(G_(rb, s0) - gr[s0]), exp2_inrange(G_(rb, s1) - gr[s1])};
+                    const f2 eO = sg ? f2{sEo, sEo} : f2{exp2_inrange(G_(rb, s0) - gr[s0]), exp2_inrange(G_(rb, s1) - gr[s1])};
                     const f2 Aq = f2{Q(rb, s0), Q(rb, s1)} * eO;
                     const f2 Ak = f2{K(rb, s0), K(rb, s1)} * eO;
                     #pragma unroll
                     for (int cb = 0; cb < rb; ++cb) {
-                        const f2 eBo = f2{__builtin_amdgcn_exp2f(gr[s0] - G_(cb, s0)), __builtin_amdgcn_exp2f(gr[s1] - G_(cb, s1))};
+                        const f2 eBo = sg ? f2{sEc[cb], sEc[cb]}
+                                          : f2{__builtin_amdgcn_exp2f(gr[s0] - G_(cb, s0)), __builtin_amdgcn_exp2f(gr[s1] - G_(cb, s1))};
                         const f2 Bo = f2{K(cb, s0), K(cb, s1)} * eBo;
                         const int x = pidx(rb, cb) - 3 * sp;
                         aq[x] = mmac32(Aq, Bo, aq[x]);

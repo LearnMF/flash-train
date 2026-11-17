@@ -131,6 +131,22 @@ FTRAIN_API FTrainStatus ftrainKdaBackwardGetWorkspaceBytes(const FTrainKdaBackwa
 FTRAIN_API FTrainStatus ftrainKdaBackward(const FTrainKdaBackwardTensors* tensors, FTrainKdaAttributes attributes,
                                           void* workspace, uint64_t workspace_bytes, FTrainStream stream);
 
+
+/** GDN-2: dense BTHD, zero initial state; g is log decay (caller guarantees g in [-5, 0]).
+ * q/k/v are BF16, g/b/w independently BF16 or FP32. HV must be divisible by H.
+ * cache is an opaque FP32 vector of ftrainGdn2SavedElements elements, kept until backward.
+ * All ports must be distinct, contiguous device tensors. Scale is finite and positive.
+ * Current gfx936 implementation supports 1 <= K,V <= 128, arbitrary T and B >= 1.
+ */
+FTRAIN_API uint64_t ftrainGdn2SavedElements(int64_t batch, int64_t tokens, int64_t heads,
+                                          int64_t value_heads, int64_t key_dim, int64_t value_dim);
+typedef struct { FTrainStorageView q; FTrainStorageView k; FTrainStorageView v; FTrainStorageView g; FTrainStorageView b; FTrainStorageView w; FTrainStorageView o; FTrainStorageView cache; } FTrainGdn2ForwardTensors;
+FTRAIN_API FTrainStatus ftrainGdn2ForwardGetWorkspaceBytes(const FTrainGdn2ForwardTensors*, FTrainGdn2Attributes, uint64_t*);
+FTRAIN_API FTrainStatus ftrainGdn2Forward(const FTrainGdn2ForwardTensors*, FTrainGdn2Attributes, void*, uint64_t, FTrainStream);
+typedef struct { FTrainStorageView q; FTrainStorageView k; FTrainStorageView v; FTrainStorageView g; FTrainStorageView b; FTrainStorageView w; FTrainStorageView cache; FTrainStorageView d_o; FTrainStorageView dq; FTrainStorageView dk; FTrainStorageView dv; FTrainStorageView dg; FTrainStorageView db; FTrainStorageView dw; } FTrainGdn2BackwardTensors;
+FTRAIN_API FTrainStatus ftrainGdn2BackwardGetWorkspaceBytes(const FTrainGdn2BackwardTensors*, FTrainGdn2Attributes, uint64_t*);
+FTRAIN_API FTrainStatus ftrainGdn2Backward(const FTrainGdn2BackwardTensors*, FTrainGdn2Attributes, void*, uint64_t, FTrainStream);
+
 #ifdef __cplusplus
 }
 #endif

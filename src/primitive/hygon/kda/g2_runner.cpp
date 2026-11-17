@@ -29,9 +29,12 @@ int g2_fwd_h_v8o(const void* Wn, const void* Kn, const void* Un, const void* Gn,
                  int nseg, const int* ctok, const int* clen, const void* GnRaw, hipStream_t s);
 int g2_kda_gn_all(const float* g, const int* ctok, const int* clen, int H, int NT, float* raw, float* gn, float* gnat,
                   int kp, hipStream_t s);  // kra P-99: to_gn (+ to_gn + exp2 | + gn_kp) in one pass
+int g2_gdn_gn_all(const float* g, const int* ctok, const int* clen, int H, int NT, float* raw, float* gn, float* gnat,
+                  int kp, hipStream_t s);  // GDN: the same on the scalar cumulative g (fp32 [T,H])
 int g2_wu(const void* k, const void* v, const void* q, const void* beta, const void* A, const void* g, void* Wn,
           void* Wb, void* Un, void* KgA, void* Kn, void* Qn, void* kgB, void* vB, int B, int T, int H, const int* ctok,
-          const int* clen, const void* hbn, void* vn_out, hipStream_t s);  // kra P-82: + hbn / vn_out
+          const int* clen, const void* hbn, void* vn_out, int scalar_gate,
+          hipStream_t s);  // kra P-82: + hbn / vn_out
 int g2_dav(const void* do_, const void* Vn, const void* A, void* dA, void* dVn, void* dOT, void* aNdo, double scale,
            int B, int T, int H, const int* ctok, const int* clen, hipStream_t s);
 int g2_dhu_v8b(const void* KgA, const void* Qg, const void* Wb, const void* dOT, const void* dv, const void* Gn,
@@ -43,7 +46,7 @@ int g2_wy_s4_split_r(const void* q_kgb, const void* k, const void* v_vb, const v
                      const void* dAqk, void* dq, void* dk, void* dv2, void* dg, void* db, void* dA, void* dwT,
                      void* db_part, float scale, int T, int H, int NT, const void* q_row, const void* v_row,
                      const int* ctok, const int* clen, const void* do_row, const void* dv2c, const void* vnc,
-                     hipStream_t s);
+                     int scalar_gate, hipStream_t s);
 int g2_bwd_tail(const void* dq, const void* dk, const void* dg, const void* db, const void* qn, const void* kn,
                 const void* q_rstd, const void* k_rstd, const void* g_raw, const void* A_log, const void* dt_bias,
                 const void* beta_raw, void* dqo, void* dko, void* dg_raw, void* dA_log, void* ddt_bias, void* db_out,
@@ -189,7 +192,8 @@ BackwardLayout layoutBackward(const Shape& shape, void* base, std::uint64_t* use
     Arena a(base);
     BackwardLayout L{};
     L.tab   = takeTables(a, shape, z);
-    L.g     = shape.g_in_dqdk ? nullptr : a.take(z.rows128() * 4);  // else staged in dq | dk
+    // GDN (scalar_gate): the cumulative g and wy's dg are fp32 [T,H], not [T,H,128]
+    L.g     = shape.g_in_dqdk ? nullptr : a.take(shape.scalar_gate ? z.T * z.H * 4 : z.rows128() * 4);  // else staged in dq | dk
     L.Gn    = a.take(z.CH * 128 * 4);
     L.GnRaw = a.take(z.CH * 128 * 4);                                                 // kra P-52
     L.GnNat = g2KpLayout(static_cast<long>(z.H)) ? a.take(z.CH * 128 * 4) : nullptr;  // kra P-61e
@@ -211,7 +215,7 @@ BackwardLayout layoutBackward(const Shape& shape, void* base, std::uint64_t* use
     const std::uint64_t p2   = blk + spread(blk, 5);
     const std::uint64_t pr   = rows + spread(rows, 3);
     char* b1                 = static_cast<char*>(a.take(std::max(2 * p1, pa) + blk));
-    char* b2                 = static_cast<char*>(a.take(std::max(4 * p2 + blk, 2 * pr + rows)));
+    char* b2                 = static_cast<char*>(a.take(std::max(4 * p2 + blk, 2 * pr + (shape.scalar_gate ? z.T * z.H * 4 : rows))));
     if (b1 != nullptr) {
         L.Wn    = b1;
         L.Kn    = b1 + p1;
@@ -322,11 +326,11 @@ void backward(const Shape& shape, const BackwardArgs& p, void* workspace, FTrain
     const void* ANv  = kept ? p.state_anv : nullptr;  // kra P-22a: s4b rebuilds aN(v_new) from Vn
     check(g2_wu(kn, p.v, qn, p.beta, p.akk, L.g, p1 ? L.Wn : nullptr, L.Wb, p1 ? L.Un : nullptr, L.KgA,
                 p1 ? L.Kn : nullptr, L.Qn, L.kgB, nullptr /* kra P-17: no vB */, 1, NT * 64, H, ctok, clen,
-                hsave ? p.saved_h : nullptr, hsave ? L.Vn : nullptr, stream),
+                hsave ? p.saved_h : nullptr, hsave ? L.Vn : nullptr, shape.scalar_gate ? 1 : 0, stream),
           "wu");
     // kra P-99: GnRaw + Gn (exp2f, P-52) [+ GnNat and natural-k GnRaw for the kp layouts, P-61e] in one pass
     const bool kp = g2KpLayout(H);
-    check(g2_kda_gn_all(static_cast<const float*>(L.g), ctok, clen, H, NT, static_cast<float*>(L.GnRaw),
+    check((shape.scalar_gate ? g2_gdn_gn_all : g2_kda_gn_all)(static_cast<const float*>(L.g), ctok, clen, H, NT, static_cast<float*>(L.GnRaw),
                         static_cast<float*>(L.Gn), kp ? static_cast<float*>(L.GnNat) : nullptr, kp ? 1 : 0, stream),
           "gn_all");
     if (p1) {
@@ -342,7 +346,7 @@ void backward(const Shape& shape, const BackwardArgs& p, void* workspace, FTrain
           "dhu");
     check(g2_wy_s4_split_r(L.kgB, kn, nullptr, ANv, L.g, p.beta, p.akk, HbN, nullptr, L.HbNdh, L.ANv2, dA, L.dq, L.dk,
                            p.dv, L.dg, p.dbeta, L.dAout, L.dwT, L.dbPart, p.scale, NT * 64, H, NT, qn, p.v, ctok, clen,
-                           p.d_o, nullptr, kept ? nullptr : Vn, stream),
+                           p.d_o, nullptr, kept ? nullptr : Vn, shape.scalar_gate ? 1 : 0, stream),
           "wy");
     // dbeta: the post-activation beta's gradient is wy's fp32 db, written in place (use_beta = 0).
     check(g2_bwd_tail(L.dq, L.dk, L.dg, p.dbeta, qn, kn, p.q_rstd, p.k_rstd, p.g,
