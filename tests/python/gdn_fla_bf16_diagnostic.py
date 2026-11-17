@@ -17,5 +17,3 @@ from torch_gdn_test import ISSUE29_SHAPES, gfx936, _compare_native_and_fla
 @pytest.mark.parametrize("gate", ["normal", "weak", "zero", "boundary"])
 def test_native_and_fla_against_fp64(monkeypatch, K, V, norm, gate):
     _compare_native_and_fla(monkeypatch, K, V, norm, gate, torch.bfloat16)
-
-
