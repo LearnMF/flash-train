@@ -52,7 +52,7 @@ struct TailParams {
 // VL (varlen phase 2): rows r >= clen load as 0 and are never stored; ALL arithmetic
 // (incl. the Kahan updates) still runs on those zeros, so the result is bit-identical
 // to the dense kernel on the zero-padded stream.
-template <bool VL>
+template <bool VL, bool SCALAR_GATE = false>
 __global__ void __launch_bounds__(256) g2_bwd_tail_kernel(TailParams p) {
     const int i = blockIdx.x, hh = blockIdx.y, tid = threadIdx.x;
     const int wv = tid >> 6, l = tid & 63;              // wave64
@@ -71,7 +71,37 @@ __global__ void __launch_bounds__(256) g2_bwd_tail_kernel(TailParams p) {
         // registers (Kahan) and publishes the block totals; after the barrier
         // each warp adds the carry (suffix of the blocks ABOVE it, fixed order)
         // and does the gate math.
-        if (p.gate_none) {                                  // uniform: reverse cumsum only
+        if constexpr (SCALAR_GATE) {
+            // d(g_scalar) = sum_k d(g_vector[k]); reduce before the reverse scan.
+            float loc[16], run = 0.f, comp = 0.f;
+            const int tb = wv * 16;
+            #pragma unroll
+            for (int u = 0; u < 16; ++u) {
+                const int t = tb + 15 - u;
+                float x = 0.f;
+                if (g2_row_ok<M>(t, cl)) {
+                    const size_t off = ((size_t)(t0 + t) * p.H + hh) * kK + l;
+                    x = p.dg[off] + p.dg[off + 64];
+                }
+                #pragma unroll
+                for (int d = 32; d > 0; d >>= 1) x += __shfl_down(x, d, 64);
+                const float y = x - comp, next = run + y;
+                comp = (next - run) - y;
+                run = next;
+                loc[u] = run;
+            }
+            if (l == 0) sBlk[wv] = run;
+            __syncthreads();
+            float carry = 0.f;
+            for (int b = wv + 1; b < 4; ++b) carry += sBlk[b];
+            #pragma unroll
+            for (int u = 0; u < 16; ++u) {
+                const int t = tb + 15 - u;
+                if (l == 0 && g2_row_ok<M>(t, cl))
+                    reinterpret_cast<float*>(p.dg_raw)[(size_t)(t0 + t) * p.H + hh] = loc[u] + carry;
+            }
+            __syncthreads();
+        } else if (p.gate_none) {                                  // uniform: reverse cumsum only
             const int tb = wv * 16;
             #pragma unroll
             for (int c = 0; c < 2; ++c) {
@@ -342,7 +372,10 @@ extern "C" int g2_bwd_tail(const void* dq, const void* dk, const void* dg,
                      (float*)dA_part, (float*)ddt_part,
                      (float)lower_bound, (float)beta_scale,
                      use_l2, use_beta, H, NT, ctok, clen, gate_none, beta_f32};
-    if (ctok)
+    if (gate_none == 2) {
+        if (ctok) hipLaunchKernelGGL((g2::g2_bwd_tail_kernel<true, true>), dim3(NT, H), dim3(256), 0, s, p);
+        else hipLaunchKernelGGL((g2::g2_bwd_tail_kernel<false, true>), dim3(NT, H), dim3(256), 0, s, p);
+    } else if (ctok)
         hipLaunchKernelGGL(g2::g2_bwd_tail_kernel<true>, dim3(NT, H), dim3(256), 0, s, p);
     else
         hipLaunchKernelGGL(g2::g2_bwd_tail_kernel<false>, dim3(NT, H), dim3(256), 0, s, p);

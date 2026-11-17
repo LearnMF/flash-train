@@ -8,6 +8,8 @@
 #include "flash_train/family/gemm/family.hpp"
 #include "flash_train/family/kda/family.hpp"
 #include "flash_train/family/kda/finder.hpp"
+#include "flash_train/family/gdn/family.hpp"
+#include "flash_train/family/gdn/finder.hpp"
 #include "flash_train/engine.hpp"
 
 namespace ftrain {
@@ -27,7 +29,9 @@ Plan OpsEngineBase::createPlan(const Args& args) const {
 std::vector<std::shared_ptr<OpsEngineBase>> makeBuiltinOpsEngines() {
     return {std::make_shared<OpsEngine<GemmFamily, RegistrationOrderFinder>>(),
             std::make_shared<OpsEngine<KdaForwardFamily, KdaRegistrationOrderFinder>>(),
-            std::make_shared<OpsEngine<KdaBackwardFamily, KdaRegistrationOrderFinder>>()};
+            std::make_shared<OpsEngine<KdaBackwardFamily, KdaRegistrationOrderFinder>>(),
+            std::make_shared<OpsEngine<GdnForwardFamily, GdnRegistrationOrderFinder>>(),
+            std::make_shared<OpsEngine<GdnBackwardFamily, GdnRegistrationOrderFinder>>()};
 }
 
 }  // namespace ftrain

@@ -90,6 +90,10 @@ __global__ void __launch_bounds__(256) g2_gate_kernel(GateParams p) {
                 const short2 s2 = *reinterpret_cast<const short2*>(
                     reinterpret_cast<const short*>(p.g_raw) + base + (size_t)r * step);
                 x = float2{bf2f(s2.x) + dt0, bf2f(s2.y) + dt1};
+            } else if constexpr (GATE == 2) {
+                float g = c == 0 ? static_cast<const float*>(p.g_raw)[(t0 + r) * p.H + hh] : 0.f;
+                g = __shfl(g, 0, 64);
+                x = float2{g, g};
             } else {
                 x = *reinterpret_cast<const float2*>(
                     reinterpret_cast<const float*>(p.g_raw) + base + (size_t)r * step);
@@ -168,7 +172,10 @@ extern "C" int g2_head_gate(const void* g_raw, const void* A_log, const void* dt
     g2::GateParams p{g_raw, (const float*)A_log, (const float*)dt_bias, (float*)g_out,
                      (float)lower_bound, (float)scale, H, ctok, clen};
     const dim3 grid(NT, H), blk(256);
-    if (gate) {
+    if (gate == 2) {
+        if (ctok) hipLaunchKernelGGL((g2::g2_gate_kernel<2, true>), grid, blk, 0, s, p);
+        else hipLaunchKernelGGL((g2::g2_gate_kernel<2, false>), grid, blk, 0, s, p);
+    } else if (gate) {
         if (ctok) hipLaunchKernelGGL((g2::g2_gate_kernel<1, true>), grid, blk, 0, s, p);
         else hipLaunchKernelGGL((g2::g2_gate_kernel<1, false>), grid, blk, 0, s, p);
     } else {

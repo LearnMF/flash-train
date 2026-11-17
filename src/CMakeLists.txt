@@ -6,6 +6,7 @@ add_library(
   OBJECT api/common_api.cpp
          api/gemm_api.cpp
          api/kda_api.cpp
+         api/gdn_api.cpp
          api/ops_args_api.cpp
          api/pattern_api.cpp
          api/plan_api.cpp
@@ -23,6 +24,8 @@ add_library(
          family/gemm/problem.cpp
          family/kda/family.cpp
          family/kda/problem.cpp
+         family/gdn/family.cpp
+         family/gdn/problem.cpp
          primitive.cpp
          pattern.cpp)
 target_include_directories(
@@ -39,6 +42,7 @@ if(FTRAIN_PLATFORM_HYGON_HIP)
     PRIVATE primitive/hygon/gemm/fp32_gemm.cpp
             primitive/hygon/gemm/fp32_gemm.hip
             primitive/hygon/kda/g2_kda.cpp
+            primitive/hygon/gdn/g2_gdn.cpp
             primitive/hygon/kda/g2_runner.cpp
             primitive/hygon/kda/g2_kernels.hip)
   # The G2 KDA kernels use the HIP warp-sync shuffle builtins.

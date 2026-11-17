@@ -28,6 +28,8 @@ enum class OperationKind : std::uint16_t {
     kGroupedABGemm,
     kKdaForward,
     kKdaBackward,
+    kGdnForward,
+    kGdnBackward,
 };
 
 // Identifies an operand within its owning PatternBuilder.

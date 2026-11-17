@@ -5,6 +5,7 @@
 #define FTRAIN_FLASH_TRAIN_H_
 
 #include <flash_train/common.h>
+#include <flash_train/gdn.h>
 
 #ifdef __cplusplus
 extern "C" {

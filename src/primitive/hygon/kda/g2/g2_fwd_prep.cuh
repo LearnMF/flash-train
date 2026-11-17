@@ -72,6 +72,11 @@ __device__ __forceinline__ void gate_load(const PrepAParams& p, GRaw<GATE>& gr, 
         if constexpr (GATE == 1) {
             gr.v[u] = ok ? *reinterpret_cast<const uint32_t*>(
                                reinterpret_cast<const short*>(p.g_raw) + base + (size_t)r * step) : 0u;
+        } else if constexpr (GATE == 2) {
+            // GDN's scalar log decay: one load per wave, no [T,H,128] gate tensor.
+            float x = (ok && c == 0) ? static_cast<const float*>(p.g_raw)[(t0 + r) * p.H + hh] : 0.f;
+            x = __shfl(x, 0, 64);
+            gr.v[u] = float2{x, x};
         } else {
             gr.v[u] = ok ? *reinterpret_cast<const float2*>(
                                reinterpret_cast<const float*>(p.g_raw) + base + (size_t)r * step)
@@ -656,11 +661,13 @@ extern "C" int g2_fwd_prep_l2n(const void* q, const void* k, const void* v, cons
     const dim3 grid(NT, H), blk(256);
 #define G2_PREP_A(GT, VLT, L2) hipLaunchKernelGGL((g2::r4::g2_fwd_prep_a_kernel<GT, VLT, L2>), grid, blk, 0, s, pa)
     if (l2n) {
-        if (gate) { if (ctok) G2_PREP_A(1, true, true); else G2_PREP_A(1, false, true); }
+        if (gate == 2) { if (ctok) G2_PREP_A(2, true, true); else G2_PREP_A(2, false, true); }
+        else if (gate) { if (ctok) G2_PREP_A(1, true, true); else G2_PREP_A(1, false, true); }
         else      { if (ctok) G2_PREP_A(0, true, true); else G2_PREP_A(0, false, true); }
     } else {
         pa.qn_out = pa.kn_out = nullptr;
-        if (gate) { if (ctok) G2_PREP_A(1, true, false); else G2_PREP_A(1, false, false); }
+        if (gate == 2) { if (ctok) G2_PREP_A(2, true, false); else G2_PREP_A(2, false, false); }
+        else if (gate) { if (ctok) G2_PREP_A(1, true, false); else G2_PREP_A(1, false, false); }
         else      { if (ctok) G2_PREP_A(0, true, false); else G2_PREP_A(0, false, false); }
     }
 #undef G2_PREP_A

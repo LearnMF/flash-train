@@ -8,11 +8,12 @@
 
 #include "flash_train/operation/gemm.hpp"
 #include "flash_train/operation/kda.hpp"
+#include "flash_train/operation/gdn.hpp"
 
 namespace ftrain {
 
 using OperationValue = std::variant<GemmAttributes, GroupedABCDGemmAttributes, GroupedBCDGemmAttributes,
-                                    GroupedABGemmAttributes, KdaAttributes>;
+                                    GroupedABGemmAttributes, KdaAttributes, GdnAttributes>;
 
 }  // namespace ftrain
 

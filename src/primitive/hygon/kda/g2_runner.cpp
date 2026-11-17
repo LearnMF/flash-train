@@ -181,7 +181,7 @@ struct BackwardLayout {
     void *Wn, *Kn, *Un, *HbNdh, *ANv2;     // B1
     void *KgA, *Qn, *Wb, *Vn, *dVn, *dOT;  // B2
     void *dq, *dk, *dg;                    // B2 reuse (fp32 rows)
-    void *dAout, *dwT, *dbPart, *dAPart, *ddtPart;
+    void *dAout, *dwT, *dbPart, *dAPart, *ddtPart, *scalarDA;
 };
 
 BackwardLayout layoutBackward(const Shape& shape, void* base, std::uint64_t* used) {
@@ -229,6 +229,7 @@ BackwardLayout layoutBackward(const Shape& shape, void* base, std::uint64_t* use
         L.dk  = b2 + pr;
         L.dg  = b2 + 2 * pr;
     }
+    L.scalarDA = shape.scalar_gate ? a.take(z.T * z.H * 64 * 4) : nullptr;
     L.dAout   = a.take(z.NT * 64 * z.H * 64 * 4);
     L.dwT     = a.take(z.CH * 128 * 64 * 2);
     L.dbPart  = a.take(z.CH * 256 * 4);
@@ -269,7 +270,7 @@ void forward(const Shape& shape, const ForwardArgs& p, void* workspace, FTrainSt
     check(g2_fwd_prep_l2n(p.q, p.k, p.v, p.g, shape.gate_in_kernel ? p.a_log : nullptr,
                           shape.gate_in_kernel ? p.dt_bias : nullptr, p.beta, L.Wn, L.Kn, L.Un, L.QgA, L.AqkA, p.aqk,
                           p.akk, l2 ? p.q_rstd : nullptr, l2 ? p.k_rstd : nullptr, L.Gn, L.R, p.o,
-                          shape.gate_in_kernel ? p.lower_bound : 0.0, kRcpLn2, shape.gate_in_kernel ? 1 : 0, p.scale, H,
+                          shape.gate_in_kernel ? p.lower_bound : 0.0, kRcpLn2, shape.scalar_gate ? 2 : (shape.gate_in_kernel ? 1 : 0), p.scale, H,
                           NT, L.tab.ctok, L.tab.clen, l2 ? p.qn : nullptr, l2 ? p.kn : nullptr, l2 ? 1 : 0, stream),
           "fwd_prep");
     // R5 keep-state: with p.state_* set, the recurrence also emits the backward's B2 state
@@ -295,7 +296,7 @@ void backward(const Shape& shape, const BackwardArgs& p, void* workspace, FTrain
         check(g2_kda_tables(p.cu_seqlens, static_cast<int>(z.N), T, NT, L.tab.ctok, L.tab.clen, L.tab.seg, stream),
               "tables");
     }
-    void* dA       = p.dg;  // staged: fp32 [T, H, 64] fits g's-dtype [T, H, 128]; dead before the tail writes dg
+    void* dA       = shape.scalar_gate ? L.scalarDA : p.dg;  // staged: fp32 [T, H, 64] fits g's-dtype [T, H, 128]; dead before the tail writes dg
     const void* qn = p.q;
     const void* kn = p.k;
     if (p.qn != nullptr) {  // kra P-77b: the forward saved qn / kn -> no l2n_apply
@@ -308,7 +309,7 @@ void backward(const Shape& shape, const BackwardArgs& p, void* workspace, FTrain
         kn = p.dk;
     }
     check(g2_head_gate(p.g, shape.gate_in_kernel ? p.a_log : nullptr, shape.gate_in_kernel ? p.dt_bias : nullptr, L.g,
-                       p.lower_bound, kRcpLn2, shape.gate_in_kernel ? 1 : 0, NT, H, ctok, clen, stream),
+                       p.lower_bound, kRcpLn2, shape.scalar_gate ? 2 : (shape.gate_in_kernel ? 1 : 0), NT, H, ctok, clen, stream),
           "gate");
     // R5 keep-state: the forward handed over the B2 state -> wu skips Wn/Un/Kn (fwd_h_bn's inputs
     // only) and the bN recompute does not run.  kra P-82 saved-h: the forward handed over h only ->
@@ -348,7 +349,7 @@ void backward(const Shape& shape, const BackwardArgs& p, void* workspace, FTrain
                       shape.gate_in_kernel ? p.a_log : nullptr, shape.gate_in_kernel ? p.dt_bias : nullptr, p.beta,
                       p.dq, p.dk, p.dg, shape.gate_in_kernel ? p.da_log : nullptr,
                       shape.gate_in_kernel ? p.ddt_bias : nullptr, nullptr, L.dAPart, L.ddtPart, p.lower_bound, 1.0,
-                      shape.l2norm_qk ? 1 : 0, 0, 1, T, H, ctok, clen, NT, shape.gate_in_kernel ? 0 : 1, 1, stream),
+                      shape.l2norm_qk ? 1 : 0, 0, 1, T, H, ctok, clen, NT, shape.scalar_gate ? 2 : (shape.gate_in_kernel ? 0 : 1), 1, stream),
           "bwd_tail");
 }
 

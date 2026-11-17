@@ -187,7 +187,10 @@ std::vector<at::Tensor> kdaBackward(const at::Tensor& d_o, const std::optional<a
 
 }  // namespace
 
+void registerGdn(py::module_& m);
+
 PYBIND11_MODULE(_flash_train_torch, m) {
+    registerGdn(m);
     m.doc() = "flash-train PyTorch bindings";
     m.def("gemm", &gemm, "d = alpha * (a @ b) + beta * c on the current stream", py::arg("a"), py::arg("b"),
           py::arg("c") = std::nullopt, py::arg("alpha") = 1.0, py::arg("beta") = 0.0);

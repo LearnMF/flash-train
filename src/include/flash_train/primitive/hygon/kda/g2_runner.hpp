@@ -20,6 +20,7 @@ struct Shape {
     std::int64_t heads  = 0;  // H
     std::int64_t seqs   = 1;  // N: sequences (cu_seqlens has N + 1 entries; 1 when null)
     bool has_cu_seqlens = false;
+    bool scalar_gate = false;  // GDN: fp32 g/dg [T,H], shared across all key channels
     bool l2norm_qk      = true;   // l2-normalize q and k inside the operator
     bool has_state      = false;  // backward only: the forward handed over its recurrent state
                                   //   (BackwardArgs::state_*), so the bN recompute buffers are not needed
