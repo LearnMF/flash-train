@@ -236,3 +236,56 @@ ftrainPlanDestroy(plan);  ftrainArgsDestroy(args);  ftrainOpsDestroy(ops);
 | `FTRAIN_DISABLED_FINDERS` | 按名字禁用选择启发式 |
 | `FTRAIN_DISABLE_CACHE` | 关闭选择缓存（调试用） |
 | `FTRAIN_KDA_SAVE_QKN` / `FTRAIN_KDA_SAVE_H` / `FTRAIN_KDA_KEEP_STATE` / `FTRAIN_KDA_DEV` | KDA 调试开关，训练不需要，见第 1 节"KDA 调试开关" |
+
+## 4. GDN / GDN-2 的严格精度路径（gfx936）
+
+Python 入口为 `flash_train.torch.chunk_gated_delta_rule` 与 `chunk_gdn2`。
+输入 q/k/v 为 BF16；GDN 的标量 g/beta 为 FP32，GDN-2 的向量 g/b/w 可分别为 BF16 或 FP32。
+传入的 g 为激活后的 log decay，范围 `[-5, 0]`；目前只支持零初始状态及一阶反向。
+Python 接口支持 GQA、packed sequence、`1 <= K <= 128` 和按 128 列分块的 V；
+TP 仅按 head 分片，不包含通信，不切分序列。
+
+GDN 在 HIP 内保持 FP32 归一化结果、中间状态和反向重放，最后将 o/dq/dk/dv 转为 BF16。
+C API 的 qn/kn/h 必须是 FP32，h 布局不透明；保留端口 aqk/akk 必须为空。
+旧 BF16 或 KDA 的保存张量不能交给此路径。`disable_recompute=True` 保存 FP32 状态，
+False 在反向重算；GDN-2 当前无论该参数值如何都保存 FP32 chunk 中间量。
+
+GDN-2 使用分块前代求下三角逆，而不是 FP32 幂级数：相关正值 key 配合弱/零衰减时，
+后者会先形成很大的交替项，再发生数值抵消。两者均为原生 HIP 实现，无 FLA 或 Python 参考回退。
+此路径以精度为先，不能沿用旧 BF16 中间路径的性能结果。
+
+### 精度验收
+
+以独立 FP64 参考检查输出与每个梯度的有限性；误差为
+`RMS(actual-reference)/(RMS(reference)+1e-8)`。
+最大绝对误差不超过 `1e-6`，或相对 RMS 严格小于以下阈值时通过。
+
+| 算子 | o | dq/dk/dv | dg/门梯度 |
+|---|---:|---:|---:|
+| GDN | 0.005 | 0.008 | 0.02 |
+| GDN-2 | 0.005 | 0.01 | 0.015 |
+
+GDN 对齐 FLA 0.5.2 `tests/ops/test_gdn.py::test_chunk`；GDN-2 对齐
+`tests/ops/test_gdn2.py::test_chunk`，门梯度保留比其 0.02 更严格的既有 0.015 上限。
+
+```bash
+# 安装对应 gfx936 wheel 后运行；设备编号按实际机器选择。
+HIP_VISIBLE_DEVICES=1 pytest -q tests/python/torch_gdn_test.py tests/python/torch_gdn2_test.py
+python -m pytest -q tests/python/gdn2_math_test.py
+for op in gdn gdn2; do
+  HIP_VISIBLE_DEVICES=1 python tests/python/gdn_precision_matrix.py \
+    --op "$op" --issue29 --out "issue29-$op.jsonl"
+  HIP_VISIBLE_DEVICES=1 python tests/python/gdn_precision_matrix.py \
+    --op "$op" --out "long-$op.jsonl"
+done
+```
+
+长矩阵默认覆盖 S=8k/16k/32k/64k × TP=1/2/4/8，使用正值输入和混合衰减；
+可用 `--gate weak/zero/boundary`、`--distribution normal`、`--recompute` 补充压力条件。
+原生调用使用完整形状，仅独立 FP64 参考按 head 分组以控制显存。
+
+同卡 FLA BF16 是对照而非真值，不能以它的失败放宽原生门限。
+`tests/python/gdn_fla_bf16_diagnostic.py` 保留独立硬断言，显式执行时可能失败；
+其结果必须与 native 验收、FLA FP16 control 分开记录。
+`benchmarks/gdn_compare.py --check` 和 `gdn_correctness_matrix.py` 也是同卡 FLA 诊断，
+已经使用严格门限，但不能代替上述独立 FP64 验收。

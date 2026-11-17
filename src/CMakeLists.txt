@@ -46,6 +46,7 @@ if(FTRAIN_PLATFORM_HYGON_HIP)
             primitive/hygon/gemm/fp32_gemm.hip
             primitive/hygon/kda/g2_kda.cpp
             primitive/hygon/gdn/g2_gdn.cpp
+            primitive/hygon/gdn/fp32_runner.hip
             primitive/hygon/kda/g2_runner.cpp
             primitive/hygon/kda/g2_kernels.hip
             primitive/hygon/gdn2/primitive.cpp

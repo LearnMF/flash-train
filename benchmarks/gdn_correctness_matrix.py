@@ -1,11 +1,11 @@
-"""Issue #29 full shapes: native output and every gradient against same-device FLA."""
+"""Issue #29 strict same-device FLA diagnostic; native acceptance uses the FP64 matrix."""
 import argparse
 import gc
 import json
 
 import torch
 
-from gdn_compare import error, evaluate, operator
+from gdn_compare import error, evaluate, operator, tolerances
 
 SHAPES = {
     "small": (1, 64, 4, 4, 32, 32), "small2": (1, 128, 8, 8, 64, 64),
@@ -49,8 +49,8 @@ def run(op, shape):
 
     expected = evaluate(reference, xs, do)
     metrics = {n: error(a, b) for n, a, b in zip(names, actual, expected)}
-    budgets = dict(o=0.02, dq=0.04, dk=0.04, dv=0.04, dg=0.06, dbeta=0.06, db=0.06, dw=0.06)
-    return {"metrics": metrics, "passed": all(x["finite"] and x["relative_rms"] < budgets[n]
+    budgets = tolerances(op)
+    return {"metrics": metrics, "passed": all(x["finite"] and (x["max_abs"] <= 1e-6 or x["relative_rms"] < budgets[n])
                                               for n, x in metrics.items()), "tolerances": budgets}
 
 

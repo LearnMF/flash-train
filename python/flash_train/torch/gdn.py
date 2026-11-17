@@ -89,9 +89,11 @@ def chunk_gated_delta_rule(
     ``disable_recompute=True`` saves chunk states; False recomputes them in
     backward. None saves them at HV<=64 (inherited KDA policy, not GDN-tuned).
     Optional q/k L2 norm uses rsqrt(sum(x*x)+1e-6). This is a scalar-gate
-    specialization of the KDA MFMA pipeline, not a FLA runtime fallback.
+    recurrence implemented in native HIP with FP32 intermediates/checkpoints,
+    not a FLA or Python-reference fallback.
     Initial/final state, CP, raw-gate activation and K > 128 are unsupported.
-    Only first-order gradients are supported. Performance is not yet measured.
+    Only first-order gradients are supported. The FP32 accuracy path replaces
+    the BF16-intermediate pipeline; performance is not yet optimized.
     """
     if state_v_first:
         raise NotImplementedError("GDN: state_v_first has no effect without state tensors")

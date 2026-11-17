@@ -9,11 +9,11 @@
 
 #include "flash_train/family/gdn/problem.hpp"
 #include "flash_train/primitive.hpp"
-#include "flash_train/primitive/hygon/kda/g2_runner.hpp"
+#include "flash_train/primitive/hygon/gdn/fp32_runner.hpp"
 
 namespace ftrain {
 
-// Scalar-gate specializations of the gfx936 MFMA chunk pipeline, K = V = 128.
+// FP32 checkpointed GDN recurrence on gfx936, K = V = 128.
 class G2GdnForward final : public Primitive<GdnForwardProblem> {
   public:
     const char* getName() const noexcept override;
@@ -25,8 +25,8 @@ class G2GdnForward final : public Primitive<GdnForwardProblem> {
   private:
     void executeImpl(const Resources& resources) override;
 
-    kda_g2::Shape shape_{};
-    kda_g2::ForwardArgs args_{};
+    gdn_fp32::Shape shape_{};
+    gdn_fp32::ForwardArgs args_{};
 };
 
 class G2GdnBackward final : public Primitive<GdnBackwardProblem> {
@@ -40,8 +40,8 @@ class G2GdnBackward final : public Primitive<GdnBackwardProblem> {
   private:
     void executeImpl(const Resources& resources) override;
 
-    kda_g2::Shape shape_{};
-    kda_g2::BackwardArgs args_{};
+    gdn_fp32::Shape shape_{};
+    gdn_fp32::BackwardArgs args_{};
 };
 
 }  // namespace ftrain

@@ -50,12 +50,18 @@ def evaluate(fn, data, do):
 
 
 def error(actual, reference):
-    actual, reference = actual.float(), reference.float()
+    actual, reference = actual.double(), reference.double()
     diff = actual - reference
     return {"finite": bool(torch.isfinite(actual).all() and torch.isfinite(reference).all()),
             "relative_rms": float(diff.square().mean().sqrt() /
-                                  reference.square().mean().sqrt().clamp_min(1e-6)),
+                                  (reference.square().mean().sqrt() + 1e-8)),
             "max_abs": float(diff.abs().max())}
+
+
+def tolerances(op):
+    if op == "gdn":
+        return dict(o=0.005, dq=0.008, dk=0.008, dv=0.008, dg=0.02, dbeta=0.02)
+    return dict(o=0.005, dq=0.01, dk=0.01, dv=0.01, dg=0.015, db=0.015, dw=0.015)
 
 
 def timed(fn, reps, samples):
@@ -95,10 +101,11 @@ def run_case(args, length, tp):
         names = ["o", "dq", "dk", "dv", "dg", "dbeta"] if args.op == "gdn" else [
             "o", "dq", "dk", "dv", "dg", "db", "dw"]
         metrics = {name: error(a, b) for name, a, b in zip(names, actual, reference)}
-        # These are KDA/cudnn-front-end FP64 budgets used as an initial FLA
-        # regression gate; independent FP64 tests remain necessary.
-        budgets = dict(o=0.02, dq=0.04, dk=0.04, dv=0.04, dg=0.06, dbeta=0.06, db=0.06, dw=0.06)
-        passed = all(m["finite"] and m["relative_rms"] < budgets[n] for n, m in metrics.items())
+        # FLA BF16 comparison is a diagnostic, not an independent accuracy oracle.
+        # Native acceptance is tests/python/gdn_precision_matrix.py against FP64.
+        budgets = tolerances(args.op)
+        passed = all(m["finite"] and (m["max_abs"] <= 1e-6 or m["relative_rms"] < budgets[n])
+                     for n, m in metrics.items())
         return {"metrics": metrics, "passed": passed, "tolerances": budgets}
     fn = operator(args.op, args.impl)
 
@@ -129,7 +136,7 @@ def main():
     parser.add_argument("--reps", type=int, default=10)
     parser.add_argument("--samples", type=int, default=3)
     parser.add_argument("--seed", type=int, default=2026)
-    parser.add_argument("--check", action="store_true")
+    parser.add_argument("--check", action="store_true", help="strict same-input FLA diagnostic, not FP64 acceptance")
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--out", required=True)
     args = parser.parse_args()

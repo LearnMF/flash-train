@@ -25,10 +25,11 @@ typedef struct {
  * g is the per-token log decay, in [-5,0]; beta is post-activation.
  * Scalar decay: S = exp(g)*S; S += beta*k*(v-k^T*S)^T; o = scale*q^T*S.
  * q_rstd/k_rstd fp32 [T,H] are required with l2norm_qk (eps=1e-6).
- * aqk/akk bf16 [T,H,64] are required saved intermediates.
+ * aqk/akk are reserved ports and must have null memory.
  * cu_seqlens int32 [N+1] is optional; each sequence starts at zero state.
- * qn/kn bf16 [T,H,128] and h bf16 [ftrainGdnSavedHElements(...)] are optional
+ * qn/kn fp32 [T,H,128] and h fp32 [ftrainGdnSavedHElements(...)] are optional
  * saved tensors. With qn/kn given, backward q/k may be null.
+ * State checkpoints have an opaque layout; never reuse KDA/BF16 saved tensors.
  * The C API uses equal q/k/value heads; the Python API maps grouped heads.
  * Outputs and workspace must not alias inputs or each other. */
 typedef struct {

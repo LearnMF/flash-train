@@ -7,7 +7,7 @@
 
 namespace ftrain {
 
-// Registration order is the no-Finder preference: the G2 gfx936 implementation first.
+// The FP32-intermediate gfx936 implementation is the accuracy-safe default.
 std::vector<std::shared_ptr<const Primitive<GdnForwardProblem>>> GdnForwardFamily::makeRecords() {
     return {std::make_shared<G2GdnForward>()};
 }

@@ -73,8 +73,8 @@ GdnShape validateCommon(const std::vector<Tensor>& ports, std::size_t q, std::si
     requireDims(ports, k, qd, "k");
     requireDims(ports, g, {qd[0], qd[1]}, "g");
     requireDims(ports, beta, Dims{shape.tokens, shape.heads}, "beta");
-    requireDims(ports, aqk, Dims{shape.tokens, shape.heads, 64}, "aqk");
-    requireDims(ports, akk, Dims{shape.tokens, shape.heads, 64}, "akk");
+    if (portHasMemory(ports, aqk)) requireDims(ports, aqk, Dims{shape.tokens, shape.heads, 64}, "aqk");
+    if (portHasMemory(ports, akk)) requireDims(ports, akk, Dims{shape.tokens, shape.heads, 64}, "akk");
 
     if (portHasMemory(ports, cu)) {
         const Dims& cd = dimsOf(ports, cu);

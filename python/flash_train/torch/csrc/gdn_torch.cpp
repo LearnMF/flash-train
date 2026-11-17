@@ -66,15 +66,15 @@ std::vector<at::Tensor> gdnForward(const at::Tensor& q, const at::Tensor& k, con
     auto fopt         = q.options().dtype(at::kFloat);
     at::Tensor q_rstd = l2norm_qk ? torch::empty({T, H}, fopt) : torch::empty({0}, fopt);
     at::Tensor k_rstd = l2norm_qk ? torch::empty({T, H}, fopt) : torch::empty({0}, fopt);
-    at::Tensor aqk    = torch::empty({T, H, 64}, q.options());
-    at::Tensor akk    = torch::empty({T, H, 64}, q.options());
+    at::Tensor aqk    = torch::empty({0}, q.options());
+    at::Tensor akk    = torch::empty({0}, q.options());
     const bool qkn    = save_qkn && l2norm_qk;
-    at::Tensor qn     = qkn ? torch::empty_like(q) : torch::empty({0}, q.options());
-    at::Tensor kn     = qkn ? torch::empty_like(k) : torch::empty({0}, k.options());
+    at::Tensor qn     = qkn ? torch::empty(q.sizes(), fopt) : torch::empty({0}, fopt);
+    at::Tensor kn     = qkn ? torch::empty(k.sizes(), fopt) : torch::empty({0}, fopt);
     const bool has_cu = cu_seqlens.has_value() && cu_seqlens->defined();
     const int64_t N   = has_cu ? cu_seqlens->numel() - 1 : 1;
-    at::Tensor h      = torch::empty(
-        {save_h ? static_cast<int64_t>(flash_train_torch::gdnSavedHElements(T, H, N, has_cu)) : 0}, q.options());
+    at::Tensor h =
+        torch::empty({save_h ? static_cast<int64_t>(flash_train_torch::gdnSavedHElements(T, H, N, has_cu)) : 0}, fopt);
     const std::vector<GdnBridgeView> views = {
         gdnView(q),      gdnView(k),      gdnView(v),   gdnView(g),   gdnView(beta), gdnView(cu_seqlens), gdnView(o),
         gdnView(q_rstd), gdnView(k_rstd), gdnView(aqk), gdnView(akk), gdnView(qn),   gdnView(kn),         gdnView(h),
@@ -93,12 +93,10 @@ std::vector<at::Tensor> gdnBackward(const at::Tensor& d_o, const std::optional<a
                                     double scale, bool l2norm_qk) {
     const bool has_qk = q.has_value() && q->defined() && q->numel() > 0;
     TORCH_CHECK(has_qk || (qn.has_value() && qn->defined() && qn->numel() > 0), "gdn: backward needs q/k or qn/kn");
-    const at::Tensor& qs = has_qk ? *q : *qn;  // the [T, H, K] shape and options of q / k
-    // dq | dk as one buffer: with qn / kn saved the backward stages its fp32 gate scratch there
-    // (it would otherwise sit in the workspace beside the two idle outputs).
+    const at::Tensor& qs           = has_qk ? *q : *qn;  // the [T, H, K] shape and options of q / k
     std::vector<int64_t> dqk_shape = {2};
     dqk_shape.insert(dqk_shape.end(), qs.sizes().begin(), qs.sizes().end());
-    at::Tensor dqk = torch::empty(dqk_shape, qs.options());
+    at::Tensor dqk = torch::empty(dqk_shape, qs.options().dtype(at::kBFloat16));
     at::Tensor dq = dqk[0], dk = dqk[1], dv = torch::empty_like(v);
     at::Tensor dg = torch::empty_like(g), dbeta = torch::empty_like(beta);
     const std::vector<GdnBridgeView> views = {
