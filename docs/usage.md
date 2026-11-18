@@ -130,7 +130,7 @@ q / k / v / g 都是 `[B, T, H, 128]`，beta 是 `[B, T, H]`，A_log 是 `[H]`�
 
 预训练里如果只是把多篇文档直接拼接、没有传 `cu_seqlens`，对 KDA 来说仍是一条定长序列，属于第一种方式。
 
-需要我们按实际训练配置测性能时，提供以下几项即可：TP（或每卡 head 数）、micro batch size、seq_len、是否传 `cu_seqlens`（是的话附大致的文档长度分布或一份典型的 `cu_seqlens`）、是否开全层重算。CP（context parallel）目前不支持。
+需要我们按实际训练配置测性能时，提供以下几项即可：TP（或每卡 head 数）、micro batch size、seq_len、是否传 `cu_seqlens`（是的话附大致的文档长度分布或一份典型的 `cu_seqlens`）、是否开全层重算、CP（context parallel）大小。
 
 #### 1. 安装
 
@@ -138,11 +138,11 @@ wheel 绑定编译时的 DTK、torch 和 Python 版本：镜像与预编译 whee
 
 **1a. 预编译 wheel**（megatron 0.19.2 / DTK 26.10 / torch 2.11 / Python 3.12）
 
-从本仓库 Releases 页面的 `kda-mk3-e9eb1ef` 下载 `flash_train-0.1.0-cp312-cp312-linux_x86_64.whl`（MD5 `baf1a94f7cf648e0da22c6559db8d03e`，由提交 `e9eb1ef` 编译），然后：
+从本仓库 Releases 页面的 `kda-mk3-cp-197ef5c` 下载 `flash_train-0.1.0-cp312-cp312-linux_x86_64.whl`（MD5 `938fd0a5e4e2ed63f2a305690beaa5f8`，由本分支提交 `197ef5c` 在 gfx936 上编译，支持 CP > 1），然后：
 
 ```bash
-wget https://github.com/LearnMF/flash-train/releases/download/kda-mk3-e9eb1ef/flash_train-0.1.0-cp312-cp312-linux_x86_64.whl
-md5sum flash_train-0.1.0-cp312-cp312-linux_x86_64.whl   # baf1a94f7cf648e0da22c6559db8d03e
+wget https://github.com/LearnMF/flash-train/releases/download/kda-mk3-cp-197ef5c/flash_train-0.1.0-cp312-cp312-linux_x86_64.whl
+md5sum flash_train-0.1.0-cp312-cp312-linux_x86_64.whl   # 938fd0a5e4e2ed63f2a305690beaa5f8
 python3 -m pip install --no-deps --force-reinstall flash_train-0.1.0-cp312-cp312-linux_x86_64.whl
 python3 -c "import flash_train.torch as ft; print(ft.__file__, ft.chunk_kda)"
 ```
@@ -152,7 +152,7 @@ python3 -c "import flash_train.torch as ft; print(ft.__file__, ft.chunk_kda)"
 ```bash
 git clone -b feat/kda-gfx936-mk3-cp https://github.com/LearnMF/flash-train.git
 cd flash-train
-git checkout <commit>                         # 如果拿到的是指定版本（例如 e9eb1ef），先切到该提交
+git checkout <commit>                         # 如果拿到的是指定版本（例如 197ef5c），先切到该提交
 git rev-parse --short HEAD                    # 记下实际使用的版本，反馈问题时附上
 
 export DTKROOT=/opt/dtk                       # CMake 靠它找到 roctx
@@ -225,12 +225,52 @@ def kda(q, k, v, g, beta, a_log, dt_bias, lower_bound, *, cu_seqlens=None):
 - **全层重算**（`--recompute-granularity full`）：Megatron 用可重入 checkpoint，第一次前向在 no_grad 下运行，flash-train 不保存任何东西；重算前向按上面的表保存，只活到这一层的反向结束。
 - **确定性**：固定顺序归约、不用原子操作，同样的输入多次运行结果逐位相同；与 hip_kda 的独立版本也逐位一致。
 
+#### 5. context parallel（CP > 1）
+
+支持 FLA 的 **chunkwise CP**（`fla.ops.cp.build_cp_context` 造出的 `cp_context`），接口与 FLA 的 `chunk_kda` 完全一致，所以第 2 步换掉 import 之后，CP 的开关、`--context-parallel-size`、调用点全都不用再动。Megatron-LM-k3 的 `kda.py` 在 `cp_size_chunkwise > 1` 时自己构造 `cp_context` 并传进来。
+
+**算法**：每个 rank 先把自己这段序列总结成 `[M | S_loc]`（`S_loc` 是从零状态出发的末状态，`M` 是把值项置零、从单位矩阵出发得到的转移矩阵），`all_gather` 后在 fp32 下把前面各 rank 的总结复合成本 rank 的起始状态 `h0`，再从 `h0` 跑正常递推；反向镜像这一过程（`dh0 = Mᵀ dht + D`），梯度照常穿过 rank 边界。总结那两趟复用主调用的前处理，不重复做前处理。
+
+**数值**：CP2 / CP4，输出 `o` 和 `dq/dk/dv/dg/dbeta` 与「单卡一次算完整条序列」**逐位相同**（T 至 1K–8K、含慢衰减 gate 的用例都验过）。只有 `dt_bias` 的梯度有约 2.4e-3 的相对差异——它是按调用分段求和、每段舍入到 bf16 的标量参数梯度，FLA 的 CP 也是同一契约。
+
+**限制**（都会显式抛异常，不会静默回退）：
+
+- 每个 rank 一条本地序列：CP 下的 `cu_seqlens` 只能是 `[0, T_local]`，即 **CP 暂不支持 packed 变长序列**（Megatron 侧 TE 在 CP 下本来也不支持 pack）；对应地 `micro_batch_size` 需为 1（Megatron 的 `kda.py` 自己也有这个检查）。
+- 只支持 chunkwise CP，不支持 headwise CP（`cp_size_headwise > 1`）。
+- 要求 `K == V`（K3 是 128 = 128）。
+- `cp_context` 与 `initial_state` / `output_final_state=True` 不能同时用。
+- `CUDA_DEVICE_MAX_CONNECTIONS=1`（TP/CP 本来就要求）。
+- MLA 层在 CP 下跑不起来，报的是 TE 没有可用的 attention backend（FusedAttention 在 ROCm 上不支持 MLA、FlashAttention 对 padding 的 THD 关闭、Unfused 不支持 CP）。这与 KDA 实现无关，FLA 路线也一样；目前的 CP 验证用的是 KDA-only 的层配置（`--hybrid-layer-pattern K-KEKE/KE`）。
+
+**实测**（811 节点，8×BW1000，dtk2610 镜像，Megatron-LM-k3，KDA_HEADS 96，GBS 8，MBS 1，adam，mock 数据，6 个 iteration，KDA-only 层配置）：
+
+| 配置 | 每卡 token / KDA head | 步时 | 每卡峰值显存 | lm loss（iter 1 → 6） |
+|---|---|---|---|---|
+| TP4 / CP1 / 32K | 32K / 24 | 1.84 s | 27.5 GB | 10.800 → 9.690 |
+| TP4 / CP2 / 32K | 16K / 24 | 2.22–2.27 s | 14.7 GB | 10.800 → 9.711 |
+| TP2 / CP4 / 64K | 16K / 48 | 3.53–3.60 s | 28.3 GB | 10.805 → 9.693 |
+| TP4 / CP4 / 64K（2 节点） | 16K / 24 | 14.2–16.6 s | 14.9 GB | 10.801 → 9.706 |
+
+CP 把每卡显存按序列切开（TP4/32K：27.5 → 14.7 GB）。CP1 与 CP2 的步时不是纯 CP 对比（DP/EP 几何也不同）。两节点那一行走 eth0 TCP（IB 关闭），步时由 DP/EP 通信主导，只有显存可比。
+
+**算子自身的 CP 开销**（同样每卡 16K token，一次前向+反向，ABBA 交错计时取中位数）：CP2 / H=24：12.4 → 14.5 ms（+16.5%）；CP4 / H=48：24.1 → 29.2 ms（+21.4%）。
+
+**与 FLA 的 CP 对比**（bw52，8×BW1000，同机同配方，TP4 / CP2 / 32K）：
+
+| | 步时（iter 2–6 中位数） | 峰值显存 | 首个 iteration |
+|---|---|---|---|
+| FLA 0.5.2（打了 `num_stages=1` 补丁） | 2728 ms | 14890 MB | 521.6 s |
+| flash-train | 2146 ms | 14438 MB | 59.6 s |
+
+快 21.3%，loss 曲线一致（iter 1 吻合到 5 位、iter 6 到 4 位）。FLA 0.5.2 的 CP 在 gfx936 上需要改 `fla/ops/cp/chunk_delta_h.py` 两处 autotune 的 `num_stages` 为 `[1]` 才能跑：K=V=128 的 tile 让它的 merge kernel 要 80 KB LDS，超过 gfx936 的 64 KB 上限，砍 autotune 配置也降不下来。flash-train 这条路线不需要这个补丁。
+
 #### 参数对照（与 FLA 的差别）
 
 - 只做布局转换，与在打包 THD 张量上直接调用 `kimi_delta_attention` 逐位一致：`[B, T, H, D]` 展平成 `[B*T, H, D]`；`B > 1` 且不传 `cu_seqlens` 时按 B 条长度为 T 的序列处理；传 `cu_seqlens` 时要求 `B == 1`（与 FLA 相同）。
 - gate：`use_gate_in_kernel=True` 时要求给出 `A_log`、`dt_bias` 和 `lower_bound`（FLA 的 safe_gate 形式，即 K3 的用法）；`use_gate_in_kernel=False` 时 g 是逐 token log 衰减。`use_beta_sigmoid_in_kernel=True` 时在宿主侧对 beta 做 sigmoid（`allow_neg_eigval` 时乘 2）。
 - `disable_recompute` 与 FLA 含义相同，见上一节；不传时用算子自选的策略（FLA 的默认值是 `False`，这里是 `None`）。`chunk_size`、`cu_seqlens_cpu` 是 FLA 的调优参数，这里接受但不起作用。
-- 不支持的参数直接抛异常，不会悄悄回退：`initial_state`、`output_final_state=True`、`return_intermediate_states`、不为 None 的 `cp_context`（即 CP > 1）、没有 `lower_bound` 的 softplus gate 抛 `NotImplementedError`；未知关键字抛 `TypeError`。
+- `cp_context`（FLA 的 chunkwise CP）支持，见下一节；与 `initial_state` / `output_final_state=True` 不能同时传。
+- 不支持的参数直接抛异常，不会悄悄回退：`return_intermediate_states`、没有 `lower_bound` 的 softplus gate 抛 `NotImplementedError`；未知关键字抛 `TypeError`。
 
 ### KDA 调试开关（flash-train 开发用，训练不需要）
 
