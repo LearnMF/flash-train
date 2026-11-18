@@ -138,11 +138,11 @@ wheel 绑定编译时的 DTK、torch 和 Python 版本：镜像与预编译 whee
 
 **1a. 预编译 wheel**（megatron 0.19.2 / DTK 26.10 / torch 2.11 / Python 3.12）
 
-从本仓库 Releases 页面的 `kda-mk3-cp-197ef5c` 下载 `flash_train-0.1.0-cp312-cp312-linux_x86_64.whl`（MD5 `938fd0a5e4e2ed63f2a305690beaa5f8`，由本分支提交 `197ef5c` 在 gfx936 上编译，支持 CP > 1），然后：
+从本仓库 Releases 页面的 `kda-mk3-cp-5139c01` 下载 `flash_train-0.1.0-cp312-cp312-linux_x86_64.whl`（MD5 `c58a713b0be1ff585b7cb957fdcf9083`，由本分支提交 `5139c01` 在 gfx936 上编译，支持 CP > 1），然后：
 
 ```bash
-wget https://github.com/LearnMF/flash-train/releases/download/kda-mk3-cp-197ef5c/flash_train-0.1.0-cp312-cp312-linux_x86_64.whl
-md5sum flash_train-0.1.0-cp312-cp312-linux_x86_64.whl   # 938fd0a5e4e2ed63f2a305690beaa5f8
+wget https://github.com/LearnMF/flash-train/releases/download/kda-mk3-cp-5139c01/flash_train-0.1.0-cp312-cp312-linux_x86_64.whl
+md5sum flash_train-0.1.0-cp312-cp312-linux_x86_64.whl   # c58a713b0be1ff585b7cb957fdcf9083
 python3 -m pip install --no-deps --force-reinstall flash_train-0.1.0-cp312-cp312-linux_x86_64.whl
 python3 -c "import flash_train.torch as ft; print(ft.__file__, ft.chunk_kda)"
 ```
@@ -152,7 +152,7 @@ python3 -c "import flash_train.torch as ft; print(ft.__file__, ft.chunk_kda)"
 ```bash
 git clone -b feat/kda-gfx936-mk3-cp https://github.com/LearnMF/flash-train.git
 cd flash-train
-git checkout <commit>                         # 如果拿到的是指定版本（例如 197ef5c），先切到该提交
+git checkout <commit>                         # 如果拿到的是指定版本（例如 5139c01），先切到该提交
 git rev-parse --short HEAD                    # 记下实际使用的版本，反馈问题时附上
 
 export DTKROOT=/opt/dtk                       # CMake 靠它找到 roctx
@@ -229,9 +229,9 @@ def kda(q, k, v, g, beta, a_log, dt_bias, lower_bound, *, cu_seqlens=None):
 
 支持 FLA 的 **chunkwise CP**（`fla.ops.cp.build_cp_context` 造出的 `cp_context`），接口与 FLA 的 `chunk_kda` 完全一致，所以第 2 步换掉 import 之后，CP 的开关、`--context-parallel-size`、调用点全都不用再动。Megatron-LM-k3 的 `kda.py` 在 `cp_size_chunkwise > 1` 时自己构造 `cp_context` 并传进来。
 
-**算法**：每个 rank 先把自己这段序列总结成 `[M | S_loc]`（`S_loc` 是从零状态出发的末状态，`M` 是把值项置零、从单位矩阵出发得到的转移矩阵），`all_gather` 后在 fp32 下把前面各 rank 的总结复合成本 rank 的起始状态 `h0`，再从 `h0` 跑正常递推；反向镜像这一过程（`dh0 = Mᵀ dht + D`），梯度照常穿过 rank 边界。总结那两趟复用主调用的前处理，不重复做前处理。
+**算法**：每个 rank 先把自己这段序列总结成 `[M | S_loc]`（`S_loc` 是从零状态出发的末状态，`M` 是把值项置零、从单位矩阵出发得到的转移矩阵），`all_gather` 后在 fp32 下把前面各 rank 的总结复合成本 rank 的起始状态 `h0`，再从 `h0` 跑正常递推；反向镜像这一过程（`dh0 = Mᵀ dht + D`），梯度照常穿过 rank 边界。总结复用主调用的前处理，不重复做前处理。首 rank 只算 `S_loc`（它的 `M` 没人用），末 rank 不算总结；中间 rank 的 `S_loc` 和 `M` 在同一趟递推里算出（状态为 `K × (V + K)`）。
 
-**数值**：CP2 / CP4，输出 `o` 和 `dq/dk/dv/dg/dbeta` 与「单卡一次算完整条序列」**逐位相同**（T 至 1K–8K、含慢衰减 gate 的用例都验过）。只有 `dt_bias` 的梯度有约 2.4e-3 的相对差异——它是按调用分段求和、每段舍入到 bf16 的标量参数梯度，FLA 的 CP 也是同一契约。
+**数值**：CP2 / CP4，输出 `o` 和 `dq/dk/dv/dg/dbeta` 与「单卡一次算完整条序列」**逐位相同**（T 至 1K–8K、含慢衰减 gate 的用例都验过；`5139c01` 的 wheel 复验了 CP2 / CP3 / CP4）。两个按调用分段求和的标量参数梯度例外：`dt_bias` 的梯度有约 2.4e-3 的相对差异（每段舍入到 bf16，FLA 的 CP 也是同一契约），`A_log` 的梯度约 1e-7。验证用的每 rank 长度都是 64 token 的整数倍（Megatron 的 32K / 64K 切分即如此），其他长度没有验过。
 
 **限制**（都会显式抛异常，不会静默回退）：
 
@@ -242,7 +242,7 @@ def kda(q, k, v, g, beta, a_log, dt_bias, lower_bound, *, cu_seqlens=None):
 - `CUDA_DEVICE_MAX_CONNECTIONS=1`（TP/CP 本来就要求）。
 - MLA 层在 CP 下跑不起来，报的是 TE 没有可用的 attention backend（FusedAttention 在 ROCm 上不支持 MLA、FlashAttention 对 padding 的 THD 关闭、Unfused 不支持 CP）。这与 KDA 实现无关，FLA 路线也一样；目前的 CP 验证用的是 KDA-only 的层配置（`--hybrid-layer-pattern K-KEKE/KE`）。
 
-**实测**（811 节点，8×BW1000，dtk2610 镜像，Megatron-LM-k3，KDA_HEADS 96，GBS 8，MBS 1，adam，mock 数据，6 个 iteration，KDA-only 层配置）：
+**实测**（提交 `197ef5c`，811 节点，8×BW1000，dtk2610 镜像，Megatron-LM-k3，KDA_HEADS 96，GBS 8，MBS 1，adam，mock 数据，6 个 iteration，KDA-only 层配置）：
 
 | 配置 | 每卡 token / KDA head | 步时 | 每卡峰值显存 | lm loss（iter 1 → 6） |
 |---|---|---|---|---|
@@ -253,9 +253,19 @@ def kda(q, k, v, g, beta, a_log, dt_bias, lower_bound, *, cu_seqlens=None):
 
 CP 把每卡显存按序列切开（TP4/32K：27.5 → 14.7 GB）。CP1 与 CP2 的步时不是纯 CP 对比（DP/EP 几何也不同）。两节点那一行走 eth0 TCP（IB 关闭），步时由 DP/EP 通信主导，只有显存可比。
 
-**算子自身的 CP 开销**（同样每卡 16K token，一次前向+反向，ABBA 交错计时取中位数）：CP2 / H=24：12.4 → 14.5 ms（+16.5%）；CP4 / H=48：24.1 → 29.2 ms（+21.4%）。
+**算子自身的 CP 开销**（同样每卡 16K token，一次前向+反向，ABBA 交错计时取中位数，提交 `197ef5c`）：CP2 / H=24：12.4 → 14.5 ms（+16.5%）；CP4 / H=48：24.1 → 29.2 ms（+21.4%）。
 
-**与 FLA 的 CP 对比**（bw52，8×BW1000，同机同配方，TP4 / CP2 / 32K）：
+**`5139c01` 相对 `197ef5c`**（中间 rank 的 `S_loc` 和 `M` 合成一趟递推；新旧 wheel 交替实测）：
+
+| | CP2 | CP4 |
+|---|---|---|
+| 算子前向（bw61，每卡 16K token，H=24） | 3.78 → 3.74 ms | 4.80 → 4.19 ms |
+| 算子前向+反向（同上） | 13.08 → 13.02 ms | 14.25 → 13.65 ms |
+| Megatron 步时（bw52，同上配方，12 个 iteration，各两轮） | TP4/CP2/32K：2134.8 → 2137.9 ms | TP2/CP4/64K：3550.6 → 3530.1 ms |
+
+CP2 没有中间 rank，不受影响。CP4 端到端快 0.6%，与同一个 wheel 两轮之间的差异同量级；loss 和峰值显存没有差别。
+
+**与 FLA 的 CP 对比**（提交 `197ef5c`，bw52，8×BW1000，同机同配方，TP4 / CP2 / 32K）：
 
 | | 步时（iter 2–6 中位数） | 峰值显存 | 首个 iteration |
 |---|---|---|---|
