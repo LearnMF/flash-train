@@ -220,6 +220,26 @@ inline bool g2Vna() {
     return known[d] == 1;
 }
 
+// kra P-938cp2: gfx938 -- the CP backward's summary recurrence does not write the hand-offs only wy reads.
+// KDA_G2_CP_BSUM=0 (FTRAIN_KDA_DEV only) keeps them.
+inline bool g2CpBsum() {
+    static const bool on = [] {
+        const char* d = std::getenv(FTRAIN_KDA_DEV);
+        const bool dev = d != nullptr && *d != '\0' && std::strcmp(d, "0") != 0;
+        const char* e = dev ? std::getenv("KDA_G2_CP_BSUM") : nullptr;
+        return e == nullptr || std::strcmp(e, "0") != 0;
+    }();
+    if (!on) { return false; }
+    static int known[64] = {};   // 0 unknown, 1 gfx938, 2 other
+    int d = 0;
+    if (hipGetDevice(&d) != hipSuccess || d < 0 || d >= 64) { return false; }
+    if (known[d] == 0) {
+        hipDeviceProp_t prop;
+        known[d] = (hipGetDeviceProperties(&prop, d) == hipSuccess && std::strncmp(prop.gcnArchName, "gfx938", 6) == 0) ? 1 : 2;
+    }
+    return known[d] == 1;
+}
+
 // kra P-94: the forward runs the R4 prep also without in-kernel l2norm (bitwise the X1 chain);
 // KDA_G2_PREP_NOL2=0 (FTRAIN_KDA_DEV only) keeps the X1 chain for A/B gates.
 inline bool g2UsePrep(const Shape& shape) {
@@ -502,8 +522,11 @@ void backward(const Shape& shape, const BackwardArgs& p, void* workspace, FTrain
           "dav");
     }  // !reuse
     if (shape.prepOnly()) { return; }  // no other rank reads this rank's dh0
-    check(g2_dhu_v8b(L.KgA, L.Qn, L.Wb, L.dOT, L.dVn, L.Gn, nullptr, L.HbNdh, L.ANv2, p.scale, 1, NT * 64, H, L.tab.seg,
-                     nseg, p.dht, p.dh0, stream),
+    // kra P-938cp2 (gfx938): the summary pass needs dh0 only -- without its hand-offs to wy the recurrence takes
+    // 0.53 -> 0.49 ms (H = 8, 12), 1.01 -> 0.84 (24), 1.62 -> 1.46 (48) at 16K.
+    const bool bsum = summary && g2CpBsum();
+    check(g2_dhu_v8b(L.KgA, L.Qn, L.Wb, L.dOT, L.dVn, L.Gn, nullptr, bsum ? nullptr : L.HbNdh,
+                     bsum ? nullptr : L.ANv2, p.scale, 1, NT * 64, H, L.tab.seg, nseg, p.dht, p.dh0, stream),
           "dhu");
     if (summary) { return; }  // the summary phase stops at the recurrence: dh0 is its only output
     // kra P-938q: gfx938 without in-kernel l2norm -- s4b writes the final bf16 dq / dk, bwd_tail skips its cast

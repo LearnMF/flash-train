@@ -669,6 +669,9 @@ extern "C" int g2_dhu_v8b(const void* KgA, const void* Qg, const void* Wb, const
     const long ctas = 4L * nseg * H;
     // kra P-85: re-measured on P-82b -- the 8-wave form wins from 128 CTAs on (H=48: 1.05-1.15x)
     int dhu4 = (ctas >= 96 && ctas <= g2_env_long("KDA_G2_DHU4_MAX_CTAS", 127)) ? 1 : 0;
+    // kra P-938cp2: gfx938's CP summary pass (dh0 only, no hand-off written) stays on the 8-wave form -- 16K, H = 24
+    // (96 CTAs): 0.85 -> 0.78 ms; the 4-wave form also loses at 48 CTAs (0.49 -> 0.60) and 192 (1.45 -> 1.77).
+    if (HbN == nullptr && ANv2 == nullptr && dv2 == nullptr && g2_cur_gfx938()) dhu4 = 0;
     if (const char* e = g2::g2_getenv("KDA_G2_R1A_DHU")) dhu4 = atoi(e);
     // kra P-24: at deep saturation cap dhu at 1 CTA/CU (33 KB LDS per CTA): the operands shared
     // by a head's 4 V-slab CTAs then stay in L2.
