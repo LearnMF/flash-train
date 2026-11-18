@@ -47,6 +47,10 @@ struct FwdOParams {
     // (null = skip).
     const float* H0 = nullptr;
     float* Ht = nullptr;
+    // CP summary pass (v8o4, ST only): HtAux set -> grid.x doubles; the second half of the V-slab
+    // CTAs carries a K x K state from H0Aux with a zero value term (the transition matrix) into HtAux.
+    const float* H0Aux = nullptr;
+    float* HtAux = nullptr;
 };
 
 // The state slice a wave holds: the lane (m, q4) of the wave owning key block kb keeps
@@ -304,22 +308,25 @@ __global__ void __launch_bounds__(256) g2_fwd_h_v8o4_kernel(FwdOParams p) {
     __shared__ __align__(16) bf16 vB[kBV * kPadT];
     __shared__ __align__(16) bf16 oStage[4][256];
     const int tid = threadIdx.x, wv = SG ? __builtin_amdgcn_readfirstlane(tid >> 6) : (tid >> 6), l = tid & 63;   // kra P-58   // wv in 0..3
-    const int vs = blockIdx.x;
+    const bool ax = ST && p.HtAux != nullptr && blockIdx.x >= kK / kBV;   // transition-matrix slab
+    const int vs = ax ? blockIdx.x - kK / kBV : blockIdx.x;
+    const float* H0 = ax ? p.H0Aux : p.H0;
+    float* Ht = ax ? p.HtAux : p.Ht;
     const int sg = blockIdx.y / p.H, bh = blockIdx.y - sg * p.H;
     const int c0 = p.seg ? p.seg[sg] : 0, c1 = p.seg ? p.seg[sg + 1] : p.NT;
     const int kb0 = wv, kb1 = wv + 4;        // GEMM2 K-blocks
     f4 ht0[2], ht1[2];
     if constexpr (ST) {
-        g2_state_load<KP, BP>(p.H0, sg, p.H, bh, kb0, vs, l, ht0);
-        g2_state_load<KP, BP>(p.H0, sg, p.H, bh, kb1, vs, l, ht1);
+        g2_state_load<KP, BP>(H0, sg, p.H, bh, kb0, vs, l, ht0);
+        g2_state_load<KP, BP>(H0, sg, p.H, bh, kb1, vs, l, ht1);
     } else {
         ht0[0] = f4{0.f,0.f,0.f,0.f}; ht0[1] = ht0[0];
         ht1[0] = ht0[0];              ht1[1] = ht0[0];
     }
     if (c0 >= c1) {                          // empty segment: S_final = h0
-        if (ST && p.Ht != nullptr) {
-            g2_state_store<KP, BP>(p.Ht, sg, p.H, bh, kb0, vs, l, ht0);
-            g2_state_store<KP, BP>(p.Ht, sg, p.H, bh, kb1, vs, l, ht1);
+        if (ST && Ht != nullptr) {
+            g2_state_store<KP, BP>(Ht, sg, p.H, bh, kb0, vs, l, ht0);
+            g2_state_store<KP, BP>(Ht, sg, p.H, bh, kb1, vs, l, ht1);
         }
         return;
     }
@@ -349,7 +356,9 @@ __global__ void __launch_bounds__(256) g2_fwd_h_v8o4_kernel(FwdOParams p) {
     };
     auto loadU = [&](int i, int v1a_, v4bh& uf) {
         // kra L16: uf0/uf1 are one 16 B pair -- loaded on the v1a_ == 0 call (always paired)
-        if (v1a_ == 0) ld16x2(p.Un + (((chunk + i) * 4 + r1) * 8 + 2 * vs) * 256 + l * 8, uf0, uf1);
+        if (ax) {                     // zero value term: the state carried is the transition matrix
+            if (v1a_ == 0) { uf0 = v4bh{0, 0, 0, 0}; uf1 = uf0; }
+        } else if (v1a_ == 0) ld16x2(p.Un + (((chunk + i) * 4 + r1) * 8 + 2 * vs) * 256 + l * 8, uf0, uf1);
         (void)uf;
     };
     auto loadG = [&](int i, int kb, f4& gl) {
@@ -636,9 +645,9 @@ __global__ void __launch_bounds__(256) g2_fwd_h_v8o4_kernel(FwdOParams p) {
             loadK(nxt, kb0, kf0); loadK(nxt, kb1, kf1);
         }
     }
-    if constexpr (ST) if (p.Ht != nullptr) {
-        g2_state_store<KP, BP>(p.Ht, sg, p.H, bh, kb0, vs, l, ht0);
-        g2_state_store<KP, BP>(p.Ht, sg, p.H, bh, kb1, vs, l, ht1);
+    if constexpr (ST) if (Ht != nullptr) {
+        g2_state_store<KP, BP>(Ht, sg, p.H, bh, kb0, vs, l, ht0);
+        g2_state_store<KP, BP>(Ht, sg, p.H, bh, kb1, vs, l, ht1);
     }
 }
 
@@ -937,12 +946,12 @@ extern "C" int g2_exp2_inplace(float* x, long n, hipStream_t s) {
     return (int)hipGetLastError();
 }
 
-extern "C" int g2_fwd_h_v8o(const void* Wn, const void* Kn, const void* Un, const void* Gn,
-                            const void* QgA, const void* AqkA, void* O, void* Ob, void* Vn,
-                            void* HbN, void* ANv,
-                            float scale, int B, int T, int H, const int* seg, int nseg,
-                            const int* ctok, const int* clen, const void* GnRaw, const void* H0, void* Ht,
-                            hipStream_t s) {
+extern "C" int g2_fwd_h_v8o2(const void* Wn, const void* Kn, const void* Un, const void* Gn,
+                             const void* QgA, const void* AqkA, void* O, void* Ob, void* Vn,
+                             void* HbN, void* ANv,
+                             float scale, int B, int T, int H, const int* seg, int nseg,
+                             const int* ctok, const int* clen, const void* GnRaw, const void* H0, void* Ht,
+                             const void* H0Aux, void* HtAux, hipStream_t s) {
     // T is the chunk-padded row count (NT = T / 64); with ctok/clen the o rows are packed.
     if (T % kBT || B != 1) return -1;                  // batch = segments (seg/nseg)
     if (seg == nullptr) nseg = 1;
@@ -953,9 +962,11 @@ extern "C" int g2_fwd_h_v8o(const void* Wn, const void* Kn, const void* Un, cons
                  scale, H, T / kBT, seg, nseg, ctok, clen, (const float*)GnRaw, (const float*)H0, (float*)Ht};
     int r1a = 1;   // R1a: 4-wave dedup form (bitwise equal; 0 restores the 8-wave form)
     if (const char* e = g2::g2_getenv("KDA_G2_R1A")) r1a = atoi(e);
+    p.H0Aux = (const float*)H0Aux; p.HtAux = (float*)HtAux;
+    if (HtAux != nullptr && (Ht == nullptr || O != nullptr || Ob != nullptr || Vn || HbN || ANv)) return -3;
     const bool kp = g2_kp_layout(H);   // kra P-61e: Kn lane-permuted / Gn natural-k producers
     if (kp) r1a = 1;
-    const dim3 grid(kK / kBV, (unsigned)nseg * H);
+    const dim3 grid(kK / kBV * (HtAux ? 2 : 1), (unsigned)nseg * H);
     // kra P-9: the production output sets get compile-time instances, others the generic one
     // Mode 1 (forward, o only) is NOT selected: measured 4% slower (kra P-9) -- without the
     // conservative waits the compiler clusters the loads and VMEM issue stalls return, while the
@@ -1025,6 +1036,7 @@ extern "C" int g2_fwd_h_v8o(const void* Wn, const void* Kn, const void* Un, cons
     // are issued by 2 CTAs instead of 4 (bit-identical per column)
     // gated to long sequences: at NT < 512 the 96-CTA wide grid's CU imbalance cost more than the shared
     // loads it saves (16K/48 mode 4 0.91x, 8K/96 0.68x); 32K/48 1.02-1.12x, 64K/48 1.12-1.40x
+    if (HtAux != nullptr) r1a = 1;   // the transition-matrix slabs exist in v8o4 only
     // kra P-938z: gfx938 at H <= 8 (<= 32 CTAs of 32 columns on 72 CUs): 16-column slabs, 8 CTAs per head.  The step
     // latency scales with the slab width (64-col 2.0-2.3x slower than 32-col), and 16-col is 1.12-1.18x faster than the
     // kp 32-col default at H = 8 (bit-identical).  At H >= 16 it loses (0.64-0.87x), so not there.
@@ -1068,6 +1080,16 @@ extern "C" int g2_fwd_h_v8o(const void* Wn, const void* Kn, const void* Un, cons
         else     hipLaunchKernelGGL(g2_fwd_h_v8o_kernel<false>, grid, dim3(512), 0, s, p);
     }
     return (int)hipGetLastError();
+}
+
+extern "C" int g2_fwd_h_v8o(const void* Wn, const void* Kn, const void* Un, const void* Gn,
+                            const void* QgA, const void* AqkA, void* O, void* Ob, void* Vn,
+                            void* HbN, void* ANv,
+                            float scale, int B, int T, int H, const int* seg, int nseg,
+                            const int* ctok, const int* clen, const void* GnRaw, const void* H0, void* Ht,
+                            hipStream_t s) {
+    return g2_fwd_h_v8o2(Wn, Kn, Un, Gn, QgA, AqkA, O, Ob, Vn, HbN, ANv, scale, B, T, H, seg, nseg, ctok,
+                         clen, GnRaw, H0, Ht, nullptr, nullptr, s);
 }
 
 }  // namespace g2

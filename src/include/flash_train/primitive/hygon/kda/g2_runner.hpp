@@ -41,7 +41,11 @@ struct Shape {
     int cp_phase = 0;
 
     bool reusePrep() const noexcept { return cp_phase == 2 || cp_phase == 3; }
-    bool stateOnly() const noexcept { return cp_phase == 1 || cp_phase == 2; }
+    // Forward phase 6: phase 1 with the transition matrix in the same recurrence pass (the state
+    // is K x (V + K)): the initial state is the matrix's start (I), the final state holds
+    // [S_loc; M] as two states.
+    bool withM() const noexcept { return cp_phase == 6; }
+    bool stateOnly() const noexcept { return cp_phase == 1 || cp_phase == 2 || cp_phase == 6; }
     bool prepOnly() const noexcept { return cp_phase == 4; }
     bool zeroU() const noexcept { return cp_phase == 2; }
 
