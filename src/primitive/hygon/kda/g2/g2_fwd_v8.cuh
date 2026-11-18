@@ -299,11 +299,12 @@ __global__ void __launch_bounds__(256) g2_fwd_h_v8o4_kernel(FwdOParams p) {
     // younger, actually-issued loads to land (v8o4 fwd: one GEMM1 wait = 15.7% of the step).
     // MODE 0 generic | 1 fwd (Ob) | 2 fwd keep-state (Ob+HbN+Vn+ANv) | 3 bwd recompute (HbN+Vn+ANv)
     // | 4 bwd recompute without the aN copy (HbN+Vn; s4b rebuilds aN from Vn) [kra P-22]
+    // | 6 state only (no output: the CP summary recurrence)
     const bool hasO  = MODE == 0 ? p.O != nullptr : false;
-    const bool hasOb = MODE == 0 ? p.Ob != nullptr : (MODE != 3 && MODE != 4);
-    const bool hasBN = MODE == 0 ? p.HbN != nullptr : MODE != 1;
-    const bool hasVn = MODE == 0 ? p.Vn != nullptr : (MODE != 1 && MODE != 5);   // kra P-82: MODE 5 = Ob + HbN
-    const bool hasAN = MODE == 0 ? p.ANv != nullptr : (MODE != 1 && MODE != 4 && MODE != 5);
+    const bool hasOb = MODE == 0 ? p.Ob != nullptr : (MODE != 3 && MODE != 4 && MODE != 6);
+    const bool hasBN = MODE == 0 ? p.HbN != nullptr : (MODE != 1 && MODE != 6);
+    const bool hasVn = MODE == 0 ? p.Vn != nullptr : (MODE != 1 && MODE != 5 && MODE != 6);   // kra P-82: MODE 5 = Ob + HbN
+    const bool hasAN = MODE == 0 ? p.ANv != nullptr : (MODE != 1 && MODE != 4 && MODE != 5 && MODE != 6);
     __shared__ __align__(16) bf16 hB[kBV * kPadK];
     __shared__ __align__(16) bf16 vB[kBV * kPadT];
     __shared__ __align__(16) bf16 oStage[4][256];
@@ -660,13 +661,20 @@ struct V8o4K {
 
 
 // kra P-49: g2_fwd_h_v8o4_kernel with NVH 16-column V-tiles per CTA (NVH = 4: 64 columns, 2 CTAs/head)
-template <bool VL, int MODE = 0, int NVH = 4>
+// ST: the H0 / Ht state ports, as in g2_fwd_h_v8o4_kernel (false: the pre-port kernel).  A wave's lane (m, q4) of
+// key block kb holds ht[vt][e] = S[16 kb + c_col(l, e)][16 NVH vs + 16 vt + m], as write_h stores it.
+template <int NVH>
+__device__ __forceinline__ size_t g2w_state_off(int sg, int H, int bh, int kb, int vs, int vt, int l, int e) {
+    return (((size_t)sg * H + bh) * kK + 16 * kb + c_col(l, e)) * kV + 16 * NVH * vs + 16 * vt + (l & 15);
+}
+
+template <bool VL, int MODE = 0, int NVH = 4, bool ST = false>
 __global__ void __launch_bounds__(256) g2_fwd_h_v8o4w_kernel(FwdOParams p) {
     const bool hasO  = MODE == 0 ? p.O != nullptr : false;
-    const bool hasOb = MODE == 0 ? p.Ob != nullptr : (MODE != 3 && MODE != 4);
-    const bool hasBN = MODE == 0 ? p.HbN != nullptr : MODE != 1;
-    const bool hasVn = MODE == 0 ? p.Vn != nullptr : (MODE != 1 && MODE != 5);   // kra P-82: MODE 5 = Ob + HbN
-    const bool hasAN = MODE == 0 ? p.ANv != nullptr : (MODE != 1 && MODE != 4 && MODE != 5);
+    const bool hasOb = MODE == 0 ? p.Ob != nullptr : (MODE != 3 && MODE != 4 && MODE != 6);
+    const bool hasBN = MODE == 0 ? p.HbN != nullptr : (MODE != 1 && MODE != 6);   // MODE 6: state only, as v8o4
+    const bool hasVn = MODE == 0 ? p.Vn != nullptr : (MODE != 1 && MODE != 5 && MODE != 6);   // kra P-82: MODE 5 = Ob + HbN
+    const bool hasAN = MODE == 0 ? p.ANv != nullptr : (MODE != 1 && MODE != 4 && MODE != 5 && MODE != 6);
     constexpr int BVW = 16 * NVH;
     __shared__ __align__(16) bf16 hB[BVW * kPadK];
     __shared__ __align__(16) bf16 vB[BVW * kPadT];
@@ -675,7 +683,7 @@ __global__ void __launch_bounds__(256) g2_fwd_h_v8o4w_kernel(FwdOParams p) {
     const int vs = blockIdx.x;
     const int sg = blockIdx.y / p.H, bh = blockIdx.y - sg * p.H;
     const int c0 = p.seg ? p.seg[sg] : 0, c1 = p.seg ? p.seg[sg + 1] : p.NT;
-    if (c0 >= c1) return;
+    if constexpr (!ST) { if (c0 >= c1) return; }
     const size_t chunk = (size_t)bh * p.NT;
     const int r1 = wv;
     const int kb0 = wv, kb1 = wv + 4;
@@ -685,6 +693,29 @@ __global__ void __launch_bounds__(256) g2_fwd_h_v8o4w_kernel(FwdOParams p) {
     f4 ht0[NVH], ht1[NVH];
     #pragma unroll
     for (int v = 0; v < NVH; ++v) { ht0[v] = f4{0.f,0.f,0.f,0.f}; ht1[v] = ht0[v]; }
+    if constexpr (ST) {
+        if (p.H0 != nullptr) {
+            #pragma unroll
+            for (int vt = 0; vt < NVH; ++vt)
+                #pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    ht0[vt][e] = p.H0[g2w_state_off<NVH>(sg, p.H, bh, kb0, vs, vt, l, e)];
+                    ht1[vt][e] = p.H0[g2w_state_off<NVH>(sg, p.H, bh, kb1, vs, vt, l, e)];
+                }
+        }
+        if (c0 >= c1) {                          // empty segment: S_final = h0
+            if (p.Ht != nullptr) {
+                #pragma unroll
+                for (int vt = 0; vt < NVH; ++vt)
+                    #pragma unroll
+                    for (int e = 0; e < 4; ++e) {
+                        p.Ht[g2w_state_off<NVH>(sg, p.H, bh, kb0, vs, vt, l, e)] = ht0[vt][e];
+                        p.Ht[g2w_state_off<NVH>(sg, p.H, bh, kb1, vs, vt, l, e)] = ht1[vt][e];
+                    }
+            }
+            return;
+        }
+    }
     v4bh wf[8], kf0[4], kf1[4], uf[NVH], qgf[8], aqf[4];
     f4 gl0, gl1;
 
@@ -871,6 +902,15 @@ __global__ void __launch_bounds__(256) g2_fwd_h_v8o4w_kernel(FwdOParams p) {
         write_h(kb0, ht0);
         write_h(kb1, ht1);
     }
+    if constexpr (ST) if (p.Ht != nullptr) {
+        #pragma unroll
+        for (int vt = 0; vt < NVH; ++vt)
+            #pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                p.Ht[g2w_state_off<NVH>(sg, p.H, bh, kb0, vs, vt, l, e)] = ht0[vt][e];
+                p.Ht[g2w_state_off<NVH>(sg, p.H, bh, kb1, vs, vt, l, e)] = ht1[vt][e];
+            }
+    }
 }
 
 // kra P-52: Gn -> exp2f(Gn) in place, the consumers' former per-step exp2f evaluated once
@@ -994,6 +1034,14 @@ extern "C" int g2_fwd_h_v8o2(const void* Wn, const void* Kn, const void* Un, con
     // kra P-58: SGPR wave index only in the chain-bound regime (at most one CTA per CU)
     const bool sg = 4L * nseg * H <= g2_env_long("KDA_G2_SGPR_MAX_CTAS", 80);
     const bool st = H0 != nullptr || Ht != nullptr;   // state ports: the same instance with ST
+    // kra P-938cp1: the CP summary pass (state only, no output) on its own compile-time instance (MODE 6) instead of
+    // the generic one, whose runtime-optional outputs make the waitcnt pass count the skip path (P-9).  gfx938, 16K:
+    // S_loc 0.42 -> 0.35 ms (H = 8), 0.39 -> 0.33 (12), 0.58 -> 0.48 (24), 0.75 -> 0.66 (48); [S_loc | M] 0.55 ->
+    // 0.46 (12), 0.74 -> 0.64 (24), 1.35 -> 1.17 (48); bit-identical.  SG (P-58) on the kp layouts: H = 12 0.37 ->
+    // 0.33, without kp (H = 8) 0.35 -> 0.36.  KDA_G2_CP_FSUM: 0 generic | 1 measured | 2 never SG | 3 always SG.
+    const bool sum = st && O == nullptr && Ob == nullptr && !Vn && !HbN && !ANv;
+    const long fsum = g2_env_long("KDA_G2_CP_FSUM", g2_cur_gfx938() ? 1 : 0);
+    if (sum && fsum) mode = 6;
     auto launch4s = [&](auto k) {
         using K = decltype(k);
         if (st) launch4(K::template get<true>()); else launch4(K::template get<false>());
@@ -1027,6 +1075,14 @@ extern "C" int g2_fwd_h_v8o2(const void* Wn, const void* Kn, const void* Un, con
                     else if (kp) launch4s(V8o4K<VL, 4, true, false, false, true, false, true>{});
                     else      launch4s(V8o4K<VL, 4>{});
                     break;
+            case 6: {   // kra P-938cp1
+                const bool sg6 = fsum == 3 || (fsum == 1 && kp);
+                if (kp) { if (sg6) launch4s(V8o4K<VL, 6, true, true, false, true, true>{});
+                          else     launch4s(V8o4K<VL, 6, true, false, false, true, true>{}); }
+                else    { if (sg6) launch4s(V8o4K<VL, 6, true, true>{});
+                          else     launch4s(V8o4K<VL, 6>{}); }
+                break;
+            }
             default: if (kp) launch4s(V8o4K<VL, 0, true, false, false, true, true>{});
                      else    launch4s(V8o4K<VL, 0>{});
                      break;
@@ -1040,33 +1096,39 @@ extern "C" int g2_fwd_h_v8o2(const void* Wn, const void* Kn, const void* Un, con
     // kra P-938z: gfx938 at H <= 8 (<= 32 CTAs of 32 columns on 72 CUs): 16-column slabs, 8 CTAs per head.  The step
     // latency scales with the slab width (64-col 2.0-2.3x slower than 32-col), and 16-col is 1.12-1.18x faster than the
     // kp 32-col default at H = 8 (bit-identical).  At H >= 16 it loses (0.64-0.87x), so not there.
-    const bool narrow938 = r1a && !kp && !st && H <= 8 && g2_cur_gfx938();
+    // kra P-938cp3: on gfx938 the calls with state ports (CP) follow the same slab policy -- 16K: the o recurrence
+    // from h0 0.60 -> 0.43 ms at H = 8 (narrow), 1.81 -> 1.53 at H = 64 and 2.64 -> 2.49 at H = 96 (wide); the summary
+    // pass 0.35 -> 0.30 at H = 8 (narrow) but 0.93 -> 1.03 at H = 64 and 1.38 -> 1.69 at H = 96, so it never goes wide.
+    // The transition-matrix slabs exist in v8o4 only.  KDA_G2_CP_WST=0: state ports always on v8o4.
+    const bool wst = HtAux == nullptr && (!st || (g2_cur_gfx938() && g2_env_long("KDA_G2_CP_WST", 1) != 0));
+    const bool narrow938 = r1a && !kp && wst && H <= 8 && g2_cur_gfx938();
     // kra P-938wd: gfx938 at H >= 64 (>= 128 wide CTAs): wide at every NT -- the hand-off-free ceiling showed fwd_h's
     // K-side reads at 30-55% of its time there; wide 1.04x (2K) .. 1.16x (16K).  At H = 32 (64 CTAs) it loses 0.74-0.79x.
     const long wmin_nt = g2_env_long("KDA_G2_V8O4W_MIN_NT", g2_cur_gfx938() && H >= 64 ? 0 : 512);
-    if (narrow938 || (r1a && !kp && !st && H >= g2_env_long("KDA_G2_V8O4W_MIN_H", 40) && T / kBT >= wmin_nt)) {
+    if (narrow938 || (r1a && !kp && wst && !sum && H >= g2_env_long("KDA_G2_V8O4W_MIN_H", 40) && T / kBT >= wmin_nt)) {
         const int nvh = (int)g2_env_long("KDA_G2_V8O4W_NVH", narrow938 ? 1 : 4);   // kra P-938z: 1 = 16-column slabs
         const dim3 gridw(kK / (16 * nvh), (unsigned)nseg * H);
         auto v8o4w = [&](auto vl) {
             constexpr bool VL = decltype(vl)::value;
             if (nvh == 1) {
                 switch (mode) {
-                    case 1: hipLaunchKernelGGL((g2_fwd_h_v8o4w_kernel<VL, 1, 1>), gridw, dim3(256), 0, s, p); break;
-                    case 2: hipLaunchKernelGGL((g2_fwd_h_v8o4w_kernel<VL, 2, 1>), gridw, dim3(256), 0, s, p); break;
-                    case 3: hipLaunchKernelGGL((g2_fwd_h_v8o4w_kernel<VL, 3, 1>), gridw, dim3(256), 0, s, p); break;
-                    case 4: hipLaunchKernelGGL((g2_fwd_h_v8o4w_kernel<VL, 4, 1>), gridw, dim3(256), 0, s, p); break;
-                    case 5: hipLaunchKernelGGL((g2_fwd_h_v8o4w_kernel<VL, 5, 1>), gridw, dim3(256), 0, s, p); break;
-                    default: hipLaunchKernelGGL((g2_fwd_h_v8o4w_kernel<VL, 0, 1>), gridw, dim3(256), 0, s, p); break;
+                    case 1: hipLaunchKernelGGL((st ? g2_fwd_h_v8o4w_kernel<VL, 1, 1, true> : g2_fwd_h_v8o4w_kernel<VL, 1, 1>), gridw, dim3(256), 0, s, p); break;
+                    case 2: hipLaunchKernelGGL((st ? g2_fwd_h_v8o4w_kernel<VL, 2, 1, true> : g2_fwd_h_v8o4w_kernel<VL, 2, 1>), gridw, dim3(256), 0, s, p); break;
+                    case 3: hipLaunchKernelGGL((st ? g2_fwd_h_v8o4w_kernel<VL, 3, 1, true> : g2_fwd_h_v8o4w_kernel<VL, 3, 1>), gridw, dim3(256), 0, s, p); break;
+                    case 4: hipLaunchKernelGGL((st ? g2_fwd_h_v8o4w_kernel<VL, 4, 1, true> : g2_fwd_h_v8o4w_kernel<VL, 4, 1>), gridw, dim3(256), 0, s, p); break;
+                    case 5: hipLaunchKernelGGL((st ? g2_fwd_h_v8o4w_kernel<VL, 5, 1, true> : g2_fwd_h_v8o4w_kernel<VL, 5, 1>), gridw, dim3(256), 0, s, p); break;
+                    case 6: hipLaunchKernelGGL((g2_fwd_h_v8o4w_kernel<VL, 6, 1, true>), gridw, dim3(256), 0, s, p); break;   // kra P-938cp1
+                    default: hipLaunchKernelGGL((st ? g2_fwd_h_v8o4w_kernel<VL, 0, 1, true> : g2_fwd_h_v8o4w_kernel<VL, 0, 1>), gridw, dim3(256), 0, s, p); break;
                 }
                 return;
             }
             switch (mode) {
-                case 1: hipLaunchKernelGGL((g2_fwd_h_v8o4w_kernel<VL, 1>), gridw, dim3(256), 0, s, p); break;
-                case 2: hipLaunchKernelGGL((g2_fwd_h_v8o4w_kernel<VL, 2>), gridw, dim3(256), 0, s, p); break;
-                case 3: hipLaunchKernelGGL((g2_fwd_h_v8o4w_kernel<VL, 3>), gridw, dim3(256), 0, s, p); break;
-                case 4: hipLaunchKernelGGL((g2_fwd_h_v8o4w_kernel<VL, 4>), gridw, dim3(256), 0, s, p); break;
-                case 5: hipLaunchKernelGGL((g2_fwd_h_v8o4w_kernel<VL, 5>), gridw, dim3(256), 0, s, p); break;   // kra P-82
-                default: hipLaunchKernelGGL((g2_fwd_h_v8o4w_kernel<VL, 0>), gridw, dim3(256), 0, s, p); break;
+                case 1: hipLaunchKernelGGL((st ? g2_fwd_h_v8o4w_kernel<VL, 1, 4, true> : g2_fwd_h_v8o4w_kernel<VL, 1>), gridw, dim3(256), 0, s, p); break;
+                case 2: hipLaunchKernelGGL((st ? g2_fwd_h_v8o4w_kernel<VL, 2, 4, true> : g2_fwd_h_v8o4w_kernel<VL, 2>), gridw, dim3(256), 0, s, p); break;
+                case 3: hipLaunchKernelGGL((st ? g2_fwd_h_v8o4w_kernel<VL, 3, 4, true> : g2_fwd_h_v8o4w_kernel<VL, 3>), gridw, dim3(256), 0, s, p); break;
+                case 4: hipLaunchKernelGGL((st ? g2_fwd_h_v8o4w_kernel<VL, 4, 4, true> : g2_fwd_h_v8o4w_kernel<VL, 4>), gridw, dim3(256), 0, s, p); break;
+                case 5: hipLaunchKernelGGL((st ? g2_fwd_h_v8o4w_kernel<VL, 5, 4, true> : g2_fwd_h_v8o4w_kernel<VL, 5>), gridw, dim3(256), 0, s, p); break;   // kra P-82
+                default: hipLaunchKernelGGL((st ? g2_fwd_h_v8o4w_kernel<VL, 0, 4, true> : g2_fwd_h_v8o4w_kernel<VL, 0>), gridw, dim3(256), 0, s, p); break;
             }
         };
         if (ctok != nullptr) v8o4w(std::true_type{}); else v8o4w(std::false_type{});
