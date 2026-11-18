@@ -161,3 +161,126 @@ def test_extreme_decay_and_zero_norm(decay):
     torch.testing.assert_close(actual,o)
     for a, b in zip(result, expect):
         torch.testing.assert_close(a, b)
+
+
+def blocked_gate_grad(q, k, G, b, end, upstream, scale):
+    dQ, dR, dE, dP, dA = upstream
+    Q, E = scale * q * G.exp(), k * (end - G).exp()
+    dq = scale * G.exp() * dQ
+    dk = b * G.exp() * dR + (end - G).exp() * dE
+    db = k * G.exp() * dR
+    dG = Q * dQ + b * k * G.exp() * dR - E * dE
+    for dbeg in range(0, q.shape[-1], 64):
+        ds = slice(dbeg, dbeg + 64)
+        for ib in range(4):
+            rows = slice(16 * ib, 16 * (ib + 1))
+            for jb in range(ib + 1):
+                cols = slice(16 * jb, 16 * (jb + 1))
+                ref = G[16 * ib + (7 if jb == ib else -1), ds]
+                rhs = k[cols, ds] * (ref - G[cols, ds]).exp()
+                for kind, grad in enumerate((dP, dA)):
+                    term = (grad[rows, cols] @ rhs) * (G[rows, ds] - ref).exp()
+                    if kind == 0:
+                        dq[rows, ds] += scale * term
+                        dG[rows, ds] += scale * q[rows, ds] * term
+                    else:
+                        dk[rows, ds] += b[rows, ds] * term
+                        db[rows, ds] += k[rows, ds] * term
+                        dG[rows, ds] += b[rows, ds] * k[rows, ds] * term
+            for jb in range(ib, 4):
+                cols = slice(16 * jb, 16 * (jb + 1))
+                ref = G[16 * ib + 7 if jb == ib else 16 * jb - 1, ds]
+                for kind, grad in enumerate((dP, dA)):
+                    value = (b * k if kind else scale * q)[cols, ds]
+                    rhs = value * (G[cols, ds] - ref).exp()
+                    term = (grad[cols, rows].T @ rhs) * (ref - G[rows, ds]).exp()
+                    dk[rows, ds] += term
+                    dG[rows, ds] -= k[rows, ds] * term
+    return dq, dk, dG, db
+
+
+@pytest.mark.parametrize("width", [1, 17, 64, 65, 128])
+@pytest.mark.parametrize("length", [1, 37, 64])
+@pytest.mark.parametrize("decay", [0.0, 0.35, 5.0])
+def test_register_gate_tiles_against_fp64_autograd(width, length, decay):
+    torch.manual_seed(93)
+    q, k, b = (torch.randn(64, width, dtype=torch.float64) * 0.1 for _ in range(3))
+    for x in (q, k, b):
+        x[length:] = 0
+    g = -torch.rand_like(q) * decay
+    g[length:] = 0
+    G = g.cumsum(0)
+    q, k, G, b = (x.requires_grad_() for x in (q, k, G, b))
+    end = G[-1].detach()
+    scale = 0.37
+    grads = [torch.randn_like(q) for _ in range(3)]
+    grads += [torch.randn(64, 64, dtype=q.dtype).tril(offset) for offset in (0, -1)]
+    causal = torch.ones(64, 64, dtype=torch.bool).tril()
+    factors = torch.where(causal[..., None], G[:, None] - G[None, :], 0).exp()
+    P = (scale * q[:, None] * k[None, :] * factors).sum(-1).tril()
+    A = ((b * k)[:, None] * k[None, :] * factors).sum(-1).tril(-1)
+    values = (scale * q * G.exp(), b * k * G.exp(), k * (end - G).exp(), P, A)
+    loss = sum((value * grad).sum() for value, grad in zip(values, grads))
+    expected = torch.autograd.grad(loss, (q, k, G, b))
+    with torch.no_grad():
+        actual = blocked_gate_grad(q, k, G, b, end, grads, scale)
+    for got, want in zip(actual, expected):
+        assert torch.isfinite(got).all()
+        torch.testing.assert_close(got, want, rtol=1e-10, atol=1e-10)
+
+
+@pytest.mark.parametrize("width", [1, 17, 64, 65, 128])
+def test_register_gate_fragment_ownership(width):
+    owners = torch.zeros(64, width, dtype=torch.int32)
+    for ib in range(4):
+        for dbeg in range(0, width, 64):
+            for tid in range(256):
+                lane, wave = tid & 63, tid >> 6
+                row = 16 * ib + (lane & 15)
+                for e in range(4):
+                    d = dbeg + 16 * wave + (lane >> 4) + 4 * e
+                    if d < width:
+                        owners[row, d] += 1
+    assert (owners == 1).all()
+
+
+def block_triangular_inverse(a):
+    m = torch.zeros_like(a)
+    for block in range(4):
+        r = slice(16 * block, 16 * (block + 1))
+        raw = -a[r, r].tril(-1)
+        diagonal = raw.clone()
+        for j in range(16):
+            diagonal[j+1:] += raw[j+1:, j:j+1] * diagonal[j:j+1]
+        m[r, r] = diagonal + torch.eye(16, dtype=a.dtype)
+    for distance in range(1, 4):
+        for i in range(distance, 4):
+            j = i - distance
+            r, c = slice(16*i, 16*(i+1)), slice(16*j, 16*(j+1))
+            total = torch.zeros(16, 16, dtype=a.dtype)
+            for k in range(j, i):
+                middle = slice(16*k, 16*(k+1))
+                total += a[r, middle] @ m[middle, c]
+            m[r, c] = -m[r, r] @ total
+    return m
+
+
+@pytest.mark.parametrize("length", [1, 15, 16, 17, 37, 63, 64])
+@pytest.mark.parametrize("decay", [0.0, 0.35, 5.0])
+def test_block_triangular_inverse(length, decay):
+    torch.manual_seed(936)
+    q, k, v, g, b, w = make_inputs((1, length, 1, 1, 128, 128))
+    k = k[0, :, 0]
+    k /= (k.square().sum(-1, keepdim=True) + 1e-6).sqrt()
+    b = b[0, :, 0]
+    G = (g[0, :, 0] * (decay / 0.35)).cumsum(0)
+    delta = G[:, None, :] - G[None, :, :]
+    causal = torch.ones(length, length, dtype=torch.bool).tril(-1)
+    a = (b[:, None] * k[:, None] * k[None, :] * delta.clamp_max(0).exp()).sum(-1)
+    a = F.pad(a.masked_fill(~causal, 0), (0, 64-length, 0, 64-length))
+    identity = torch.eye(64, dtype=torch.float64)
+    expected = torch.linalg.solve_triangular(identity + a, identity, upper=False)
+    torch.testing.assert_close(block_triangular_inverse(a), expected, atol=1e-12, rtol=1e-10)
+    actual = block_triangular_inverse(a.float())
+    torch.testing.assert_close(actual.double(), expected, atol=1e-7, rtol=1e-4)
+    torch.testing.assert_close((identity + a) @ actual.double(), identity, atol=1e-7, rtol=1e-6)

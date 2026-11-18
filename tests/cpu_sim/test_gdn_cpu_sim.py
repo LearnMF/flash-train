@@ -40,11 +40,11 @@ def rel_rms(a, e):
     return ((a.double() - e).square().mean().sqrt() / e.square().mean().sqrt().clamp_min(1e-9)).item()
 
 
-def run(sim, d, T, H, cu, save_qn, save_h, seed=290, gmax=0.3):
+def run(sim, d, T, H, cu, save_qn, save_h, seed=290, gmax=0.3, gmin=0.0):
     torch.manual_seed(seed)
     q, k = (torch.randn(1, T, H, 128) * 0.1 for _ in range(2))
     v = torch.randn(1, T, H, 128) * 0.3
-    g = -torch.rand(1, T, H) * gmax
+    g = -(gmin + torch.rand(1, T, H) * (gmax - gmin))
     beta = torch.rand(1, T, H)
     do = torch.randn(1, T, H, 128)
     x = [t.to(torch.bfloat16) for t in (q, k, v)] + [g, beta]
@@ -112,3 +112,21 @@ def test_same_bits_as_baseline(sim, base, tmp_path, name, T, H, cu, save):
         assert torch.equal(new[n], old[n]), n
     rtol = float(os.environ.get("G2_SIM_DG_RTOL", "2e-6"))
     assert (new["dg"] - old["dg"]).abs().max() <= rtol * old["dg"].abs().max()
+
+
+# The safe-gate contract's extreme: every token decays by up to e^-5, so chunk-prefix factors span
+# 2^-461 .. 1.  Any form that builds 2^(-prefix) (the reciprocal) overflows fp32 here; the outputs
+# must stay finite and within the usual FP64 tolerances.
+DECAY = [("all_-5", 5.0, 5.0), ("-5..0", 5.0, 0.0), ("-5..-4", 5.0, 4.0)]
+
+
+@pytest.mark.parametrize("name,T,H,cu", [CASES[0], CASES[1], CASES[3]], ids=["dense", "tail", "packed"])
+@pytest.mark.parametrize("dname,gmax,gmin", DECAY, ids=[d[0] for d in DECAY])
+@pytest.mark.parametrize("save", [(False, False), (True, True)], ids=["recompute", "saved"])
+def test_extreme_negative_decay(sim, tmp_path, name, T, H, cu, dname, gmax, gmin, save):
+    err, got, _ = run(sim, tmp_path, T, H, cu, *save, seed=11, gmax=gmax, gmin=gmin)
+    print(name, dname, save, {k: f"{v:.2e}" for k, v in err.items()})
+    for n, x in got.items():
+        assert torch.isfinite(x).all(), n
+    for n, e in err.items():
+        assert e < TOL[n], (n, e)

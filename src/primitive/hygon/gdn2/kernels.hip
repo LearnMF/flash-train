@@ -168,34 +168,64 @@ __global__ void intra(Shape s, Args p, Layout l) {
         }
     }
 }
-// N=-A is strictly lower triangular, so N^64=0.
 __global__ void wy(Shape s, Args p, Layout l) {
-    const int block = blockIdx.x, tid = threadIdx.x;
+    const int block = blockIdx.x, tid = threadIdx.x, lane = tid & 63, wave = tid >> 6;
+    const int row = lane & 15, quarter = lane >> 4;
     float* base = static_cast<float*>(p.cache) + size_t(block) * l.size;
-    __shared__ float power[C * C], inverse[C * C], tmp[C * C];
-    for (int ix = tid; ix < C * C; ix += 256) {
-        power[ix] = -base[l.M + ix];
-        inverse[ix] = float(ix / C == ix % C) + power[ix];
+    __shared__ float inverse[C * 68], tmp[C * 32];
+    for (int ix = tid; ix < C * 68; ix += 256) inverse[ix] = 0;
+    f4 raw = {}, diagonal = {};
+#pragma unroll
+    for (int e = 0; e < 4; ++e) {
+        const int col = g2::c_col(lane, e);
+        raw[e] = col < row ? -base[l.M + (16 * wave + row) * C + 16 * wave + col] : 0;
+    }
+    diagonal = raw;
+#pragma unroll
+    for (int j = 0; j < 16; ++j) {
+        const float coefficient = __shfl(raw[j >> 2], 16 * (j & 3) + row, 64);
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            const float pivot = __shfl(diagonal[e], 16 * quarter + j, 64);
+            if (row > j) diagonal[e] = fmaf(coefficient, pivot, diagonal[e]);
+        }
     }
     __syncthreads();
-#pragma unroll 1
-    for (int exponent = 2; exponent <= 32; exponent *= 2) {
-        gemm({power, C, 1}, {power, C, 1}, tmp, C, C, C, C);
-        for (int ix = tid; ix < C * C; ix += 256) power[ix] = tmp[ix];
+#pragma unroll
+    for (int e = 0; e < 4; ++e) {
+        const int col = g2::c_col(lane, e);
+        inverse[(16 * wave + row) * 68 + 16 * wave + col] = diagonal[e] + float(col == row);
+    }
+    __syncthreads();
+    for (int distance = 1; distance < 4; ++distance) {
+        const int j = wave - distance;
+        f4 sum = {};
+        if (j >= 0) {
+            for (int k = j; k < wave; ++k)
+                sum += dot16({base + l.M + 16 * wave * C + 16 * k, C, 1},
+                             {inverse + 16 * k * 68 + 16 * j, 68, 1}, 16, 16, 16, 0, 0);
+#pragma unroll
+            for (int e = 0; e < 4; ++e) tmp[wave * 320 + row * 20 + g2::c_col(lane, e)] = sum[e];
+        }
         __syncthreads();
-        gemm({inverse, C, 1}, {power, C, 1}, tmp, C, C, C, C);
-        for (int ix = tid; ix < C * C; ix += 256) inverse[ix] += tmp[ix];
+        if (j >= 0) {
+            const f4 result = dot16({inverse + 16 * wave * 68 + 16 * wave, 68, 1},
+                                    {tmp + wave * 320, 20, 1}, 16, 16, 16, 0, 0);
+#pragma unroll
+            for (int e = 0; e < 4; ++e)
+                inverse[(16 * wave + row) * 68 + 16 * j + g2::c_col(lane, e)] = -result[e];
+        }
         __syncthreads();
     }
-    for (int ix = tid; ix < C * C; ix += 256) base[l.M + ix] = inverse[ix];
+    for (int ix = tid; ix < C * C; ix += 256) base[l.M + ix] = inverse[(ix / C) * 68 + ix % C];
     for (int kind = 0; kind < 2; ++kind) {
         const int width = kind ? s.V : s.K;
         float* rhs = base + (kind ? l.U : l.W);
-        for (int col = 0; col < width; col += C) {
-            const int n = min(C, width - col);
-            gemm({inverse, C, 1}, {rhs + col, width, 1}, tmp, C, n, C, C);
-            for (int ix = tid; ix < C * C; ix += 256)
-                if (ix % C < n) rhs[(ix / C) * width + col + ix % C] = tmp[ix];
+        for (int col = 0; col < width; col += 32) {
+            const int n = min(32, width - col);
+            gemm({inverse, 68, 1}, {rhs + col, width, 1}, tmp, C, n, C, 32);
+            for (int ix = tid; ix < C * 32; ix += 256)
+                if (ix % 32 < n) rhs[(ix / 32) * width + col + ix % 32] = tmp[ix];
             __syncthreads();
         }
     }
@@ -327,43 +357,56 @@ __global__ void products(Shape s, Args p, Layout l, GradLayout gl, float* grad) 
 }
 __global__ void gates(Shape s, Args p, Layout l, GradLayout gl, float* grad) {
     const int block = blockIdx.x, ib = blockIdx.y, tid = threadIdx.x;
+    const int lane = tid & 63, wave = tid >> 6, dbeg = blockIdx.z * 64;
+    const int row = 16 * ib + (lane & 15), len = length(s, block);
     const float* base = static_cast<const float*>(p.cache) + size_t(block) * l.size;
     float* dst = grad + size_t(block) * gl.size;
-    __shared__ float a[16 * 20], rhs[16 * 132], result[16 * 128];
-    __shared__ float dq[16 * 128], dk[16 * 128], db[16 * 128], dg[16 * 128];
-    for (int ix = tid; ix < 16 * s.K; ix += 256) {
-        const int i = 16 * ib + ix / s.K, d = ix % s.K, gi = i * s.K + d;
-        const float eg = __expf(base[l.g + gi]);
-        const float ki = base[l.k + gi];
-        const float bi = i < length(s, block) ? read(p.b, token(s, block, i) * s.K + d, p.bf32) : 0;
-        dq[ix] = p.scale * eg * dst[gl.dQ + gi];
-        dk[ix] = bi * eg * dst[gl.dR + gi] + __expf(base[l.g + (C - 1) * s.K + d] - base[l.g + gi]) * dst[gl.dE + gi];
-        db[ix] = ki * eg * dst[gl.dR + gi];
-        dg[ix] = base[l.Q + gi] * dst[gl.dQ + gi] + bi * ki * eg * dst[gl.dR + gi] - dst[gl.dE + gi] * base[l.E + gi];
+    __shared__ float a[16 * 20], rhs[16 * 68];
+    f4 dq = {}, dk = {}, db = {}, dg = {};
+    f4 q = {}, k = {}, beta = {}, grow = {};
+#pragma unroll
+    for (int e = 0; e < 4; ++e) {
+        const int d = dbeg + 16 * wave + g2::c_col(lane, e), gi = row * s.K + d;
+        if (d < s.K) {
+            grow[e] = base[l.g + gi];
+            const float eg = __expf(grow[e]);
+            q[e] = p.scale * base[l.q + gi];
+            k[e] = base[l.k + gi];
+            beta[e] = row < len ? read(p.b, token(s, block, row) * s.K + d, p.bf32) : 0;
+            dq[e] = p.scale * eg * dst[gl.dQ + gi];
+            dk[e] = beta[e] * eg * dst[gl.dR + gi]
+                    + __expf(base[l.g + (C - 1) * s.K + d] - grow[e]) * dst[gl.dE + gi];
+            db[e] = k[e] * eg * dst[gl.dR + gi];
+            dg[e] = base[l.Q + gi] * dst[gl.dQ + gi]
+                    + beta[e] * k[e] * eg * dst[gl.dR + gi] - dst[gl.dE + gi] * base[l.E + gi];
+        }
     }
-    __syncthreads();
     for (int jb = 0; jb <= ib; ++jb) {
         const int ref = 16 * ib + (jb == ib ? 7 : -1);
-        for (int ix = tid; ix < 16 * s.K; ix += 256) {
-            const int j = 16 * jb + ix / s.K, d = ix % s.K;
-            rhs[(ix / s.K) * 132 + d] = base[l.k + j * s.K + d] * __expf(base[l.g + ref * s.K + d] - base[l.g + j * s.K + d]);
+        for (int ix = tid; ix < 16 * 64; ix += 256) {
+            const int j = 16 * jb + ix / 64, d = dbeg + ix % 64;
+            rhs[(ix / 64) * 68 + ix % 64] = d < s.K
+                ? base[l.k + j * s.K + d] * __expf(base[l.g + ref * s.K + d] - base[l.g + j * s.K + d]) : 0;
         }
         for (int kind = 0; kind < 2; ++kind) {
             const int i = 16 * ib + tid / 16, j = 16 * jb + tid % 16;
-            a[(tid / 16) * 20 + tid % 16] = (kind ? i > j : i >= j) ? dst[(kind ? gl.dA : gl.dP) + i * C + j] : 0;
+            a[(tid / 16) * 20 + tid % 16] = (kind ? i > j : i >= j)
+                ? dst[(kind ? gl.dA : gl.dP) + i * C + j] : 0;
             __syncthreads();
-            gemm({a, 20, 1}, {rhs, 132, 1}, result, 16, s.K, 16, s.K);
-            for (int ix = tid; ix < 16 * s.K; ix += 256) {
-                const int row = 16 * ib + ix / s.K, d = ix % s.K, gi = row * s.K + d;
-                const float term = result[ix] * __expf(base[l.g + gi] - base[l.g + ref * s.K + d]);
-                if (kind == 0) {
-                    dq[ix] += p.scale * term;
-                    dg[ix] += p.scale * base[l.q + gi] * term;
-                } else {
-                    const float bi = row < length(s, block) ? read(p.b, token(s, block, row) * s.K + d, p.bf32) : 0;
-                    dk[ix] += bi * term;
-                    db[ix] += base[l.k + gi] * term;
-                    dg[ix] += bi * base[l.k + gi] * term;
+            const f4 result = dot16({a, 20, 1}, {rhs, 68, 1}, 16, 64, 16, 0, 16 * wave);
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const int d = dbeg + 16 * wave + g2::c_col(lane, e);
+                if (d < s.K) {
+                    const float term = result[e] * __expf(grow[e] - base[l.g + ref * s.K + d]);
+                    if (kind == 0) {
+                        dq[e] += p.scale * term;
+                        dg[e] += q[e] * term;
+                    } else {
+                        dk[e] += beta[e] * term;
+                        db[e] += k[e] * term;
+                        dg[e] += beta[e] * k[e] * term;
+                    }
                 }
             }
             __syncthreads();
@@ -373,30 +416,41 @@ __global__ void gates(Shape s, Args p, Layout l, GradLayout gl, float* grad) {
         const int ref = jb == ib ? 16 * ib + 7 : 16 * jb - 1;
         for (int kind = 0; kind < 2; ++kind) {
             const int i = 16 * ib + tid / 16, j = 16 * jb + tid % 16;
-            a[(tid / 16) * 20 + tid % 16] = (kind ? j > i : j >= i) ? dst[(kind ? gl.dA : gl.dP) + j * C + i] : 0;
-            for (int ix = tid; ix < 16 * s.K; ix += 256) {
-                const int row = 16 * jb + ix / s.K, d = ix % s.K, gi = row * s.K + d;
-                const float bi = row < length(s, block) ? read(p.b, token(s, block, row) * s.K + d, p.bf32) : 0;
-                const float value = kind ? bi * base[l.k + gi] : p.scale * base[l.q + gi];
-                rhs[(ix / s.K) * 132 + d] = value * __expf(base[l.g + gi] - base[l.g + ref * s.K + d]);
+            a[(tid / 16) * 20 + tid % 16] = (kind ? j > i : j >= i)
+                ? dst[(kind ? gl.dA : gl.dP) + j * C + i] : 0;
+            for (int ix = tid; ix < 16 * 64; ix += 256) {
+                const int r = 16 * jb + ix / 64, d = dbeg + ix % 64, gi = r * s.K + d;
+                float value = 0;
+                if (d < s.K) {
+                    const float bi = r < len ? read(p.b, token(s, block, r) * s.K + d, p.bf32) : 0;
+                    value = (kind ? bi * base[l.k + gi] : p.scale * base[l.q + gi])
+                        * __expf(base[l.g + gi] - base[l.g + ref * s.K + d]);
+                }
+                rhs[(ix / 64) * 68 + ix % 64] = value;
             }
             __syncthreads();
-            gemm({a, 20, 1}, {rhs, 132, 1}, result, 16, s.K, 16, s.K);
-            for (int ix = tid; ix < 16 * s.K; ix += 256) {
-                const int row = 16 * ib + ix / s.K, d = ix % s.K, gi = row * s.K + d;
-                const float term = result[ix] * __expf(base[l.g + ref * s.K + d] - base[l.g + gi]);
-                dk[ix] += term;
-                dg[ix] -= base[l.k + gi] * term;
+            const f4 result = dot16({a, 20, 1}, {rhs, 68, 1}, 16, 64, 16, 0, 16 * wave);
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const int d = dbeg + 16 * wave + g2::c_col(lane, e);
+                if (d < s.K) {
+                    const float term = result[e] * __expf(base[l.g + ref * s.K + d] - grow[e]);
+                    dk[e] += term;
+                    dg[e] -= k[e] * term;
+                }
             }
             __syncthreads();
         }
     }
-    for (int ix = tid; ix < 16 * s.K; ix += 256) {
-        const int i = 16 * ib + ix / s.K, d = ix % s.K, gi = i * s.K + d;
-        dst[gl.dq + gi] = dq[ix];
-        dst[gl.dk + gi] = dk[ix];
-        dst[gl.dQ + gi] = dg[ix];
-        if (i < length(s, block)) write(p.db, token(s, block, i) * s.K + d, db[ix], p.bf32);
+#pragma unroll
+    for (int e = 0; e < 4; ++e) {
+        const int d = dbeg + 16 * wave + g2::c_col(lane, e), gi = row * s.K + d;
+        if (d < s.K) {
+            dst[gl.dq + gi] = dq[e];
+            dst[gl.dk + gi] = dk[e];
+            dst[gl.dQ + gi] = dg[e];
+            if (row < len) write(p.db, token(s, block, row) * s.K + d, db[e], p.bf32);
+        }
     }
 }
 __global__ void gate_scan(Shape s, Args p, Layout l, GradLayout gl, const float* grad) {
@@ -514,7 +568,7 @@ void backward(const Shape& s, const Args& p, void* workspace, FTrainStream strea
     check("reverse");
     hipLaunchKernelGGL(products, dim3(s.blocks(), 5, 2 * ((std::max(s.K, C) + 31) / 32)), dim3(256), 0, stream, s, p, l, gl, grad);
     check("products");
-    hipLaunchKernelGGL(gates, dim3(s.blocks(), 4), dim3(256), 0, stream, s, p, l, gl, grad);
+    hipLaunchKernelGGL(gates, dim3(s.blocks(), 4, (s.K + 63) / 64), dim3(256), 0, stream, s, p, l, gl, grad);
     check("gates");
     hipLaunchKernelGGL(gate_scan, dim3(s.blocks()), dim3(128), 0, stream, s, p, l, gl, grad);
     check("gate_scan");

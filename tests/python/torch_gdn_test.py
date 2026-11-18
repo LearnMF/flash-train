@@ -266,3 +266,31 @@ def test_native_non128_against_fp64(monkeypatch, K, V, B, T, H, HV, norm):
     for name, a, e, tol in zip(("dq", "dk", "dv", "dg", "dbeta"), torch.autograd.grad(o, x, do),
                                torch.autograd.grad(ref, ref_x, do.double()), (0.04, 0.04, 0.04, 0.06, 0.06)):
         assert rel_rms(a, e) < tol, (name, rel_rms(a, e))
+
+
+@pytest.mark.skipif(not gfx936(), reason="native GDN requires gfx936")
+@pytest.mark.parametrize("case", ["dense", "tail", "packed"])
+@pytest.mark.parametrize("gmin,gmax", [(5.0, 5.0), (0.0, 5.0), (4.0, 5.0)])
+@pytest.mark.parametrize("save_h", [False, True])
+def test_native_gram_negative_decay(case, gmin, gmax, save_h):
+    from flash_train.torch import chunk_gated_delta_rule
+
+    T = {"dense": 128, "tail": 37, "packed": 140}[case]
+    raw = inputs(1, T, 1, 2, 128, 128, device="cuda")
+    x = [t.detach().to(torch.bfloat16 if i < 3 else torch.float32) for i, t in enumerate(raw)]
+    x[3] = -(gmin + torch.rand_like(x[3]) * (gmax - gmin))
+    x = [t.requires_grad_() for t in x]
+    ref_x = [t.detach().double().requires_grad_() for t in x]
+    cu = torch.tensor([0, 0, 70, 140], device="cuda", dtype=torch.int32) if case == "packed" else None
+    kw = dict(cu_seqlens=cu, use_qk_l2norm_in_kernel=True)
+    out, _ = chunk_gated_delta_rule(*x, disable_recompute=save_h, **kw)
+    expected = gdn.gdn_reference(*ref_x, **kw)
+    do = torch.randn_like(out)
+    actual = [out, *torch.autograd.grad(out, x, do)]
+    reference = [expected, *torch.autograd.grad(expected, ref_x, do.double())]
+    for name, got, want, budget in zip(
+        ("o", "dq", "dk", "dv", "dg", "dbeta"), actual, reference,
+        (0.02, 0.04, 0.04, 0.04, 0.06, 0.06),
+    ):
+        assert torch.isfinite(got).all(), name
+        assert rel_rms(got, want) < budget, (name, rel_rms(got, want))
