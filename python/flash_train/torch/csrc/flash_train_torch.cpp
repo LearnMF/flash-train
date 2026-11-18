@@ -130,7 +130,7 @@ std::vector<at::Tensor> kdaForward(const at::Tensor& q, const at::Tensor& k, con
                                    int64_t cp_phase, const std::optional<at::Tensor>& cp_workspace,
                                    const std::optional<at::Tensor>& cp_out) {
     TORCH_CHECK(q.dim() == 3 && v.dim() == 3, "kda: q/k/v must be [T, H, D]");
-    TORCH_CHECK(cp_phase >= 0 && cp_phase <= 4, "kda: cp_phase must be 0..4");
+    TORCH_CHECK(cp_phase >= 0 && cp_phase <= 6 && cp_phase != 5, "kda: forward cp_phase must be 0..4 or 6");
     TORCH_CHECK(!(keep_state && save_h), "kda: keep_state and save_h are exclusive");
     const int64_t T = q.size(0), H = q.size(1);
     // The prep stages one hand-off in o, so the phases that reuse it get the same buffer back.
@@ -149,7 +149,7 @@ std::vector<at::Tensor> kdaForward(const at::Tensor& q, const at::Tensor& k, con
         {save_h ? static_cast<int64_t>(flash_train_torch::kdaSavedHElements(T, H, N, has_cu)) : 0}, q.options());
     at::Tensor state = torch::empty(
         {keep_state ? static_cast<int64_t>(flash_train_torch::kdaStateElements(T, H, N, has_cu)) : 0}, q.options());
-    at::Tensor final_state = output_final_state ? torch::empty({N, H, q.size(2), v.size(2)}, fopt)
+    at::Tensor final_state = output_final_state ? torch::empty({cp_phase == 6 ? 2 * N : N, H, q.size(2), v.size(2)}, fopt)
                                                 : torch::empty({0}, fopt);
     const std::vector<KdaBridgeView> views = {
         kdaView(q),   kdaView(k),      kdaView(v),      kdaView(g),   kdaView(beta), kdaView(a_log),

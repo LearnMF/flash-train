@@ -154,7 +154,10 @@ KdaForwardProblem::KdaForwardProblem(std::vector<Tensor> ports, KdaAttributes at
     requireStates(ports, kH, kState, shape_, portHasMemory(ports, kCuSeqlens));
     const Dims recurrent{shape_.seqs, shape_.heads, shape_.key_dim, shape_.value_dim};
     if (portHasMemory(ports, kInitialState)) { requireDims(ports, kInitialState, recurrent, "initial_state"); }
-    if (portHasMemory(ports, kFinalState)) { requireDims(ports, kFinalState, recurrent, "final_state"); }
+    // CP phase 6 returns [S_loc; M] as two states per sequence
+    const Dims finals{shape_.seqs * (attributes_.getCpPhase() == 6 ? 2 : 1), shape_.heads, shape_.key_dim,
+                      shape_.value_dim};
+    if (portHasMemory(ports, kFinalState)) { requireDims(ports, kFinalState, finals, "final_state"); }
     requireDevice(ports, {kQ, kK, kV, kG, kBeta, kALog, kDtBias, kCuSeqlens, kO, kQRstd, kKRstd, kAqk, kAkk, kQn, kKn,
                           kH, kState, kInitialState, kFinalState});
     tensors_ = std::move(ports);

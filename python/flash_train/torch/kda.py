@@ -291,17 +291,21 @@ class _KdaCpFunction(torch.autograd.Function):
         # or phase 4, the preprocessing alone, on the last rank, whose summary no rank reads.
         world, rank = dist.get_world_size(group=group), dist.get_rank(group=group)
         wants_summary = rank < world - 1
+        # Middle ranks (CP >= 3) also need the transition matrix M: phase 6 carries [S_loc | M] as one
+        # K x (V + K) state through one recurrence pass, M from I with a zero value term.
+        with_m = 0 < rank < world - 1
+        eye = (torch.eye(K, device=q.device, dtype=torch.float32).expand(1, H, K, K).contiguous()
+               if with_m else None)
         f1 = _kda_forward(*args, **base, save_qkn=save_qkn, output_final_state=wants_summary,
-                          cp_phase=1 if wants_summary else 4)
+                          initial_state=eye, cp_phase=6 if with_m else (1 if wants_summary else 4))
         o_buf, q_rstd, k_rstd, aqk, akk, qn, kn = f1[0], f1[1], f1[2], f1[3], f1[4], f1[5], f1[6]
         ws = f1[10]
-        s_loc = f1[9] if wants_summary else q.new_zeros(1, H, K, V, dtype=torch.float32)
+        s_loc = f1[9][:1] if wants_summary else q.new_zeros(1, H, K, V, dtype=torch.float32)
         # Phase 2: the transition matrix, only on the ranks a later rank composes it from (the
         # first summary of a composition multiplies a zero state, the last rank's is never read).
         reuse = dict(cp_workspace=ws, cp_out=o_buf)
-        if 0 < rank < world - 1:
-            eye = torch.eye(K, device=q.device, dtype=torch.float32).expand(1, H, K, K).contiguous()
-            m = _kda_forward(*args, **base, initial_state=eye, output_final_state=True, cp_phase=2, **reuse)[9]
+        if with_m:
+            m = f1[9][1:]
         else:
             m = s_loc.new_zeros(1, H, K, K)
         hm = torch.cat([m[0], s_loc[0]], dim=-1).contiguous()

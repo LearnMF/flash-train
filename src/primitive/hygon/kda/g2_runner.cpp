@@ -39,6 +39,10 @@ int g2_fwd_h_v8o(const void* Wn, const void* Kn, const void* Un, const void* Gn,
                  void* O, void* Ob, void* Vn, void* HbN, void* ANv, float scale, int B, int T, int H, const int* seg,
                  int nseg, const int* ctok, const int* clen, const void* GnRaw, const void* H0, void* Ht,
                  hipStream_t s);
+int g2_fwd_h_v8o2(const void* Wn, const void* Kn, const void* Un, const void* Gn, const void* QgA, const void* AqkA,
+                  void* O, void* Ob, void* Vn, void* HbN, void* ANv, float scale, int B, int T, int H, const int* seg,
+                  int nseg, const int* ctok, const int* clen, const void* GnRaw, const void* H0, void* Ht,
+                  const void* H0Aux, void* HtAux, hipStream_t s);
 int g2_exp2_inplace(float* x, long n, hipStream_t s);  // kra P-52: Gn -> exp2f(Gn) decays
 int g2_kda_gn_all(const float* g, const int* ctok, const int* clen, int H, int NT, float* raw, float* gn, float* gnat,
                   int kp, hipStream_t s);  // kra P-99: to_gn (+ to_gn + exp2 | + gn_kp) in one pass
@@ -352,9 +356,10 @@ void forward(const Shape& shape, const ForwardArgs& p, void* workspace, FTrainSt
         un = L.Uz;
     }
     void* ob = shape.stateOnly() ? nullptr : p.o;
-    check(g2_fwd_h_v8o(L.Wn, L.Kn, un, L.Gn, L.QgA, L.AqkA, nullptr, ob, p.state_vn, hbn, p.state_anv, p.scale, 1,
-                       NT * 64, H, L.tab.seg, nseg, L.tab.ctok, L.tab.clen, nullptr, p.initial_state,
-                       p.final_state, stream),
+    check(g2_fwd_h_v8o2(L.Wn, L.Kn, un, L.Gn, L.QgA, L.AqkA, nullptr, ob, p.state_vn, hbn, p.state_anv, p.scale, 1,
+                       NT * 64, H, L.tab.seg, nseg, L.tab.ctok, L.tab.clen, nullptr, shape.withM() ? nullptr : p.initial_state, p.final_state,
+                       shape.withM() ? p.initial_state : nullptr,
+                       shape.withM() ? static_cast<float*>(p.final_state) + z.H * 128 * 128 : nullptr, stream),
           "fwd_h_o");
 }
 
