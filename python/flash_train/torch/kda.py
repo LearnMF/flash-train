@@ -308,13 +308,17 @@ class _KdaCpFunction(torch.autograd.Function):
             m = f1[9][1:]
         else:
             m = s_loc.new_zeros(1, H, K, K)
-        hm = torch.cat([m[0], s_loc[0]], dim=-1).contiguous()
+        # Only the middle ranks' M is ever read: the first rank's multiplies a zero state, the last
+        # rank's a zero dht. Without middle ranks (CP2) the gather carries S_loc alone.
+        need_m = world > 2
+        hm = torch.cat([m[0], s_loc[0]], dim=-1).contiguous() if need_m else s_loc[0].contiguous()
         gathered = hm.new_empty(world, *hm.shape)
         dist.all_gather_into_tensor(gathered, hm, group=group)
-        h = hm.new_zeros(H, K, V)
+        h = None
         for j in range(rank - (0 if is_first else int(pre)), rank):
-            h = torch.matmul(gathered[j, ..., :K], h) + gathered[j, ..., K:]
-        h0 = h.unsqueeze(0).contiguous()
+            sj = gathered[j, ..., K:] if need_m else gathered[j]
+            h = sj if h is None else torch.matmul(gathered[j, ..., :K], h) + sj
+        h0 = (h if h is not None else hm.new_zeros(H, K, V)).unsqueeze(0).contiguous()
         # Phase 3: the ordinary recurrence from h0 on phase 1's preprocessing.
         f3 = _kda_forward(*args, **base, keep_state=keep, save_h=save_h, initial_state=h0, cp_phase=3, **reuse)
         o, saved_h, state = f3[0], f3[7], f3[8]
@@ -322,7 +326,7 @@ class _KdaCpFunction(torch.autograd.Function):
         ctx.save_for_backward(q_sv, k_sv, v, g, beta, a_log, dt_bias, cu_seqlens, q_rstd, k_rstd, aqk, akk,
                               qn, kn, saved_h, state, h0, gathered)
         ctx.scale, ctx.lower_bound, ctx.gate, ctx.l2norm = scale, lower_bound, gate, l2norm
-        ctx.group, ctx.rank, ctx.world = group, rank, world
+        ctx.group, ctx.rank, ctx.world, ctx.need_m = group, rank, world, need_m
         ctx.set_materialize_grads(False)
         return o
 
@@ -345,14 +349,14 @@ class _KdaCpFunction(torch.autograd.Function):
                            cp_phase=1 if wants_summary else 4)
         ws, dqk = b1[8], b1[9]
         K = gathered.shape[2]
-        shape = (gathered.shape[1], K, gathered.shape[3] - K)
+        shape = (gathered.shape[1], K, gathered.shape[3] - K) if ctx.need_m else tuple(gathered.shape[1:])
         d_loc = b1[7][0] if wants_summary else gathered.new_zeros(shape)
         dgath = gathered.new_empty(world, *shape)
         dist.all_gather_into_tensor(dgath, d_loc.contiguous(), group=ctx.group)
-        x = gathered.new_zeros(shape)
-        for j in range(world - 1, rank, -1):   # dht_r = M_{r+1}^T dht_{r+1} + D_{r+1}
-            x = torch.matmul(gathered[j, ..., :K].transpose(-1, -2), x) + dgath[j]
-        dht = None if rank == world - 1 else x.unsqueeze(0).contiguous()
+        x = None
+        for j in range(world - 1, rank, -1):   # dht_r = M_{r+1}^T dht_{r+1} + D_{r+1}, dht_{world-1} = 0
+            x = dgath[j] if x is None else torch.matmul(gathered[j, ..., :K].transpose(-1, -2), x) + dgath[j]
+        dht = None if x is None else x.unsqueeze(0).contiguous()
         # Phase 2 (the backward's second phase): the recurrence again from the merged dht, then
         # the input gradients, on phase 1's preprocessing and in its buffers.
         dq, dk, dv, dg, dbeta, da_log, ddt_bias = _kda_backward(
